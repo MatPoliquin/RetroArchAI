@@ -790,6 +790,9 @@ ifeq ($(HAVE_EMSCRIPTEN), 1)
    ifeq ($(HAVE_RWEBAUDIO), 1)
       OBJ += audio/drivers/rwebaudio.o
    endif
+   ifeq ($(HAVE_AUDIOWORKLET), 1)
+      OBJ += audio/drivers/audioworklet.o
+   endif
 endif
 
 ifeq ($(HAVE_BLUETOOTH), 1)
@@ -1281,6 +1284,7 @@ ifeq ($(HAVE_WAYLAND), 1)
         gfx/common/wayland_common.o \
         gfx/common/wayland/fractional-scale-v1.o \
         gfx/common/wayland/viewporter.o \
+        gfx/common/wayland/xdg-toplevel-icon-v1.o \
         gfx/common/wayland/xdg-shell.o \
         gfx/common/wayland/idle-inhibit-unstable-v1.o \
         gfx/common/wayland/xdg-decoration-unstable-v1.o \
@@ -1346,6 +1350,10 @@ ifeq ($(HAVE_X11), 1)
    DEF_FLAGS += $(X11_CFLAGS) $(XEXT_CFLAGS) $(XF86VM_CFLAGS) $(XINERAMA_CFLAGS)
    ifeq ($(HAVE_XCB),1)
       LIBS += -lX11-xcb
+   endif
+   ifeq ($(HAVE_XI2),1)
+      LIBS += -lXi
+      DEFINES += -DHAVE_XI2
    endif
    ifeq ($(HAVE_XSCRNSAVER),1)
       LIBS += -lXss
@@ -1504,6 +1512,7 @@ ifeq ($(HAVE_PLAIN_DRM), 1)
       INCLUDE_DIRS += -I/usr/include/libdrm
    endif
    LIBS += -ldrm
+   HAVE_AND_WILL_USE_DRM = 1
 endif
 
 ifeq ($(HAVE_VITAGL), 1)
@@ -2004,6 +2013,7 @@ ifeq ($(HAVE_BUILTINZLIB), 1)
    HAVE_ZLIB_COMMON = 1
    OBJ += $(DEPS_DIR)/libz/adler32.o \
           $(DEPS_DIR)/libz/libz-crc32.o \
+          $(DEPS_DIR)/libz/compress.o \
           $(DEPS_DIR)/libz/deflate.o \
           $(DEPS_DIR)/libz/gzclose.o \
           $(DEPS_DIR)/libz/gzlib.o \
@@ -2013,6 +2023,7 @@ ifeq ($(HAVE_BUILTINZLIB), 1)
           $(DEPS_DIR)/libz/inflate.o \
           $(DEPS_DIR)/libz/inftrees.o \
           $(DEPS_DIR)/libz/trees.o \
+          $(DEPS_DIR)/libz/uncompr.o \
           $(DEPS_DIR)/libz/zutil.o
    INCLUDE_DIRS += -I$(LIBRETRO_COMM_DIR)/include/compat/zlib
 else ifeq ($(HAVE_ZLIB),1)
@@ -2180,6 +2191,65 @@ ifeq ($(HAVE_V4L2),1)
    endif
    DEFINES += -DHAVE_V4L2
    LIBS += $(V4L2_LIBS)
+endif
+
+# FFmpeg
+
+ifeq ($(HAVE_FFMPEG), 1)
+   DEFINES += -DHAVE_FFMPEG
+   INCLUDE_DIRS += -Iffmpeg
+   DEF_FLAGS += $(FFMPEG_CFLAGS) -Wno-deprecated-declarations
+   LIBS += $(FFMPEG_LIBS)
+
+   ifeq ($(HAVE_AVCODEC), 1)
+      DEFINES += -DHAVE_AVCODEC
+      DEF_FLAGS += $(AVCODEC_CFLAGS)
+      LIBS += $(AVCODEC_LIBS)
+   endif
+
+   ifeq ($(HAVE_AVDEVICE), 1)
+      DEFINES += -DHAVE_AVDEVICE
+      DEF_FLAGS += $(AVDEVICE_CFLAGS)
+      LIBS += $(AVDEVICE_LIBS)
+   endif
+
+   ifeq ($(HAVE_AVFORMAT), 1)
+      DEFINES += -DHAVE_AVFORMAT
+      DEF_FLAGS += $(AVFORMAT_CFLAGS)
+      LIBS += $(AVFORMAT_LIBS)
+   endif
+
+   ifeq ($(HAVE_AVUTIL), 1)
+      DEFINES += -DHAVE_AVUTIL
+      DEF_FLAGS += $(AVUTIL_CFLAGS)
+      LIBS += $(AVUTIL_LIBS)
+   endif
+
+   ifeq ($(HAVE_SWSCALE), 1)
+      DEFINES += -DHAVE_SWSCALE
+      DEF_FLAGS += $(SWSCALE_CFLAGS)
+      LIBS += $(SWSCALE_LIBS)
+   endif
+
+   ifeq ($(HAVE_SWRESAMPLE), 1)
+      DEFINES += -DHAVE_SWRESAMPLE
+      DEF_FLAGS += $(SWRESAMPLE_CFLAGS)
+      LIBS += $(SWRESAMPLE_LIBS)
+   endif
+endif
+
+ifeq ($(HAVE_FFMPEG), 1)
+ifeq ($(HAVE_AVFORMAT), 1)
+ifeq ($(HAVE_AVDEVICE), 1)
+ifeq ($(HAVE_AVCODEC), 1)
+ifeq ($(HAVE_AVUTIL), 1)
+ifeq ($(HAVE_SWSCALE), 1)
+   OBJ += camera/drivers/ffmpeg.o
+endif
+endif
+endif
+endif
+endif
 endif
 
 # Accessibility
@@ -2422,7 +2492,7 @@ ifeq ($(HAVE_FFMPEG), 1)
           cores/libretro-ffmpeg/video_buffer.o \
           $(LIBRETRO_COMM_DIR)/rthreads/tpool.o
 
-   LIBS += $(AVCODEC_LIBS) $(AVFORMAT_LIBS) $(AVUTIL_LIBS) $(SWSCALE_LIBS) $(SWRESAMPLE_LIBS) $(FFMPEG_LIBS)
+   LIBS += $(AVCODEC_LIBS) $(AVFORMAT_LIBS) $(AVUTIL_LIBS) $(SWSCALE_LIBS) $(SWRESAMPLE_LIBS) $(FFMPEG_LIBS) $(AVDEVICE_LIBS)
    DEFINES += -DHAVE_FFMPEG
    DEF_FLAGS += $(AVCODEC_CFLAGS) $(AVFORMAT_CFLAGS) $(AVUTIL_CFLAGS) $(SWSCALE_CFLAGS) $(SWRESAMPLE_CFLAGS) \
                 -Wno-deprecated-declarations

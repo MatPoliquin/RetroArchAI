@@ -448,8 +448,10 @@ typedef struct xmb_handle
    bool show_fullscreen_thumbnails;
    bool want_fullscreen_thumbnails;
    bool skip_thumbnail_reset;
+   bool show_thumbnails;
    bool show_mouse;
    bool show_screensaver;
+   bool show_playlist_tabs;
    bool use_ps3_layout;
    bool last_use_ps3_layout;
    bool assets_missing;
@@ -792,16 +794,16 @@ static float *xmb_gradient_ident(unsigned xmb_color_theme)
            0.50,      0.50,      0.50, 1.0,
    };
    static float gradient_gray_dark[16]       = {
-           0.10,      0.10,      0.10, 1.0,
-           0.10,      0.10,      0.10, 1.0,
-           0.10,      0.10,      0.10, 1.0,
-           0.10,      0.10,      0.10, 1.0,
+       16/255.0,  16/255.0,  16/255.0, 1.0,
+       16/255.0,  16/255.0,  16/255.0, 1.0,
+       16/255.0,  16/255.0,  16/255.0, 1.0,
+       16/255.0,  16/255.0,  16/255.0, 1.0,
    };
    static float gradient_gray_light[16]      = {
-           0.20,      0.20,      0.20, 1.0,
-           0.20,      0.20,      0.20, 1.0,
-           0.20,      0.20,      0.20, 1.0,
-           0.20,      0.20,      0.20, 1.0,
+       32/255.0,  32/255.0,  32/255.0, 1.0,
+       32/255.0,  32/255.0,  32/255.0, 1.0,
+       32/255.0,  32/255.0,  32/255.0, 1.0,
+       32/255.0,  32/255.0,  32/255.0, 1.0,
    };
 
    switch (xmb_color_theme)
@@ -1385,7 +1387,7 @@ static unsigned xmb_get_horizontal_selection_type(xmb_handle_t *xmb)
    return 0;
 }
 
-static void xmb_refresh_thumbnail_image(void *data, unsigned i)
+static void xmb_refresh_thumbnail_image(void *data, size_t i)
 {
    xmb_handle_t *xmb          = (xmb_handle_t*)data;
    struct menu_state *menu_st = menu_state_get_ptr();
@@ -2633,7 +2635,6 @@ static void xmb_init_horizontal_list(xmb_handle_t *xmb)
    menu_displaylist_info_t info;
    settings_t *settings             = config_get_ptr();
    const char *dir_playlist         = settings->paths.directory_playlist;
-   bool menu_content_show_playlists = settings->bools.menu_content_show_playlist_tabs;
    bool truncate_playlist_name      = settings->bools.ozone_truncate_playlist_name;
    bool sort_after_truncate         = settings->bools.ozone_sort_after_truncate_playlist_name;
 
@@ -2646,7 +2647,7 @@ static void xmb_init_horizontal_list(xmb_handle_t *xmb)
    info.type_default                = FILE_TYPE_PLAIN;
    info.enum_idx                    = MENU_ENUM_LABEL_PLAYLISTS_TAB;
 
-   if (menu_content_show_playlists && !string_is_empty(info.path))
+   if (!string_is_empty(info.path))
    {
       size_t i;
 
@@ -3007,6 +3008,8 @@ static void xmb_populate_entries(void *data,
    if (!xmb)
       return;
 
+   xmb->show_playlist_tabs            = settings->bools.menu_content_show_playlist_tabs;
+
    xmb->skip_thumbnail_reset          = false;
    if (xmb->is_quick_menu && depth < xmb->old_depth)
       xmb->skip_thumbnail_reset       = true;
@@ -3322,6 +3325,7 @@ static uintptr_t xmb_icon_get_id(xmb_handle_t *xmb,
       case MENU_ENUM_LABEL_TAKE_SCREENSHOT:
       case MENU_ENUM_LABEL_QUICK_MENU_SHOW_TAKE_SCREENSHOT:
          return xmb->textures.list[XMB_TEXTURE_SCREENSHOT];
+      case MENU_ENUM_LABEL_CORE_LIST_UNLOAD:
       case MENU_ENUM_LABEL_DELETE_ENTRY:
       case MENU_ENUM_LABEL_QUICK_MENU_SHOW_CLOSE_CONTENT:
          return xmb->textures.list[XMB_TEXTURE_CLOSE];
@@ -3522,6 +3526,65 @@ static uintptr_t xmb_icon_get_id(xmb_handle_t *xmb,
          return xmb->textures.list[XMB_TEXTURE_INPUT_SETTINGS];
       case MENU_ENUM_LABEL_INPUT_TURBO_FIRE_SETTINGS:
          return xmb->textures.list[XMB_TEXTURE_INPUT_TURBO];
+      case MENU_ENUM_LABEL_INPUT_TURBO_BIND:
+      case MENU_ENUM_LABEL_INPUT_TURBO_BUTTON:
+      {
+         settings_t *settings               = config_get_ptr();
+         int turbo_bind = settings->ints.input_turbo_bind;
+
+         if (enum_idx == MENU_ENUM_LABEL_INPUT_TURBO_BUTTON)
+            turbo_bind = settings->uints.input_turbo_button;
+
+         switch (turbo_bind)
+         {
+            case RETRO_DEVICE_ID_JOYPAD_UP:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_DPAD_U];
+            case RETRO_DEVICE_ID_JOYPAD_DOWN:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_DPAD_D];
+            case RETRO_DEVICE_ID_JOYPAD_LEFT:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_DPAD_L];
+            case RETRO_DEVICE_ID_JOYPAD_RIGHT:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_DPAD_R];
+            case RETRO_DEVICE_ID_JOYPAD_B:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_BTN_D];
+            case RETRO_DEVICE_ID_JOYPAD_A:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_BTN_R];
+            case RETRO_DEVICE_ID_JOYPAD_Y:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_BTN_L];
+            case RETRO_DEVICE_ID_JOYPAD_X:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_BTN_U];
+            case RETRO_DEVICE_ID_JOYPAD_SELECT:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_SELECT];
+            case RETRO_DEVICE_ID_JOYPAD_START:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_START];
+            case RETRO_DEVICE_ID_JOYPAD_L:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_LB];
+            case RETRO_DEVICE_ID_JOYPAD_R:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_RB];
+            case RETRO_DEVICE_ID_JOYPAD_L2:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_LT];
+            case RETRO_DEVICE_ID_JOYPAD_R2:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_RT];
+            case RETRO_DEVICE_ID_JOYPAD_L3:
+            case RETRO_DEVICE_ID_JOYPAD_R3:
+               return xmb->textures.list[XMB_TEXTURE_INPUT_STCK_P];
+            case 19: /* Left Analog Up */
+            case 23: /* Right Analog Up */
+               return xmb->textures.list[XMB_TEXTURE_INPUT_STCK_U];
+            case 18: /* Left Analog Down */
+            case 22: /* Right Analog Down */
+               return xmb->textures.list[XMB_TEXTURE_INPUT_STCK_D];
+            case 17: /* Left Analog Left */
+            case 21: /* Right Analog Left */
+               return xmb->textures.list[XMB_TEXTURE_INPUT_STCK_L];
+            case 16: /* Left Analog Right */
+            case 20: /* Right Analog Right */
+               return xmb->textures.list[XMB_TEXTURE_INPUT_STCK_R];
+            default:
+               break;
+         }
+         break;
+      }
       case MENU_ENUM_LABEL_LATENCY_SETTINGS:
       case MENU_ENUM_LABEL_CONTENT_SHOW_LATENCY:
       case MENU_ENUM_LABEL_SETTINGS_SHOW_LATENCY:
@@ -4739,10 +4802,12 @@ static int xmb_draw_item(
    {
       bool show_right_thumbnail         =
                (gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_RIGHT)
+            && xmb->show_thumbnails
             && (  (xmb->thumbnails.right.status == GFX_THUMBNAIL_STATUS_AVAILABLE)
                || (xmb->thumbnails.right.status == GFX_THUMBNAIL_STATUS_PENDING)));
       bool show_left_thumbnail          =
                (gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_LEFT)
+            && xmb->show_thumbnails
             && (  (xmb->thumbnails.left.status == GFX_THUMBNAIL_STATUS_AVAILABLE)
                || (xmb->thumbnails.left.status == GFX_THUMBNAIL_STATUS_PENDING)));
 
@@ -5498,7 +5563,7 @@ static void xmb_show_fullscreen_thumbnails(
    xmb_set_thumbnail_delay(false);
 }
 
-static bool INLINE xmb_fullscreen_thumbnails_available(xmb_handle_t *xmb,
+static INLINE bool xmb_fullscreen_thumbnails_available(xmb_handle_t *xmb,
       struct menu_state *menu_st)
 {
    bool ret = xmb->fullscreen_thumbnails_available
@@ -5746,6 +5811,14 @@ static enum menu_action xmb_parse_menu_entry_action(
                }
             }
             return MENU_ACTION_NOOP;
+         }
+         break;
+      case MENU_ACTION_INFO:
+         if (     (xmb->is_playlist)
+               || (xmb->is_explore_list))
+         {
+            xmb->show_thumbnails = !xmb->show_thumbnails;
+            new_action = MENU_ACTION_NOOP;
          }
          break;
       case MENU_ACTION_UP:
@@ -6477,7 +6550,6 @@ static void xmb_context_reset_internal(xmb_handle_t *xmb,
 
    if (reinit_textures)
    {
-      settings_t *settings = config_get_ptr();
       gfx_display_deinit_white_texture();
       gfx_display_init_white_texture();
       xmb->assets_missing     = false;
@@ -7709,7 +7781,11 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
    /* Horizontal tab icons */
    if (!xmb->assets_missing)
    {
-      for (i = 0; i <= xmb_list_get_size(xmb, MENU_LIST_HORIZONTAL) + xmb->system_tab_end; i++)
+      unsigned horizontal_list_size = (xmb->show_playlist_tabs)
+            ? (unsigned)xmb_list_get_size(xmb, MENU_LIST_HORIZONTAL)
+            : 0;
+
+      for (i = 0; i <= xmb->system_tab_end + horizontal_list_size; i++)
       {
          xmb_node_t *node = xmb_get_node(xmb, i);
 
@@ -7908,15 +7984,23 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
    }
    else if (xmb->fullscreen_thumbnails_available && !xmb->show_fullscreen_thumbnails)
    {
+      float background_color[16] = {
+            0.0f, 0.0f, 0.0f, 1.0f,
+            0.0f, 0.0f, 0.0f, 1.0f,
+            0.0f, 0.0f, 0.0f, 1.0f,
+            0.0f, 0.0f, 0.0f, 1.0f,
+      };
+      bool thumbnail_background = settings->bools.menu_thumbnail_background_enable;
       bool show_right_thumbnail =
                (gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_RIGHT))
+            && xmb->show_thumbnails
             && (  (xmb->thumbnails.right.status == GFX_THUMBNAIL_STATUS_AVAILABLE)
                || (  xmb->thumbnails.right.status       < GFX_THUMBNAIL_STATUS_AVAILABLE
                   && xmb->thumbnails_right_status_prev <= GFX_THUMBNAIL_STATUS_AVAILABLE
                   && xmb->thumbnails_right_status_prev != GFX_THUMBNAIL_STATUS_UNKNOWN));
-
       bool show_left_thumbnail  =
                (gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_LEFT))
+            && xmb->show_thumbnails
             && (  (xmb->thumbnails.left.status == GFX_THUMBNAIL_STATUS_AVAILABLE)
                || (  xmb->thumbnails.left.status       < GFX_THUMBNAIL_STATUS_AVAILABLE
                   && xmb->thumbnails_left_status_prev <= GFX_THUMBNAIL_STATUS_AVAILABLE
@@ -7946,41 +8030,37 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
                float right_thumb_y       = thumb_y_base + thumb_y_offset;
                float left_thumb_y        = thumb_y_base + thumb_height + (xmb->icon_size / 8) + thumb_y_offset;
 
-               float background_color[16]        = {
-                     0.0f, 0.0f, 0.0f, 1.0f,
-                     0.0f, 0.0f, 0.0f, 1.0f,
-                     0.0f, 0.0f, 0.0f, 1.0f,
-                     0.0f, 0.0f, 0.0f, 1.0f,
-               };
-
                /* Darken background */
-               gfx_display_draw_quad(
-                     p_disp,
-                     userdata,
-                     video_width,
-                     video_height,
-                     thumb_x,
-                     right_thumb_y,
-                     scaled_thumb_width,
-                     scaled_thumb_height,
-                     video_width,
-                     video_height,
-                     background_color,
-                     NULL);
+               if (thumbnail_background)
+               {
+                  gfx_display_draw_quad(
+                        p_disp,
+                        userdata,
+                        video_width,
+                        video_height,
+                        thumb_x,
+                        right_thumb_y,
+                        scaled_thumb_width,
+                        scaled_thumb_height,
+                        video_width,
+                        video_height,
+                        background_color,
+                        NULL);
 
-               gfx_display_draw_quad(
-                     p_disp,
-                     userdata,
-                     video_width,
-                     video_height,
-                     thumb_x,
-                     left_thumb_y,
-                     scaled_thumb_width,
-                     scaled_thumb_height,
-                     video_width,
-                     video_height,
-                     background_color,
-                     NULL);
+                  gfx_display_draw_quad(
+                        p_disp,
+                        userdata,
+                        video_width,
+                        video_height,
+                        thumb_x,
+                        left_thumb_y,
+                        scaled_thumb_width,
+                        scaled_thumb_height,
+                        video_width,
+                        video_height,
+                        background_color,
+                        NULL);
+               }
 
                gfx_thumbnail_draw(
                      userdata,
@@ -8017,17 +8097,31 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
                                          + ((thumb_width - scaled_thumb_width) / 2.0f);
                float thumb_y             = xmb->margins_screen_top + (xmb->icon_size / 1.5f);
 
+               if (thumbnail_background)
+                  gfx_display_draw_quad(
+                        p_disp,
+                        userdata,
+                        video_width,
+                        video_height,
+                        thumb_x,
+                        thumb_y,
+                        scaled_thumb_width,
+                        scaled_thumb_height,
+                        video_width,
+                        video_height,
+                        background_color,
+                        NULL);
+
                gfx_thumbnail_draw(
                      userdata,
                      video_width,
                      video_height,
-                        show_right_thumbnail
-                     ? &xmb->thumbnails.right : &xmb->thumbnails.left,
+                     (show_right_thumbnail) ? &xmb->thumbnails.right : &xmb->thumbnails.left,
                      thumb_x,
                      thumb_y,
-                     scaled_thumb_width  > 0.0f ? (unsigned)scaled_thumb_width  : 0,
-                     scaled_thumb_height > 0.0f ? (unsigned)scaled_thumb_height : 0,
-                     GFX_THUMBNAIL_ALIGN_TOP,
+                     (scaled_thumb_width  > 0.0f) ? (unsigned)scaled_thumb_width  : 0,
+                     (scaled_thumb_height > 0.0f) ? (unsigned)scaled_thumb_height : 0,
+                     (thumbnail_background) ? GFX_THUMBNAIL_ALIGN_CENTRE : GFX_THUMBNAIL_ALIGN_TOP,
                      1.0f, 1.0f, &thumbnail_shadow);
             }
          }
@@ -8044,6 +8138,21 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
                                          + ((thumb_width - scaled_thumb_width) / 2.0f);
                float thumb_y             = xmb->margins_screen_top + (xmb->icon_size / 1.5f);
 
+               if (thumbnail_background)
+                  gfx_display_draw_quad(
+                        p_disp,
+                        userdata,
+                        video_width,
+                        video_height,
+                        thumb_x,
+                        thumb_y,
+                        scaled_thumb_width,
+                        scaled_thumb_height,
+                        video_width,
+                        video_height,
+                        background_color,
+                        NULL);
+
                gfx_thumbnail_draw(
                      userdata,
                      video_width,
@@ -8053,7 +8162,7 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
                      thumb_y,
                      (scaled_thumb_width  > 0.0f) ? (unsigned)scaled_thumb_width  : 0,
                      (scaled_thumb_height > 0.0f) ? (unsigned)scaled_thumb_height : 0,
-                     GFX_THUMBNAIL_ALIGN_TOP,
+                     (thumbnail_background) ? GFX_THUMBNAIL_ALIGN_CENTRE : GFX_THUMBNAIL_ALIGN_TOP,
                      1.0f, 1.0f, &thumbnail_shadow);
             }
 
@@ -8070,6 +8179,21 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
                                          + ((thumb_width - scaled_thumb_width) / 2.0f);
                float thumb_y             = xmb->margins_screen_top + xmb->icon_size + y_offset;
 
+               if (thumbnail_background)
+                  gfx_display_draw_quad(
+                        p_disp,
+                        userdata,
+                        video_width,
+                        video_height,
+                        thumb_x,
+                        thumb_y,
+                        scaled_thumb_width,
+                        scaled_thumb_height,
+                        video_width,
+                        video_height,
+                        background_color,
+                        NULL);
+
                gfx_thumbnail_draw(
                      userdata,
                      video_width,
@@ -8077,9 +8201,9 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
                      &xmb->thumbnails.left,
                      thumb_x,
                      thumb_y,
-                     scaled_thumb_width  > 0.0f ? (unsigned)scaled_thumb_width  : 0,
-                     scaled_thumb_height > 0.0f ? (unsigned)scaled_thumb_height : 0,
-                     GFX_THUMBNAIL_ALIGN_TOP,
+                     (scaled_thumb_width  > 0.0f) ? (unsigned)scaled_thumb_width  : 0,
+                     (scaled_thumb_height > 0.0f) ? (unsigned)scaled_thumb_height : 0,
+                     (thumbnail_background) ? GFX_THUMBNAIL_ALIGN_CENTRE : GFX_THUMBNAIL_ALIGN_TOP,
                      1.0f, 1.0f, &thumbnail_shadow);
             }
          }
@@ -8103,17 +8227,34 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
          /* Very small thumbnails look ridiculous
           * > Impose a minimum size limit */
          if (thumb_height > xmb->icon_size)
+         {
+            if (thumbnail_background)
+               gfx_display_draw_quad(
+                     p_disp,
+                     userdata,
+                     video_width,
+                     video_height,
+                     thumb_x,
+                     thumb_y,
+                     scaled_thumb_width,
+                     scaled_thumb_height,
+                     video_width,
+                     video_height,
+                     background_color,
+                     NULL);
+
             gfx_thumbnail_draw(
                   userdata,
                   video_width,
                   video_height,
-                  show_left_thumbnail ? &xmb->thumbnails.left : &xmb->thumbnails.right,
+                  (show_left_thumbnail) ? &xmb->thumbnails.left : &xmb->thumbnails.right,
                   thumb_x,
                   thumb_y,
-                  scaled_thumb_width  > 0.0f ? (unsigned)scaled_thumb_width  : 0,
-                  scaled_thumb_height > 0.0f ? (unsigned)scaled_thumb_height : 0,
-                  GFX_THUMBNAIL_ALIGN_TOP,
+                  (scaled_thumb_width  > 0.0f) ? (unsigned)scaled_thumb_width  : 0,
+                  (scaled_thumb_height > 0.0f) ? (unsigned)scaled_thumb_height : 0,
+                  (thumbnail_background) ? GFX_THUMBNAIL_ALIGN_CENTRE : GFX_THUMBNAIL_ALIGN_TOP,
                   1.0f, 1.0f, &thumbnail_shadow);
+         }
       }
    }
 
@@ -8359,7 +8500,7 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
    {
       const char *str             = menu_input_dialog_get_buffer();
       const char *label           = menu_st->input_dialog_kb_label;
-      size_t _len                 = strlcpy(msg, label, sizeof(msg));
+      size_t _len                 = strlcpy(msg, label, sizeof(msg) - 2);
       msg[  _len]                 = '\n';
       msg[++_len]                 = '\0';
       strlcpy(msg       + _len,
@@ -8578,6 +8719,7 @@ static void *xmb_init(void **userdata, bool video_is_threaded)
    xmb->fullscreen_thumbnails_available       = false;
    xmb->show_fullscreen_thumbnails            = false;
    xmb->skip_thumbnail_reset                  = false;
+   xmb->show_thumbnails                       = true;
    xmb->fullscreen_thumbnail_alpha            = 0.0f;
    xmb->fullscreen_thumbnail_selection        = 0;
    xmb->fullscreen_thumbnail_label[0]         = '\0';
@@ -8829,6 +8971,9 @@ static void xmb_list_cache(void *data, enum menu_list_type type,
    file_list_t *menu_stack    = MENU_LIST_GET(menu_list, 0);
    file_list_t *selection_buf = MENU_LIST_GET_SELECTION(menu_list, 0);
    size_t selection           = menu_st->selection_ptr;
+   unsigned horizontal_list_size = (xmb->show_playlist_tabs)
+         ? (unsigned)xmb_list_get_size(xmb, MENU_LIST_HORIZONTAL)
+         : 0;
 
    if (!xmb)
       return;
@@ -8860,7 +9005,7 @@ static void xmb_list_cache(void *data, enum menu_list_type type,
    else
       xmb->selection_ptr_old = selection;
 
-   list_size = xmb_list_get_size(xmb, MENU_LIST_HORIZONTAL) + xmb->system_tab_end;
+   list_size = xmb->system_tab_end + horizontal_list_size;
 
    switch (type)
    {

@@ -1233,10 +1233,6 @@ MSG_HASH(
    "Korisnik"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_USER_SETTINGS,
-   "Izmeni podešavanja naloga, korisničkog imena i jezika."
-   )
-MSG_HASH(
    MENU_ENUM_LABEL_VALUE_DIRECTORY_SETTINGS,
    "Direktorijum"
    )
@@ -1905,6 +1901,7 @@ MSG_HASH(
 #endif
 #ifdef ANDROID
 #endif
+
 
 /* Settings > Input > Haptic Feedback/Vibration */
 

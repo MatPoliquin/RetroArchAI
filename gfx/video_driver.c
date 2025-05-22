@@ -1006,7 +1006,7 @@ video_pixel_scaler_t *video_driver_pixel_converter_init(
    if (!scaler_ctx_gen_filter(scalr_ctx))
       goto error;
 
-   if (!(scalr_out = calloc(sizeof(uint16_t), size * size)))
+   if (!(scalr_out = calloc(size * size, sizeof(uint16_t))))
       goto error;
 
    scalr->scaler_out                        = scalr_out;
@@ -2817,7 +2817,15 @@ void video_driver_build_info(video_frame_info_t *video_info)
    input_driver_state_t *input_st          = input_state_get_ptr();
 #ifdef HAVE_MENU
    struct menu_state *menu_st              = menu_state_get_ptr();
+#if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
+   struct video_shader *menu_shader        = menu_shader_get();
+#else
+   struct video_shader *menu_shader        = NULL;
 #endif
+#else
+   struct video_shader *menu_shader        = NULL;
+#endif /* HAVE_MENU */
+   uint8_t menu_shdr_flags                 = (menu_shader) ? menu_shader->flags : 0;
 #ifdef HAVE_GFX_WIDGETS
    dispgfx_widget_t *p_dispwidget          = dispwidget_get_ptr();
 #endif
@@ -2827,6 +2835,7 @@ void video_driver_build_info(video_frame_info_t *video_info)
 
    VIDEO_DRIVER_THREADED_LOCK(video_st, is_threaded);
 #endif
+
    custom_vp                               = &settings->video_vp_custom;
 #ifdef HAVE_GFX_WIDGETS
    video_info->widgets_active              = p_dispwidget->active;
@@ -2896,6 +2905,7 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->scale_width                 = video_st->scale_width;
    video_info->scale_height                = video_st->scale_height;
 
+   video_info->shader_active               = !(menu_shdr_flags & SHDR_FLAG_DISABLED) ? true : false;
    video_info->hdr_enable                  = settings->bools.video_hdr_enable;
 
    video_info->libretro_running            = false;
@@ -3645,7 +3655,7 @@ void video_driver_frame(const void *data, unsigned width,
    static retro_time_t curr_time;
    static retro_time_t fps_time;
    static float last_fps, frame_time;
-   static uint16_t frame_time_accumulator;
+   static int32_t frame_time_accumulator;
    /* Mark the start of nonblock state for
     * ignoring initial previous frame time */
    static int8_t nonblock_active;
@@ -3729,7 +3739,7 @@ void video_driver_frame(const void *data, unsigned width,
             || (last_frame_duped && !!data))
       )
    {
-      uint16_t frame_time_accumulator_prev = frame_time_accumulator;
+      int32_t frame_time_accumulator_prev  = frame_time_accumulator;
       uint16_t frame_time_delta            = new_time - last_time;
       uint16_t frame_time_target           = video_info.frame_time_target;
 
@@ -3797,11 +3807,17 @@ void video_driver_frame(const void *data, unsigned width,
       video_st->frame_time_samples[write_index] = frame_time;
       fps_time                                  = new_time;
 
-      /* Consider frame dropped when frame time exceeds 1.75x target */
+      /* Try to count dropped frames */
       if (     video_st->frame_count > 4
-            && !menu_is_alive
-            && frame_time > 1000000.0f / video_st->av_info.timing.fps * 1.75f)
-         video_st->frame_drop_count++;
+            && !menu_is_alive)
+      {
+         float frame_time_av_info = 1000000.0f / video_st->av_info.timing.fps;
+
+         if (     (frame_time > frame_time_av_info * 1.75f)
+               || (runloop_st->core_run_time > frame_time_av_info * 1.5f)
+            )
+            video_st->frame_drop_count++;
+      }
 
       if (video_info.fps_show)
       {
@@ -4567,15 +4583,15 @@ void video_frame_delay(video_driver_state_t *video_st,
          || (runloop_st->flags & RUNLOOP_FLAG_SLOWMOTION)
          || (runloop_st->flags & RUNLOOP_FLAG_FASTMOTION);
 
-   /* Black frame insertion + swap interval multiplier */
-   refresh_rate = (refresh_rate / (video_bfi + 1.0f) / video_swap_interval / shader_subframes);
-
    /* Treat values 20+ as frame time percentage */
    if (video_frame_delay >= 20)
       video_frame_delay = 1 / refresh_rate * 1000 * (video_frame_delay / 100.0f);
    /* Set 0 (Auto) delay target as 3/4 frame time */
    else if (video_frame_delay == 0 && settings->bools.video_frame_delay_auto)
       video_frame_delay = 1 / refresh_rate * 1000 * 0.75f;
+
+   /* Black frame insertion + swap interval multiplier */
+   refresh_rate = (refresh_rate / (video_bfi + 1.0f) / video_swap_interval / shader_subframes);
 
    if (settings->bools.video_frame_delay_auto)
    {

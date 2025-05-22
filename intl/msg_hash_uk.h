@@ -72,6 +72,14 @@ MSG_HASH(
    "Вибрати ядро для використання."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CORE_LIST_UNLOAD,
+   "Відвантажити Ядро"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CORE_LIST_UNLOAD,
+   "Відпустіть завантажене ядро."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_HELP_CORE_LIST,
    "Знайдіть основну реалізацію libretro. Де браузер запускається в залежності від вашого базового шляху каталогу. Якщо цього немає, то він запуститься в root.\nЯкщо Core Directory це каталог, меню буде використовувати це як верхню теку. Якщо Core Directory є повним шляхом, то він почнеться в папці[...]"
    )
@@ -1510,7 +1518,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_USER_SETTINGS,
-   "Зміна налаштувань облікового запису, користувача та мови."
+   "Зміна налаштувань конфіденційності, облікового запису та імені користувача."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_DIRECTORY_SETTINGS,
@@ -1979,66 +1987,6 @@ MSG_HASH(
    "Вставляє чорні рамки між кадрами для покращення чіткості руху. Використовуйте лише опцію, призначену для поточної частоти оновлення екрана. Не можна використовувати з частотою оновлення, не кратною 60 Гц, наприклад, 144 Гц, 165 Гц тощо. Не поєднуйте з інтервалом заміни > 1, під к[...]"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_120,
-   "1 - Для частоти оновлення дисплея 120 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_180,
-   "2 - Для частоти оновлення дисплея 180 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_240,
-   "3 - Для частоти оновлення дисплея 240 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_300,
-   "4 - Для частоти оновлення дисплея 300 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_360,
-   "5 - Для частоти оновлення дисплея 360 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_420,
-   "6 - Для частоти оновлення дисплея 420 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_480,
-   "7 - Для частоти оновлення дисплея 480 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_540,
-   "8 - Для частоти оновлення дисплея 540 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_600,
-   "9 - Для частоти оновлення дисплея 600 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_660,
-   "10 - Для частоти оновлення дисплея 660 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_720,
-   "11 - Для частоти оновлення дисплея 720 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_780,
-   "12 - Для частоти оновлення дисплея 780 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_840,
-   "13 - Для частоти оновлення дисплея 840 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_900,
-   "14 - Для частоти оновлення дисплея 900 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_960,
-   "15 - Для частоти оновлення дисплея 960 Гц"
-   )
-MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_BFI_DARK_FRAMES,
    "Вставка чорного кадру - темні кадри"
    )
@@ -2061,66 +2009,6 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_VIDEO_SHADER_SUBFRAMES,
    "Вставляє додатковий(і) кадр(и) шейдерів між кадрами для будь-яких можливих шейдерних ефектів, які мають працювати швидше за частоту оновлення вмісту. Використовуйте лише той параметр, який призначено для поточної частоти оновлення екрана. Не використовується при частоті [...]"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_120,
-   "2 - Для частоти оновлення дисплея 120 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_180,
-   "3 - Для частоти оновлення дисплея 180 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_240,
-   "4 - Для частоти оновлення дисплея 240 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_300,
-   "5 - Для частоти оновлення дисплея 300 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_360,
-   "6 - Для частоти оновлення дисплея 360 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_420,
-   "7 - Для частоти оновлення дисплея 420 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_480,
-   "8 - Для частоти оновлення дисплея 480 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_540,
-   "9 - Для частоти оновлення дисплея 540 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_600,
-   "10 - Для частоти оновлення дисплея 600 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_660,
-   "11 - Для частоти оновлення дисплея 660 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_720,
-   "12 - Для частоти оновлення дисплея 720 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_780,
-   "13 - Для частоти оновлення дисплея 780 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_840,
-   "14 - Для частоти оновлення дисплея 840 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_900,
-   "15 - Для частоти оновлення дисплея 900 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_960,
-   "16 - Для частоти оновлення дисплея 960 Гц"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_GPU_SCREENSHOT,
@@ -2665,11 +2553,11 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_X,
-   "Настроюване зміщення вікна перегляду, яке використовується для зсуву вікна перегляду по горизонталі (якщо ширше за висоту вмісту).  0,0 означає крайній ліворуч, а 1,0 означає крайній правий."
+   "Горизонтальне положення вмісту, якщо вікно перегляду ширше, ніж ширина контенту. 0.0 знаходиться далеко, 0.5 - центр, 1.0 знаходиться набагато вірно."
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_Y,
-   "Настроюване зміщення вікна перегляду, яке використовується для зсуву вікна перегляду по вертикалі (якщо вище за висоту вмісту).  0,0 означає верх і 1,0 означає низ."
+   "Вертикальне положення вмісту, коли вікно перегляду перевищує висоту. 0.0 знаходиться зверху, 0.5 - центр, 1.0 знизу."
    )
 #if defined(RARCH_MOBILE)
 MSG_HASH(
@@ -2690,11 +2578,11 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
-   "Настроюване зміщення вікна перегляду, яке використовується для зміщення вікна перегляду по горизонталі (якщо ширше за висоту вмісту).  0,0 означає крайній ліворуч, а 1,0 означає крайній правий. (Книжкова орієнтація)"
+   "Горизонтальне положення вмісту, коли вікно перегляду ширше, ніж ширина контенту. 0,0 далеко зліва, 0,5 - центр, 1.0 - набагато правильніше. (портретний орієнтація)"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
-   "Настроюване зміщення вікна перегляду, яке використовується для зсуву вікна перегляду по вертикалі (якщо вище за висоту вмісту).  0,0 означає верх і 1,0 означає низ. (Книжкова орієнтація)"
+   "Вертикальне положення вмісту, коли вікно перегляду є вищим, ніж висота контенту. 0,0 зверху, 0.5 знаходиться в центрі, 1.0 знаходиться внизу. (портретна орієнтація)"
    )
 #endif
 MSG_HASH(
@@ -3509,21 +3397,34 @@ MSG_HASH(
    MSG_INPUT_BIND_HOLD,
    "Утримуйте"
    )
+
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_ENABLE,
+   "Турбо Кнопки"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_TURBO_ENABLE,
+   "Вимкнено зупиняє всі операції турбопожежі."
+   )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_TURBO_PERIOD,
    "Турбо-період"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_TURBO_PERIOD,
-   "Тривалість (у кадрах) дії turbo-кнопок."
+   "Період у кадрах під час натискання кнопок із увімкненим режимом турбо."
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_DUTY_CYCLE,
-   "Робочий цикл турбо"
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_DUTY_CYCLE,
+   "Робочий цикл Turbo"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_DUTY_CYCLE,
-   "Кількість кадрів із турбо-періоду, протягом якого кнопки утримуються. Якщо це число дорівнює або перевищує період турбо, кнопки ніколи не відпустяться."
+   MENU_ENUM_SUBLABEL_INPUT_TURBO_DUTY_CYCLE,
+   "Кількість кадрів із турбо-періоду, протягом якого кнопки утримуються. Якщо це число дорівнює або перевищує Turbo Period, кнопки ніколи не відпустяться."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_TURBO_DUTY_CYCLE_HALF,
+   "Половина періоду"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_TURBO_MODE,
@@ -3551,34 +3452,38 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_TURBO_MODE_CLASSIC,
-   "Класичний режим, керування двома кнопками. Утримуйте кнопку та торкніться кнопки Турбо, щоб активувати послідовність пресреліз.\n Кнопку Турбо можна призначити в меню «Налаштування»/«Вхід»/«Керування портом 1»."
+   "Класичний режим, управління двома кнопками. Утримуйте кнопку та торкніться кнопки «Турбо», щоб активувати послідовність прес-релізів.\nТурбо-прив’язку можна призначити в «Параметрах»/«Введення»/«Керування портом X»."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_TURBO_MODE_CLASSIC_TOGGLE,
-   "Класичний режим перемикання, робота двома кнопками. Утримуйте кнопку та торкніться кнопки Turbo, щоб увімкнути турбо для цієї кнопки. Щоб вимкнути турбо: утримуйте кнопку та знову натисніть кнопку «Турбо».\nКнопку «Турбо» можна призначити в меню «Налаштування/Вхід/Керування[...]"
+   "Класичний режим перемикання, робота двома кнопками. Утримуйте кнопку та торкніться кнопки Turbo, щоб увімкнути турбо для цієї кнопки. Щоб вимкнути турбо: утримуйте кнопку та знову натисніть кнопку «Турбо».\nТурбозв’язування може b."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_TURBO_MODE_SINGLEBUTTON,
-   "Режим перемикання. Натисніть кнопку «Турбо» один раз, щоб активувати послідовність прес-релізів для вибраної кнопки за замовчуванням, натисніть її ще раз, щоб вимкнути її.\nКнопку «Турбо» можна призначити в меню «Налаштування/Вхід/Керування портом 1»."
+   "Режим перемикання. Натисніть кнопку Turbo один раз, щоб активувати послідовність прес-релізів для вибраної кнопки за замовчуванням, натисніть її ще раз, щоб вимкнути її.\nTurbo bind можна призначити в Settings/Input/Por."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_TURBO_MODE_SINGLEBUTTON_HOLD,
-   "Режим утримання. Послідовність прес-релізів для вибраної кнопки за замовчуванням активна, доки кнопка Turbo утримується.\n Кнопку Turbo можна призначити в меню «Параметри/Вхід/Керування портом 1».\n Щоб імітувати функцію автозапуску епохи домашнього комп’ютера, установіть Turbo [...]"
+   "Режим утримання. Послідовність прес-релізів для вибраної кнопки за замовчуванням активна, доки кнопку Turbo утримують.\nТурбозв’язування можна призначити в меню «Параметри/Вхід/Керування портом X».\nЩоб імітувати функцію автозапуску ери домашнього комп’ютера, установіть «[...]"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_DEFAULT_BUTTON,
-   "Стандартна кнопка Турбо"
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_BIND,
+   "Зв'язати Турбо"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_TURBO_DEFAULT_BUTTON,
-   "Активна кнопка для турбо режиму за замовчанням."
+   MENU_ENUM_SUBLABEL_INPUT_TURBO_BIND,
+   "Turbo активація прив'язки RetroPad. Empty використовує прив’язку до порту."
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_ALLOW_TURBO_DPAD,
-   "Дозволити маршрути Turbo D-Pad"
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_BUTTON,
+   "Турбо кнопка"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_ALLOW_TURBO_DPAD,
+   MENU_ENUM_SUBLABEL_INPUT_TURBO_BUTTON,
+   "Цільова турбо-кнопка в режимі «Одна кнопка»."
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_TURBO_ALLOW_DPAD,
    "Якщо ввімкнено, цифрові спрямовані входи (також відомі як d-pad або «hatswitch») можуть бути турбо."
    )
 MSG_HASH(
@@ -3587,7 +3492,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_TURBO_FIRE_SETTINGS,
-   "Змініть налаштування турбопожежі.\n Примітка: функція турбо вимагає зіставлення кнопки турбо з пристроєм введення у відповідному меню «Керування портом X»."
+   "Змініть налаштування турбо вогню."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_HAPTIC_FEEDBACK_SETTINGS,
@@ -3685,7 +3590,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DISABLE_INFO_BUTTON,
-   "Якщо буде увімкнено, натискання кнопки \"Інформація\" буде проігноровано."
+   "Вимкнути функцію інформації меню."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_SEARCH_BUTTON,
@@ -3693,7 +3598,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DISABLE_SEARCH_BUTTON,
-   "Якщо буде увімкнено, натискання кнопки \"Пошук\" буде проігноровано."
+   "Не показувати функцію пошуку в меню."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_LEFT_ANALOG_IN_MENU,
@@ -3701,7 +3606,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DISABLE_LEFT_ANALOG_IN_MENU,
-   "Запобігання навігації лівим аналоговим джойстиком у меню."
+   "Заборонити меню вивести аналогову паличку введення."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_RIGHT_ANALOG_IN_MENU,
@@ -3709,7 +3614,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DISABLE_RIGHT_ANALOG_IN_MENU,
-   "Заборонити правій аналоговій ручці навігацію в меню."
+   "Запобігає меню права аналогова паличка введення. Правий аналоговий мініатюр в списках відтворення."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_MENU_INPUT_SWAP_OK_CANCEL,
@@ -3963,6 +3868,14 @@ MSG_HASH(
    "Вмикає/вимикає поточний вибраний шейдер."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_META_SHADER_HOLD,
+   "Шейдери (Утримувати)"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_META_SHADER_HOLD,
+   "Тримає поточний вибраний шейдер увімкненим/вимкненим, поки натиснута клавіша."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_META_SHADER_NEXT,
    "Наступний шейдер"
    )
@@ -4067,6 +3980,14 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_META_REPLAY_SLOT_MINUS,
    "Зменшує поточний вибраний індекс слота для повтору."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_META_TURBO_FIRE_TOGGLE,
+   "Turbo Fire (перемикач)"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_META_TURBO_FIRE_TOGGLE,
+   "Вмикає/вимикає турбо вогонь."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_META_GRAB_MOUSE_TOGGLE,
@@ -4448,7 +4369,7 @@ MSG_HASH(
    "Гармата D-панель праворуч"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_ENABLE,
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO,
    "Турбо"
    )
 
@@ -5806,6 +5727,10 @@ MSG_HASH(
    "Вхідний (автоматичний) Сповіщення про підключення"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_AUTOCONFIG_FAILS,
+   "Повідомлення про помилку введення (автоконфігурації)"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_CHEATS_APPLIED,
    "Повідомлення чіт-кодів"
    )
@@ -5824,6 +5749,10 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_AUTOCONFIG,
    "Відображати екранне повідомлення під час підключення/відключення вхідних пристроїв."
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_AUTOCONFIG_FAILS,
+   "Відображати повідомлення на екрані, якщо не вдалося налаштувати пристрої введення."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_REMAP_LOAD,
@@ -7040,6 +6969,14 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_MENU_THUMBNAIL_UPSCALE_THRESHOLD,
    "Автоматично збільшувати мініатюри зображень з шириною/висотою менше, ніж зазначене значення. Покращує якість зображення. Має помірний вплив продуктивності."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_MENU_THUMBNAIL_BACKGROUND_ENABLE,
+   "Фони мініатюр"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_MENU_THUMBNAIL_BACKGROUND_ENABLE,
+   "Дозволяє додавати невикористаний простір в мініатюрах із суцільним фоном. Це забезпечує однорідний розмір відображення для всіх зображень, покращує зовнішній вигляд меню, при перегляді змішаних мініатюр вмісту з різними базовими розмірами."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_MENU_TICKER_TYPE,
@@ -9279,11 +9216,11 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CORE_OPTIONS_RESET,
-   "Скинути параметри"
+   "Скинути параметри ядра"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_CORE_OPTIONS_RESET,
-   "Встановити всі параметри ядра для значень за замовчуванням."
+   "Встановити всі параметри поточного ядра для значень за замовчуванням."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CORE_OPTIONS_FLUSH,
@@ -11917,7 +11854,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_MATERIALUI_THUMBNAIL_BACKGROUND_ENABLE,
-   "Малювати тло мініатюри"
+   "Фони мініатюр"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_MATERIALUI_THUMBNAIL_BACKGROUND_ENABLE,
@@ -14912,6 +14849,10 @@ MSG_HASH(
 MSG_HASH(
    MSG_CHEEVOS_LOAD_STATE_PREVENTED_BY_HARDCORE_MODE,
    "Ви повинні призупинити або вимкнути передобуті досягнень для завантаження станів."
+   )
+MSG_HASH(
+   MSG_CHEEVOS_LOAD_SAVEFILE_PREVENTED_BY_HARDCORE_MODE,
+   "Ви повинні призупинити або вимкнути досягнення Хардкорного режиму, щоб завантажити збереження srm."
    )
 MSG_HASH(
    MSG_CHEEVOS_HARDCORE_MODE_DISABLED,

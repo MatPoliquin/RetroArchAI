@@ -156,6 +156,7 @@
  * > Helps to unify menu appearance when viewing
  *   thumbnails of different sizes */
 #define DEFAULT_MATERIALUI_THUMBNAIL_BACKGROUND_ENABLE true
+#define DEFAULT_MENU_THUMBNAIL_BACKGROUND_ENABLE false
 
 #define DEFAULT_SCREEN_BRIGHTNESS 100
 
@@ -569,6 +570,7 @@
 #define DEFAULT_REMAP_SAVE_ON_EXIT true
 
 #define DEFAULT_SHOW_HIDDEN_FILES false
+#define DEFAULT_CORE_SUGGEST_ALWAYS false
 
 /* Initialise file browser with the last used start directory */
 #define DEFAULT_USE_LAST_START_DIRECTORY false
@@ -1090,6 +1092,10 @@
 #define DEFAULT_NOTIFICATION_SHOW_AUTOCONFIG true
 #endif
 
+/* Display a notification when controller
+ * autoconfiguration fails. */
+#define DEFAULT_NOTIFICATION_SHOW_AUTOCONFIG_FAILS true
+
 /* Display a notification when cheats are being
  * applied */
 #define DEFAULT_NOTIFICATION_SHOW_CHEATS_APPLIED true
@@ -1170,7 +1176,7 @@
 
 /* Desired audio latency in milliseconds. Might not be honored
  * if driver can't provide given latency. */
-#if defined(ANDROID) || defined(EMSCRIPTEN) || defined(RETROFW) || defined(MIYOO)
+#if defined(ANDROID) || defined(RETROFW) || defined(MIYOO) || (defined(EMSCRIPTEN) && !defined(HAVE_AUDIOWORKLET))
 /* For most Android devices, 64ms is way too low. */
 #define DEFAULT_OUT_LATENCY 128
 #define DEFAULT_IN_LATENCY 128
@@ -1285,11 +1291,7 @@
 #endif
 
 /* Pause gameplay when window loses focus. */
-#if defined(EMSCRIPTEN)
-#define DEFAULT_PAUSE_NONACTIVE false
-#else
 #define DEFAULT_PAUSE_NONACTIVE true
-#endif
 
 /* Pause gameplay when controller disconnects. */
 #define DEFAULT_PAUSE_ON_DISCONNECT false
@@ -1563,11 +1565,13 @@
 #define DEFAULT_ANALOG_SENSITIVITY 1.0f
 
 /* Describes speed of which turbo-enabled buttons toggle. */
+#define DEFAULT_TURBO_ENABLE true
 #define DEFAULT_TURBO_PERIOD 6
-#define DEFAULT_TURBO_DUTY_CYCLE 3
+#define DEFAULT_TURBO_DUTY_CYCLE 0
 #define DEFAULT_TURBO_MODE 0
-#define DEFAULT_TURBO_DEFAULT_BTN RETRO_DEVICE_ID_JOYPAD_B
-#define DEFAULT_ALLOW_TURBO_DPAD false
+#define DEFAULT_TURBO_BIND -1
+#define DEFAULT_TURBO_BUTTON RETRO_DEVICE_ID_JOYPAD_B
+#define DEFAULT_TURBO_ALLOW_DPAD false
 
 /* Enable automatic mouse grab by default
  * only on Android */
@@ -1613,7 +1617,11 @@
 #endif
 
 #define DEFAULT_INPUT_BIND_TIMEOUT 3
+#if defined(ANDROID)
+#define DEFAULT_INPUT_BIND_HOLD 1
+#else
 #define DEFAULT_INPUT_BIND_HOLD 0
+#endif
 #define DEFAULT_INPUT_POLL_TYPE_BEHAVIOR 2
 #define DEFAULT_INPUT_HOTKEY_BLOCK_DELAY 5
 #define DEFAULT_INPUT_HOTKEY_DEVICE_MERGE false

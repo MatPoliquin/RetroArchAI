@@ -72,6 +72,10 @@ MSG_HASH(
    "Velg hvilken kjerne du skal bruke."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_HELP_CORE_LIST,
+   ".."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_LOAD_CONTENT_LIST,
    "Åpne innhold"
    )
@@ -1285,10 +1289,6 @@ MSG_HASH(
    "Bruker"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_USER_SETTINGS,
-   "Endre innstillinger for brukerkonto, brukernavn og språk."
-   )
-MSG_HASH(
    MENU_ENUM_LABEL_VALUE_DIRECTORY_SETTINGS,
    "Mapper"
    )
@@ -2153,6 +2153,7 @@ MSG_HASH(
    MSG_INPUT_BIND_TIMEOUT,
    "Tidsavbrudd"
    )
+
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_TURBO_PERIOD,
    "Turbo periode"

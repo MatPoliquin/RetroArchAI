@@ -72,6 +72,14 @@ MSG_HASH(
    "Выбраць ядро на выкарыстанне."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CORE_LIST_UNLOAD,
+   "Выгрузіць ядро"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CORE_LIST_UNLOAD,
+   "Выгружае загружанае ядро."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_HELP_CORE_LIST,
    "Выбар ядра libretro. Пры праглядзе браўзэр адчыняе шлях, паказаны для каталога захоўвання ядраў. Калі шлях не зададзены, прагляд пачынаецца з каранёвага каталога.\nКалі каталог захоўвання ядраў з'яўляецца тэчкай, меню будзе выкарыстоўваць яе ў якасці тэчкі верхняга ўзроўня. Ка[...]"
    )
@@ -1446,7 +1454,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_ONSCREEN_DISPLAY_SETTINGS,
-   "Змяніць накладку на дысплэй і клавіятуру, а таксама налады апавяшчэнняў на экране."
+   "Змяніць накладку дысплэя і клавіятуры ды налады экранных апавяшчэнняў."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_USER_INTERFACE_SETTINGS,
@@ -1507,10 +1515,6 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_USER_SETTINGS,
    "Карыстальнік"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_USER_SETTINGS,
-   "Змяніць налады ўліковага запісу, імя карыстальніка ды мовы."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_DIRECTORY_SETTINGS,
@@ -1971,68 +1975,12 @@ MSG_HASH(
    "Устаўка чорнага кадра"
    )
 MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_BLACK_FRAME_INSERTION,
+   "УВАГА: хуткае мігаценне на некаторых дысплэях можа прыводзіць да астаткавай выявы. Выкарыстайце з асцярожнасцю // Устаўляе паміж кадрамі кадр(ы) чорнага колеру. Можа істотна паменшыць размыццё, эмулюючы разгортку ЭПТ, але зніжае яркасць."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_HELP_VIDEO_BLACK_FRAME_INSERTION,
    "Устаўляе паміж кадрамі кадр(ы) чорнага колеру для падвышэння выразнасці руху. Выкарыстоўвайце значэнне толькі для бягучай частаты абнаўлення. Не дастасавальна з частатой абнаўлення не кратнай 60 Гц, напрыклад 144 Гц, 165 Гц і г. д. Не ўключайце адначасова з інтэрвалам абнаўлен[...]"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_120,
-   "1 – для частаты абнаўлення экрану 120 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_180,
-   "2 – для частаты абнаўлення экрану 180 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_240,
-   "3 – для частаты абнаўлення экрану 240 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_300,
-   "4 – для частаты абнаўлення экрану 300 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_360,
-   "5 – для частаты абнаўлення экрану 360 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_420,
-   "6 – для частаты абнаўлення экрану 420 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_480,
-   "7 – для частаты абнаўлення экрану 480 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_540,
-   "8 – для частаты абнаўлення экрану 540 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_600,
-   "9 – для частаты абнаўлення экрану 600 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_660,
-   "10 – для частаты абнаўлення экрану 660 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_720,
-   "11 – для частаты абнаўлення экрану 720 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_780,
-   "12 – для частаты абнаўлення экрану 780 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_840,
-   "13 – для частаты абнаўлення экрану 840 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_900,
-   "14 – для частаты абнаўлення экрану 900 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_BLACK_FRAME_INSERTION_VALUE_960,
-   "15– для частаты абнаўлення экрану 960 Гц"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_BFI_DARK_FRAMES,
@@ -2053,66 +2001,6 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_VIDEO_SHADER_SUBFRAMES,
    "Устаўляе паміж кадрамі дадатковы кадр(ы) шэйдара для ўсіх шэйдарных эфектаў з частатой вышэй частаты кантэнту. Выкарыстоўвайце значэнне толькі для бягучай частаты абнаўлення. Не дастасавальна з частатой абнаўлення не кратнай 60 Гц, напрыклад 144 Гц, 165 Гц і г. д. Не ўключайце [...]"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_120,
-   "2 – для частаты абнаўлення экрану 120 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_180,
-   "3 – для частаты абнаўлення экрану 180 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_240,
-   "4 – для частаты абнаўлення экрану 240 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_300,
-   "5 – для частаты абнаўлення экрану 300 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_360,
-   "6 – для частаты абнаўлення экрану 360 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_420,
-   "7 – для частаты абнаўлення экрану 420 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_480,
-   "8 – для частаты абнаўлення экрану 480 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_540,
-   "9 – для частаты абнаўлення экрану 540 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_600,
-   "10 – для частаты абнаўлення экрану 600 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_660,
-   "11 – для частаты абнаўлення экрану 660 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_720,
-   "12 – для частаты абнаўлення экрану 720 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_780,
-   "13 – для частаты абнаўлення экрану 780 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_840,
-   "14 – для частаты абнаўлення экрану 840 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_900,
-   "15 – для частаты абнаўлення экрану 900 Гц"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_SUBFRAMES_VALUE_960,
-   "16– для частаты абнаўлення экрану 960 Гц"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_GPU_SCREENSHOT,
@@ -2651,14 +2539,6 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_Y,
    "Зрух вобласці прагляду па Y"
    )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_X,
-   "Ўстаноўка зрушэння вобласці прагляду па гарызанталі (калі шырыня перавышае вышыню кантэнту). 0.0 адпавядае леваму краю, 1.0 - праваму."
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_Y,
-   "Ўстаноўка зрушэння вобласці прагляду па вертыкалі (калі вышыня перавышае вышыню кантэнту). 0.0 адпавядае леваму краю, 1.0 - праваму."
-   )
 #if defined(RARCH_MOBILE)
 MSG_HASH(
    MENU_ENUM_LABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
@@ -2675,14 +2555,6 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
    "Зрух вобласці прагляду па Y (партрэтны рэжым)"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
-   "Ўстаноўка зрушэння вобласці прагляду па гарызанталі (калі шырыня перавышае вышыню кантэнту). 0.0 адпавядае леваму краю, 1.0 - праваму. Для (партрэтнага рэжыму)"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
-   "Ўстаноўка зрушэння вобласці прагляду па вертыкалі (калі вышыня перавышае вышыню кантэнту). 0.0 адпавядае леваму краю, 1.0 - праваму. Для (партрэтнага рэжыму)"
    )
 #endif
 MSG_HASH(
@@ -3183,7 +3055,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_AUDIO_RATE_CONTROL_DELTA,
-   "Ўстаноўка на 0 адключае кіраванне частатой. Іншыя значэнні ўплываюць на адхіленне частаты гуку.\nВызначае межы змены зыходнай частаты пры дынамічнай падладцы. Разлічваецца наступным чынам:\\зыходная частата * (1.0 +/- (адхіленне кіравання частатой))"
+   "Ўстаноўка на 0 адключае кіраванне частатой. Іншыя значэнні ўплываюць на адхіленне частаты гуку.\nВызначае межы змены зыходнай частаты пры дынамічнай падладцы. Разлічваецца наступным чынам:\nзыходная частата * (1.0 +/- (адхіленне кіравання частатой))"
    )
 
 /* Settings > Audio > MIDI */
@@ -3497,21 +3369,22 @@ MSG_HASH(
    MSG_INPUT_BIND_HOLD,
    "Утрымлівайце"
    )
+
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_ENABLE,
+   "Турба-кнопкі"
+   )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_TURBO_PERIOD,
    "Перыяд турба"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_TURBO_PERIOD,
-   "Працягласць націску турба-кнопак (у кадрах)."
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_DUTY_CYCLE,
+   "Цыкл дзеяння турба"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_DUTY_CYCLE,
-   "Цыкл працы турба"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_DUTY_CYCLE,
-   "Колькасць кадраў у перыядзе турбарэжыму, у якія кнопкі будуць націснутыя. Калі дадзенае значэнне больш ці роўна перыяду турбарэжыму, кнопкі будуць націснутыя ўвесь час."
+   MENU_ENUM_LABEL_VALUE_TURBO_DUTY_CYCLE_HALF,
+   "Палова перыяду"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_TURBO_MODE,
@@ -3538,44 +3411,24 @@ MSG_HASH(
    "Адна кнопка (Утрымліванне)"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_HELP_TURBO_MODE_CLASSIC,
-   "Класічны рэжым, дзве кнопкі для спрацоўвання. Утрымлівайце кнопку дзеяння і аднаразова націсніце кнопку Турба, каб актываваць цыкл націснуць-адпусціць.\nКнопку Турба можна прызначыць у Налады/Увод/Прывязкі порта 1."
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_BIND,
+   "Актыватар турба"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_HELP_TURBO_MODE_CLASSIC_TOGGLE,
-   "Класічны рэжым пераключэння з дзвюма кнопкамі. Для ўключэння турбарэжыму аднаразова націсніце кнопку Турба пад час утрымання кнопкі дзеяння. Для адключэння турба: зноў націсніце кнопку Турба і ўтрымлівайце кнопку дзеяння.\nКнопку Турба можна прызначыць у Налады/Увод/Пры[...]"
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_BUTTON,
+   "Турба-кнопка"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_HELP_TURBO_MODE_SINGLEBUTTON,
-   "Рэжым пераключэння. Аднаразова націсніце кнопку Турба, каб актываваць цыкл націснуць-адпусціць для абранай кнопкі. Націсніце паўторна для адключэння.\nКнопку Турба можна прызначыць у Налады/Увод/Прывязкі порта 1."
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_ALLOW_DPAD,
+   "Дазвол турба на кірункі D-Pad"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_HELP_TURBO_MODE_SINGLEBUTTON_HOLD,
-   "Рэжым з утрымліваннем. Цыкл націснуць-адпусціць для зададзенай кнопкі дзейнічае пакуль заціснутая кнопка Турба.\nКнопку Турба можна прызначыць у Налады/Увод/Прывязкі порта.\nДля эмуляцыі аўтаматычнага агню ў стылі эпохі хатніх кампутараў, прызначце кнопкі Турба і дзеянне[...]"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_DEFAULT_BUTTON,
-   "Прадвызначаная кнопка турба"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_TURBO_DEFAULT_BUTTON,
-   "Кнопка дзеяння, якая выкарыстоўваецца ў турбарэжымах 'Адна кнопка'."
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_ALLOW_TURBO_DPAD,
-   "Дазваляць турбакірункі D-Pad"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_ALLOW_TURBO_DPAD,
+   MENU_ENUM_SUBLABEL_INPUT_TURBO_ALLOW_DPAD,
    "Калі ўключана, уводы лічбавых кірункаў (таксама вядомыя як d-pad ці 'hatswitch') могуць быць турба."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_TURBO_FIRE_SETTINGS,
    "Турба-кнопкі"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_TURBO_FIRE_SETTINGS,
-   "Налады турба-кнопак.\nНататка: для працы функцыі патрабуецца прывязаць турба-кнопку да прылады ўводу ў адпаведным меню 'Прывязкі порта X'."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_HAPTIC_FEEDBACK_SETTINGS,
@@ -3676,32 +3529,16 @@ MSG_HASH(
    "Адключэнне кнопкі даведкі"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_DISABLE_INFO_BUTTON,
-   "Калі ўключана, націсканні кнопкі даведкі будуць ігнаравацца."
-   )
-MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_SEARCH_BUTTON,
    "Адключэнне кнопкі пошуку"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_DISABLE_SEARCH_BUTTON,
-   "Калі ўключана, націсканні кнопкі пошуку будуць ігнаравацца."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_LEFT_ANALOG_IN_MENU,
    "Адключыць левы аналагавы стык у меню"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_DISABLE_LEFT_ANALOG_IN_MENU,
-   "Прадухіліць пераход па меню левым аналагавымі стыкам."
-   )
-MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_RIGHT_ANALOG_IN_MENU,
    "Адключыць правы аналагавы стык у меню"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_INPUT_DISABLE_RIGHT_ANALOG_IN_MENU,
-   "Прадухіліць пераход па меню правым аналагавымі стыкам."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_MENU_INPUT_SWAP_OK_CANCEL,
@@ -4090,7 +3927,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_META_UI_COMPANION_TOGGLE,
-   "Выклікае дапаможны інтэрфейс WIMP (Windows, Icons, Menus, Pointer)."
+   "Выклікае дапаможны карыстальніцкі інтэрфейс WIMP (Windows, Icons, Menus, Pointer)."
    )
 
 MSG_HASH(
@@ -4156,7 +3993,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_META_AI_SERVICE,
-   "Захапляе выяву бягучага кантэнту для перакладу і/або агучвае любы тэкст на экране. 'AI-сэрвіс' павінен быць уключаны і наладжаны."
+   "Захапляе выяву бягучага змесціва на пераклад ды/або агучвае любы тэкст на экране. 'ШІ-сэрвіс' павінен быць уключаны і наладжаны."
    )
 
 MSG_HASH(
@@ -4448,7 +4285,7 @@ MSG_HASH(
    "Пісталет D-Pad направа"
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_ENABLE,
+   MENU_ENUM_LABEL_VALUE_INPUT_TURBO,
    "Турба"
    )
 
@@ -5735,7 +5572,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_FONT_ENABLE,
-   "Вывад паведамленняў на экран."
+   "Паказваць экранныя паведамленні."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_MENU_WIDGETS_ENABLE,
@@ -5838,12 +5675,16 @@ MSG_HASH(
    "Апавяшчэнне пра злучэнне прылады ўводу (аўтаканфігурацыя)"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_AUTOCONFIG_FAILS,
+   "Апавяшчэнні пра памылкі прылад увода (аўтаканфігурацыя)"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_CHEATS_APPLIED,
    "Апавяшчэнні пра чыт-коды"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_CHEATS_APPLIED,
-   "Адлюстроўваць паведамленне пры загрузцы чыт-кодаў."
+   "Адлюстроўваць экраннае паведамленне пры загрузцы чыт-кодаў."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_PATCH_APPLIED,
@@ -5851,11 +5692,11 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_PATCH_APPLIED,
-   "Адлюстроўваць паведамленне, калі да ROM ужыты софт-патч."
+   "Адлюстроўваць экраннае паведамленне, калі да ROM ужыты софт-патч."
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_AUTOCONFIG,
-   "Адлюстроўваць паведамленне пры злучэнне/адлучэнне прылад уводу."
+   "Адлюстроўваць экраннае паведамленне пры злучэнне/адлучэнне прылад уводу."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_REMAP_LOAD,
@@ -5863,7 +5704,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_REMAP_LOAD,
-   "Адлюстроўваць паведамленне пры загрузцы файлаў раскладак кіравання."
+   "Адлюстроўваць экраннае паведамленне пры загрузцы файлаў раскладак кіравання."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_CONFIG_OVERRIDE_LOAD,
@@ -5871,7 +5712,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_CONFIG_OVERRIDE_LOAD,
-   "Паказваць паведамленне пры загрузцы перавызначэння канфігурацыі."
+   "Паказваць экраннае паведамленне пры загрузцы перавызначэння канфігурацыі."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_SET_INITIAL_DISK,
@@ -5879,7 +5720,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_SET_INITIAL_DISK,
-   "Адлюстроўваць паведамленне пры аўтаматычным запуску апошняга выкарыстанага дыска з дапамогай M3U-плэйліста для мультыдыскавага кантэнту."
+   "Адлюстроўваць экраннае паведамленне пры аўтаматычным запуску апошняга выкарыстанага дыска з дапамогай M3U-плэйліста для шматдыскавага змесціва."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_DISK_CONTROL,
@@ -5887,7 +5728,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_DISK_CONTROL,
-   "Адлюстроўваць паведамленне пры ўстаўцы і выманні дыска."
+   "Адлюстроўваць экраннае паведамленне пры ўстаўцы і выманні дыска."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_SAVE_STATE,
@@ -5895,7 +5736,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_SAVE_STATE,
-   "Адлюстроўваць на экране паведамленне пры захаванні ды загрузцы станаў."
+   "Адлюстроўваць экраннае паведамленне пры захаванні ды загрузцы станаў."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_FAST_FORWARD,
@@ -5911,7 +5752,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_SCREENSHOT,
-   "Адлюстроўваць паведамленне пры захаванні скрыншота."
+   "Адлюстроўваць экраннае паведамленне пры захаванні здымка экрана."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_SCREENSHOT_DURATION,
@@ -5943,7 +5784,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_SCREENSHOT_FLASH,
-   "Адлюстраванне на экране эфекту ўспышкі з зададзенай працягласцю пры стварэнні скрыншота."
+   "Адлюстраванне на экране эфекту ўспышкі з зададзенай працягласцю пры стварэнні здымка экрана."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_SCREENSHOT_FLASH_NORMAL,
@@ -5959,7 +5800,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_REFRESH_RATE,
-   "Адлюстроўваць паведамленне пры змене частаты абнаўлення."
+   "Адлюстроўваць экраннае паведамленне пры змене частаты абнаўлення."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NOTIFICATION_SHOW_NETPLAY_EXTRA,
@@ -6268,15 +6109,15 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_UI_COMPANION_ENABLE,
-   "Дадатковы інтэрфейс"
+   "Дапаможны інтэрфейс"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_UI_COMPANION_START_ON_BOOT,
-   "Запуск дадатковага інтэрфейсу пры загрузцы"
+   "Запуск дапаможнага інтэрфейсу пры загрузцы"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_HELP_UI_COMPANION_START_ON_BOOT,
-   "Запускаць дадатковы драйвер карыстальніцкага інтэрфейсу пры загрузцы (калі даступна)."
+   "Запускаць драйвер дапаможнага карыстальніцкага інтэрфейсу пры загрузцы (калі даступна)."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_DESKTOP_MENU_ENABLE,
@@ -6708,11 +6549,11 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CONTENT_SHOW_OVERLAYS,
-   "Паказваць 'Аверлэі'"
+   "Паказ 'Экранныя накладкі'"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_CONTENT_SHOW_OVERLAYS,
-   "Паказваць опцыю 'Аверлэі'."
+   "Паказваць опцыю 'Экранныя накладкі'."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CONTENT_SHOW_VIDEO_LAYOUT,
@@ -7074,6 +6915,14 @@ MSG_HASH(
    "Аўтаматычна маштабаваць эскізы з шырынёй/вышынёй менш зададзенага значэння. Падвышае якасць малюнка, умерана ўплываючы на ​​прадукцыйнасць."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_MENU_THUMBNAIL_BACKGROUND_ENABLE,
+   "Фоны мініяцюр"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_MENU_THUMBNAIL_BACKGROUND_ENABLE,
+   "Уключае запаўненне вольнай прасторы вакол мініяцюр суцэльным фонам. Забяспечвае адзіную памернасць для ўсіх малюнкаў, паляпшаючы адлюстраванне меню пры праглядзе эскізаў рознага памеру."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_MENU_TICKER_TYPE,
    "Анімацыя бягучага радка"
    )
@@ -7269,7 +7118,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_CHEEVOS_APPEARANCE_SETTINGS,
-   "Настройка размяшчэння і зрушэнняў для наэкранных апавяшчэнняў аб дасягненнях."
+   "Змяніць размяшчэнне і зрухі экранных апавяшчэнняў пра дасягненні."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CHEEVOS_APPEARANCE_ANCHOR,
@@ -9323,11 +9172,11 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CORE_OPTIONS_RESET,
-   "Скінуць опцыі"
+   "Скід опцый ядра"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_CORE_OPTIONS_RESET,
-   "Задаць усім опцыям ядра прадвызначаныя значэнні."
+   "Скінуць усе значэнні опцый бягучага ядра да прадвызначаных."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CORE_OPTIONS_FLUSH,
@@ -11889,7 +11738,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_MATERIALUI_THUMBNAIL_BACKGROUND_ENABLE,
-   "Дадаваць фон да эскізаў"
+   "Фоны мініяцюр"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_MATERIALUI_THUMBNAIL_BACKGROUND_ENABLE,
@@ -14890,6 +14739,10 @@ MSG_HASH(
    "Загрузка станаў патрабуе адключэння ці прыпынення хардкор рэжыму дасягненняў."
    )
 MSG_HASH(
+   MSG_CHEEVOS_LOAD_SAVEFILE_PREVENTED_BY_HARDCORE_MODE,
+   "Загрузка станаў патрабуе адключэння ці прыпынення хардкор рэжыму дасягненняў."
+   )
+MSG_HASH(
    MSG_CHEEVOS_HARDCORE_MODE_DISABLED,
    "Загружана захаванне стану. Хардкор рэжым дасягненняў у бягучым сеансе адключаны."
    )
@@ -15916,8 +15769,28 @@ MSG_HASH(
    )
 #ifdef HAVE_GAME_AI
 
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CORE_GAME_AI_OPTIONS,
+   "Гульнявы ШІ"
+   )
 
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_GAME_AI_OVERRIDE_P1,
+   "Перавызначыць гульца 1"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_GAME_AI_OVERRIDE_P1,
+   "Перавызначыць гульца 1"
+   )
 
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_GAME_AI_OVERRIDE_P2,
+   "Перавызначыць гульца 2"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_GAME_AI_OVERRIDE_P2,
+   "Перавызначыць гульца 2"
+   )
 
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_GAME_AI_SHOW_DEBUG,
@@ -15928,4 +15801,12 @@ MSG_HASH(
    "Паказваць адладку"
    )
 
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_QUICK_MENU_SHOW_GAME_AI,
+   "Паказваць 'Гульнявы ШІ'"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_QUICK_MENU_SHOW_GAME_AI,
+   "Паказваць опцыю 'Гульнявы ШІ'."
+   )
 #endif

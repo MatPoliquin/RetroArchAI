@@ -41,6 +41,7 @@ RETRO_BEGIN_DECLS
 
 enum event_command
 {
+   CMD_SPECIAL = -1,
    CMD_EVENT_NONE = 0,
    /* Resets RetroArch. */
    CMD_EVENT_RESET,
@@ -228,6 +229,8 @@ enum event_command
    CMD_EVENT_DISK_APPEND_IMAGE,
    /* Stops rumbling. */
    CMD_EVENT_RUMBLE_STOP,
+   /* Toggles turbo fire. */
+   CMD_EVENT_TURBO_FIRE_TOGGLE,
    /* Toggles mouse grab. */
    CMD_EVENT_GRAB_MOUSE_TOGGLE,
    /* Toggles game focus. */
@@ -255,6 +258,7 @@ enum event_command
    CMD_EVENT_AI_SERVICE_CALL,
    /* Misc. */
    CMD_EVENT_SAVE_FILES,
+   CMD_EVENT_LOAD_FILES,
    CMD_EVENT_CONTROLLER_INIT,
    CMD_EVENT_DISCORD_INIT,
    CMD_EVENT_PRESENCE_UPDATE,
@@ -329,11 +333,20 @@ struct rarch_state;
 bool command_event(enum event_command action, void *data);
 
 /* Constructors for the supported drivers */
+#ifdef HAVE_NETWORK_CMD
 command_t* command_network_new(uint16_t port);
-command_t* command_stdin_new(void);
-command_t* command_uds_new(void);
-
 bool command_network_send(const char *cmd_);
+#endif
+#ifdef HAVE_STDIN_CMD
+command_t* command_stdin_new(void);
+#endif
+#ifdef LAKKA
+command_t* command_uds_new(void);
+#endif
+#ifdef EMSCRIPTEN
+command_t* command_emscripten_new(void);
+#endif
+
 
 void command_event_set_mixer_volume(
       settings_t *settings,
@@ -408,6 +421,8 @@ bool command_get_config_param(command_t *cmd, const char* arg);
 bool command_show_osd_msg(command_t *cmd, const char* arg);
 bool command_load_state_slot(command_t *cmd, const char* arg);
 bool command_play_replay_slot(command_t *cmd, const char* arg);
+bool command_save_savefiles(command_t *cmd, const char* arg);
+bool command_load_savefiles(command_t *cmd, const char* arg);
 #ifdef HAVE_CHEEVOS
 bool command_read_ram(command_t *cmd, const char *arg);
 bool command_write_ram(command_t *cmd, const char *arg);
@@ -434,6 +449,9 @@ static const struct cmd_action_map action_map[] = {
 
    { "LOAD_STATE_SLOT",command_load_state_slot, "<slot number>"},
    { "PLAY_REPLAY_SLOT",command_play_replay_slot, "<slot number>"},
+
+   { "SAVE_FILES", command_save_savefiles, "No argument"},
+   { "LOAD_FILES", command_load_savefiles, "No argument"},
 };
 
 static const struct cmd_map map[] = {
@@ -470,6 +488,7 @@ static const struct cmd_map map[] = {
    { "DISK_PREV",              RARCH_DISK_PREV },
 
    { "SHADER_TOGGLE",          RARCH_SHADER_TOGGLE },
+   { "SHADER_HOLD",            RARCH_SHADER_HOLD },
    { "SHADER_NEXT",            RARCH_SHADER_NEXT },
    { "SHADER_PREV",            RARCH_SHADER_PREV },
 
@@ -481,6 +500,7 @@ static const struct cmd_map map[] = {
    { "RECORDING_TOGGLE",       RARCH_RECORDING_TOGGLE },
    { "STREAMING_TOGGLE",       RARCH_STREAMING_TOGGLE },
 
+   { "TURBO_FIRE_TOGGLE",      RARCH_TURBO_FIRE_TOGGLE },
    { "GRAB_MOUSE_TOGGLE",      RARCH_GRAB_MOUSE_TOGGLE },
    { "GAME_FOCUS_TOGGLE",      RARCH_GAME_FOCUS_TOGGLE },
    { "FULLSCREEN_TOGGLE",      RARCH_FULLSCREEN_TOGGLE_KEY },

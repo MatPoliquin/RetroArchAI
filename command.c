@@ -337,7 +337,7 @@ command_t* command_stdin_new(void)
    command_t *cmd;
    command_stdin_t *stdincmd;
 
-#ifndef _WIN32
+#if !(defined(_WIN32) || defined(EMSCRIPTEN))
 #ifdef HAVE_NETWORKING
    if (!socket_nonblock(STDIN_FILENO))
       return NULL;
@@ -358,6 +358,58 @@ command_t* command_stdin_new(void)
    cmd->poll    = command_stdin_poll;
    cmd->replier = stdin_command_reply;
    cmd->destroy = stdin_command_free;
+
+   return cmd;
+}
+#endif
+
+#if defined(EMSCRIPTEN)
+#include "frontend/drivers/platform_emscripten.h"
+typedef struct
+{
+   char command_buf[CMD_BUF_SIZE];
+} command_emscripten_t;
+
+static void emscripten_command_reply(command_t *_cmd,
+   const char *s, size_t len)
+{
+   platform_emscripten_command_reply(s, len);
+}
+
+static void emscripten_command_free(command_t *handle)
+{
+   free(handle->userptr);
+   free(handle);
+}
+
+static void command_emscripten_poll(command_t *handle)
+{
+   command_emscripten_t *emscriptencmd = (command_emscripten_t*)handle->userptr;
+   ptrdiff_t msg_len = platform_emscripten_command_read((char **)(&emscriptencmd->command_buf), CMD_BUF_SIZE);
+   if (msg_len == 0)
+      return;
+   command_parse_msg(handle, emscriptencmd->command_buf);
+}
+
+command_t* command_emscripten_new(void)
+{
+   command_t *cmd;
+   command_emscripten_t *emscriptencmd;
+
+   cmd           = (command_t*)calloc(1, sizeof(command_t));
+   emscriptencmd = (command_emscripten_t*)calloc(1, sizeof(command_emscripten_t));
+
+   if (!cmd)
+      return NULL;
+   if (!emscriptencmd)
+   {
+      free(cmd);
+      return NULL;
+   }
+   cmd->userptr = emscriptencmd;
+   cmd->poll    = command_emscripten_poll;
+   cmd->replier = emscripten_command_reply;
+   cmd->destroy = emscripten_command_free;
 
    return cmd;
 }
@@ -688,13 +740,12 @@ bool command_show_osd_msg(command_t *cmd, const char* arg)
 
 bool command_load_state_slot(command_t *cmd, const char *arg)
 {
-   char state_path[16384];
+   char state_path[PATH_MAX_LENGTH] = "";
    size_t _len                  = 0;
    char reply[128]              = "";
    unsigned int slot            = (unsigned int)strtoul(arg, NULL, 10);
    bool savestates_enabled      = core_info_current_supports_savestate();
    bool ret                     = false;
-   state_path[0]                = '\0';
    _len  = strlcpy(reply, "LOAD_STATE_SLOT ", sizeof(reply));
    _len += snprintf(reply + _len, sizeof(reply) - _len, "%d", slot);
    if (savestates_enabled)
@@ -758,6 +809,35 @@ bool command_play_replay_slot(command_t *cmd, const char *arg)
 #endif
 }
 
+bool command_save_savefiles(command_t *cmd, const char* arg)
+{
+   char reply[4];
+   bool ret;
+   size_t  _len  = strlcpy(reply, "OK", sizeof(reply));
+   reply[  _len] = '\n';
+   reply[++_len] = '\0';
+   /* In the future, this should probably send each saved file path
+      to the replier. */
+   ret = command_event(CMD_EVENT_SAVE_FILES, NULL);
+   if (!ret)
+     strlcpy(reply, "NO", sizeof(reply));
+   cmd->replier(cmd, reply, _len);
+   return ret;
+}
+
+bool command_load_savefiles(command_t *cmd, const char* arg)
+{
+   char reply[4];
+   bool ret;
+   size_t  _len  = strlcpy(reply, "OK", sizeof(reply));
+   reply[  _len] = '\n';
+   reply[++_len] = '\0';
+   ret = command_event(CMD_EVENT_LOAD_FILES, NULL);
+   if (!ret)
+     strlcpy(reply, "NO", sizeof(reply));
+   cmd->replier(cmd, reply, _len);
+   return ret;
+}
 
 #if defined(HAVE_CHEEVOS)
 bool command_read_ram(command_t *cmd, const char *arg)
@@ -938,7 +1018,7 @@ bool command_get_status(command_t *cmd, const char* arg)
       _len    += strlcpy(reply + _len,
             path_basename(path_get(RARCH_PATH_BASENAME)), sizeof(reply) - _len);
       _len    += snprintf(reply + _len, sizeof(reply) - _len,
-            ",crc32=%x\n", content_get_crc());
+            ",crc32=%lx\n", (unsigned long)content_get_crc());
    }
    else
        _len = strlcpy(reply, "GET_STATUS CONTENTLESS", sizeof(reply));
@@ -1307,7 +1387,7 @@ void command_event_init_cheats(
 
 bool command_event_load_entry_state(settings_t *settings)
 {
-   char entry_state_path[PATH_MAX_LENGTH];
+   char entry_state_path[PATH_MAX_LENGTH] = "";
    int entry_path_stats;
    runloop_state_t *runloop_st     = runloop_state_get_ptr();
    bool ret                        = false;
@@ -1323,8 +1403,6 @@ bool command_event_load_entry_state(settings_t *settings)
    if (netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL))
       return false;
 #endif
-
-   entry_state_path[0] = '\0';
 
    if (!runloop_get_entry_state_path(
          entry_state_path, sizeof(entry_state_path),
@@ -2057,14 +2135,12 @@ void command_event_remove_current_config(enum override_type type)
 
 bool command_event_main_state(unsigned cmd)
 {
-   char msg[128];
-   char state_path[16384]; /* TODO/FIXME - reduce this */
+   char msg[128]               = "";
+   char state_path[PATH_MAX_LENGTH] = "";
    size_t _len                 = 0;
    settings_t *settings        = config_get_ptr();
    bool savestates_enabled     = core_info_current_supports_savestate();
    bool ret                    = false;
-
-   state_path[0] = msg[0]      = '\0';
 
    if (savestates_enabled)
    {

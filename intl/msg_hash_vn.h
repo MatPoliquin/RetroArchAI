@@ -1169,10 +1169,6 @@ MSG_HASH(
    "Người dùng"
    )
 MSG_HASH(
-   MENU_ENUM_SUBLABEL_USER_SETTINGS,
-   "Thay đổi cài đặt tài khoản, tên đăng nhập và ngôn ngữ."
-   )
-MSG_HASH(
    MENU_ENUM_LABEL_VALUE_DIRECTORY_SETTINGS,
    "Thư mục"
    )
@@ -1497,6 +1493,7 @@ MSG_HASH(
 #endif
 #ifdef ANDROID
 #endif
+
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_HOTKEY_BINDS,
    "Kích hoạt hotkeys"
@@ -1567,10 +1564,6 @@ MSG_HASH(
 
 /* Settings > Input > Port # Controls */
 
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_TURBO_ENABLE,
-   "Kích hoạt Turbo"
-   )
 
 /* Settings > Latency */
 

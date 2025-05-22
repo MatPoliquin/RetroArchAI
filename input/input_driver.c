@@ -1505,22 +1505,40 @@ static int16_t input_state_device(
 #endif
             }
 
-            /* Don't allow turbo for D-pad unless explicitly allowed. */
-            if (          (id  < RETRO_DEVICE_ID_JOYPAD_UP)
-                  || (    ((settings->bools.input_allow_turbo_dpad)
-                       || (id  > RETRO_DEVICE_ID_JOYPAD_RIGHT))
-                       && (id <= RETRO_DEVICE_ID_JOYPAD_R3)))
+            if (id <= RETRO_DEVICE_ID_JOYPAD_R3)
             {
-               /*
-                * Apply turbo button if activated.
-                */
-               unsigned turbo_mode = settings->uints.input_turbo_mode;
+               /* Apply turbo button if activated. */
+               uint8_t turbo_period     = settings->uints.input_turbo_period;
+               uint8_t turbo_duty_cycle = settings->uints.input_turbo_duty_cycle;
+               uint8_t turbo_mode       = settings->uints.input_turbo_mode;
+
+               /* Don't allow classic mode turbo for D-pad unless explicitly allowed. */
+               if (     turbo_mode <= INPUT_TURBO_MODE_CLASSIC_TOGGLE
+                     && !settings->bools.input_turbo_allow_dpad
+                     && id >= RETRO_DEVICE_ID_JOYPAD_UP
+                     && id <= RETRO_DEVICE_ID_JOYPAD_RIGHT)
+                  break;
+
+               if (turbo_duty_cycle == 0)
+                  turbo_duty_cycle = turbo_period / 2;
+
+               /* Clear underlying button to prevent duplicates. */
+               if (     input_st->turbo_btns.frame_enable[port]
+                     && (int)id == settings->ints.input_turbo_bind)
+                  res = 0;
 
                if (turbo_mode > INPUT_TURBO_MODE_CLASSIC_TOGGLE)
                {
-                  /* Pressing turbo button toggles turbo mode on or off.
-                   * Holding the button will
-                   * pass through, else the pressed state will be modulated by a
+                  unsigned turbo_button = settings->uints.input_turbo_button;
+                  unsigned remap_button = settings->uints.input_remap_ids[port][turbo_button];
+
+                  /* Single button modes only care about the defined button. */
+                  if (id != remap_button)
+                     break;
+
+                  /* Pressing turbo bind toggles turbo button on or off.
+                   * Holding the button will pass through, else
+                   * the pressed state will be modulated by a
                    * periodic pulse defined by the configured duty cycle.
                    */
 
@@ -1530,26 +1548,9 @@ static int16_t input_state_device(
                   else if (input_st->turbo_btns.turbo_pressed[port] >= 0)
                   {
                      input_st->turbo_btns.turbo_pressed[port] |= (1 << 31);
-                     /* Toggle turbo for selected buttons. */
-                     if (input_st->turbo_btns.enable[port]
-                           != (1 << settings->uints.input_turbo_default_button))
-                     {
-                        static const int button_map[]={
-                           RETRO_DEVICE_ID_JOYPAD_B,
-                           RETRO_DEVICE_ID_JOYPAD_Y,
-                           RETRO_DEVICE_ID_JOYPAD_A,
-                           RETRO_DEVICE_ID_JOYPAD_X,
-                           RETRO_DEVICE_ID_JOYPAD_L,
-                           RETRO_DEVICE_ID_JOYPAD_R,
-                           RETRO_DEVICE_ID_JOYPAD_L2,
-                           RETRO_DEVICE_ID_JOYPAD_R2,
-                           RETRO_DEVICE_ID_JOYPAD_L3,
-                           RETRO_DEVICE_ID_JOYPAD_R3};
-                        input_st->turbo_btns.enable[port] = 1 << button_map[
-                           MIN(
-                                 ARRAY_SIZE(button_map) - 1,
-                                 settings->uints.input_turbo_default_button)];
-                     }
+                     /* Toggle turbo for selected button. */
+                     if (input_st->turbo_btns.enable[port] != (1 << id))
+                        input_st->turbo_btns.enable[port] = (1 << id);
                      input_st->turbo_btns.mode1_enable[port] ^= 1;
                   }
 
@@ -1563,33 +1564,26 @@ static int16_t input_state_device(
                      {
                         uint16_t enable_new;
                         input_st->turbo_btns.turbo_pressed[port] |= 1 << id;
-                        /* Toggle turbo for pressed button but make
-                         * sure at least one button has turbo */
                         enable_new = input_st->turbo_btns.enable[port] ^ (1 << id);
                         if (enable_new)
                            input_st->turbo_btns.enable[port] = enable_new;
                      }
                   }
                   /* Hold mode stops turbo on release */
-                  else if (
-                           turbo_mode == INPUT_TURBO_MODE_SINGLEBUTTON_HOLD
-                        && input_st->turbo_btns.enable[port]
-                        && input_st->turbo_btns.mode1_enable[port])
+                  else if ((turbo_mode == INPUT_TURBO_MODE_SINGLEBUTTON_HOLD)
+                        && (input_st->turbo_btns.enable[port])
+                        && (input_st->turbo_btns.mode1_enable[port]))
                      input_st->turbo_btns.mode1_enable[port] = 0;
 
-                  if (!res && input_st->turbo_btns.mode1_enable[port] &&
-                        input_st->turbo_btns.enable[port] & (1 << id))
-                  {
-                     /* If turbo button is enabled for this key ID */
-                     res = ((   input_st->turbo_btns.count
-                              % settings->uints.input_turbo_period)
-                           < settings->uints.input_turbo_duty_cycle);
-                  }
+                  if (     (!res)
+                        && (input_st->turbo_btns.mode1_enable[port])
+                        && (input_st->turbo_btns.enable[port] & (1 << id)))
+                     res = ((input_st->turbo_btns.count % turbo_period) < turbo_duty_cycle);
                }
                else if (turbo_mode == INPUT_TURBO_MODE_CLASSIC)
                {
-                  /* If turbo button is held, all buttons pressed except
-                   * for D-pad will go into a turbo mode. Until the button is
+                  /* If turbo button is held, all buttons pressed
+                   * will go into a turbo mode. Until the button is
                    * released again, the input state will be modulated by a
                    * periodic pulse defined by the configured duty cycle.
                    */
@@ -1600,9 +1594,7 @@ static int16_t input_state_device(
 
                      if (input_st->turbo_btns.enable[port] & (1 << id))
                         /* if turbo button is enabled for this key ID */
-                        res = ((input_st->turbo_btns.count
-                                 % settings->uints.input_turbo_period)
-                              < settings->uints.input_turbo_duty_cycle);
+                        res = ((input_st->turbo_btns.count % turbo_period) < turbo_duty_cycle);
                   }
                   else
                      input_st->turbo_btns.enable[port] &= ~(1 << id);
@@ -1625,17 +1617,13 @@ static int16_t input_state_device(
                      }
                   }
                   else
-                  {
                      input_st->turbo_btns.turbo_pressed[port] &= ~(1 << id);
-                  }
 
                   if (res)
                   {
                      if (input_st->turbo_btns.enable[port] & (1 << id))
                         /* If turbo button is enabled for this key ID */
-                        res = ((   input_st->turbo_btns.count
-                                 % settings->uints.input_turbo_period)
-                              < settings->uints.input_turbo_duty_cycle);
+                        res = ((input_st->turbo_btns.count % turbo_period) < turbo_duty_cycle);
                   }
                }
             }
@@ -1791,7 +1779,7 @@ static int16_t input_state_device(
                   input_st->overlay_ptr, port, device, idx, id);
 #endif
 
-         if (res && input_st->flags & INP_FLAG_BLOCK_POINTER_INPUT)
+         if (res || input_st->flags & INP_FLAG_BLOCK_POINTER_INPUT)
             break;
 
          if (id < RARCH_FIRST_META_KEY)
@@ -3271,14 +3259,9 @@ static void input_overlay_poll_mouse(settings_t *settings,
       mouse_st->click = 0;
       pending_click   = false;
 
-      if (ptr_count)
-      {
-         /* Assume main pointer changed. Reset deltas */
-         mouse_st->prev_screen_x = x_start = ptr_st->screen_x;
-         mouse_st->prev_screen_y = y_start = ptr_st->screen_y;
-      }
-      else
-         old_peak_ptr_count = peak_ptr_count;
+      /* Assume main pointer changed. Reset deltas */
+      mouse_st->prev_screen_x = x_start = ptr_st->screen_x;
+      mouse_st->prev_screen_y = y_start = ptr_st->screen_y;
 
       if (ptr_count > old_ptr_count)
       {
@@ -3287,8 +3270,12 @@ static void input_overlay_poll_mouse(settings_t *settings,
          start_usec     = now_usec;
       }
       else
+      {
          /* Pointer removed */
          mouse_st->hold = 0;
+         if (!ptr_count)
+            old_peak_ptr_count = peak_ptr_count;
+      }
    }
 
    /* Action type */
@@ -3638,8 +3625,6 @@ static void input_poll_overlay(
       if (ptr_state->device_mask & (1 << RETRO_DEVICE_MOUSE))
          input_overlay_poll_mouse(settings, &ptr_state->mouse, ol,
                ptr_state->count, old_ptr_count);
-
-      ptr_state->device_mask = 0;
    }
 
    if (     OVERLAY_GET_KEY(ol_state, RETROK_LSHIFT)
@@ -3729,10 +3714,19 @@ static void input_poll_overlay(
          (input_overlay_show_inputs == OVERLAY_SHOW_INPUT_TOUCHED),
          input_overlay_show_inputs_port);
 
-   if (button_pressed || ol_ptr_enable)
+   /* Block other touchscreen input as needed. */
+   if (     button_pressed
+#ifdef IOS
+         || (ptr_state->device_mask & (1 << RETRO_DEVICE_LIGHTGUN))
+         || (ol->flags & INPUT_OVERLAY_BLOCKED))
+#else
+         || ol_ptr_enable)
+#endif
       input_st->flags |=  INP_FLAG_BLOCK_POINTER_INPUT;
    else
       input_st->flags &= ~INP_FLAG_BLOCK_POINTER_INPUT;
+
+   ptr_state->device_mask = 0;
 
    if (input_overlay_show_inputs == OVERLAY_SHOW_INPUT_NONE)
       button_pressed = false;
@@ -5104,10 +5098,14 @@ void input_driver_init_command(input_driver_state_t *input_st,
    }
 #endif
 
-#ifdef HAVE_LAKKA
+#if defined(HAVE_LAKKA)
    if (!(input_st->command[2] = command_uds_new()))
       RARCH_ERR("Failed to initialize the UDS command interface.\n");
+#elif defined(EMSCRIPTEN)
+   if (!(input_st->command[2] = command_emscripten_new()))
+      RARCH_ERR("Failed to initialize the emscripten command interface.\n");
 #endif
+
 }
 
 void input_driver_deinit_command(input_driver_state_t *input_st)
@@ -6403,17 +6401,24 @@ void input_driver_poll(void)
     * when mapping analog stick to dpad input. */
    for (i = 0; i < max_users; i++)
    {
+      uint16_t button_id = RARCH_TURBO_ENABLE;
+
+      if (settings->ints.input_turbo_bind != -1)
+         button_id = settings->ints.input_turbo_bind;
+
       joypad_info[i].axis_threshold        = input_axis_threshold;
       joypad_info[i].joy_idx               = settings->uints.input_joypad_index[i];
       joypad_info[i].auto_binds            = input_autoconf_binds[joypad_info[i].joy_idx];
 
-      input_st->turbo_btns.frame_enable[i] = (*input_st->libretro_input_binds[i])[RARCH_TURBO_ENABLE].valid ?
+      input_st->turbo_btns.frame_enable[i] =
+               (*input_st->libretro_input_binds[i])[button_id].valid
+            && settings->bools.input_turbo_enable ?
          input_state_wrap(input_st->current_driver, input_st->current_data,
                joypad, sec_joypad, &joypad_info[i],
                (*input_st->libretro_input_binds),
                (input_st->flags & INP_FLAG_KB_MAPPING_BLOCKED) ? true : false,
                (unsigned)i,
-               RETRO_DEVICE_JOYPAD, 0, RARCH_TURBO_ENABLE) : 0;
+               RETRO_DEVICE_JOYPAD, 0, button_id) : 0;
    }
 
 #ifdef HAVE_OVERLAY
@@ -6774,7 +6779,12 @@ void input_driver_poll(void)
             ssize_t ret;
             struct remote_message msg;
 
+
+#if defined(_WIN32)
+            if (input_st->remote->net_fd[user] == INVALID_SOCKET)
+#else
             if (input_st->remote->net_fd[user] < 0)
+#endif
                return;
 
             FD_ZERO(&fds);
@@ -6956,12 +6966,17 @@ void input_remapping_cache_global_config(void)
             RARCH_OVERRIDE_SETTING_LIBRETRO_DEVICE, &i))
          device = settings->uints.input_libretro_device[i];
 
-      input_st->old_analog_dpad_mode[i] = settings->uints.input_analog_dpad_mode[i];
-      input_st->old_libretro_device[i]  = device;
+      input_st->remapping_cache.analog_dpad_mode[i] = settings->uints.input_analog_dpad_mode[i];
+      input_st->remapping_cache.libretro_device[i]  = device;
    }
 
-   input_st->flags |= INP_FLAG_OLD_ANALOG_DPAD_MODE_SET
-                    | INP_FLAG_OLD_LIBRETRO_DEVICE_SET;
+   input_st->remapping_cache.turbo_enable     = settings->bools.input_turbo_enable;
+   input_st->remapping_cache.turbo_allow_dpad = settings->bools.input_turbo_allow_dpad;
+   input_st->remapping_cache.turbo_bind       = settings->ints.input_turbo_bind;
+   input_st->remapping_cache.turbo_mode       = settings->uints.input_turbo_mode;
+   input_st->remapping_cache.turbo_button     = settings->uints.input_turbo_button;
+   input_st->remapping_cache.turbo_period     = settings->uints.input_turbo_period;
+   input_st->remapping_cache.turbo_duty_cycle = settings->uints.input_turbo_duty_cycle;
 }
 
 void input_remapping_restore_global_config(bool clear_cache, bool restore_analog_dpad_mode)
@@ -6975,27 +6990,47 @@ void input_remapping_restore_global_config(bool clear_cache, bool restore_analog
 
    for (i = 0; i < MAX_USERS; i++)
    {
-      if (   (input_st->flags & INP_FLAG_OLD_ANALOG_DPAD_MODE_SET)
-          &&  restore_analog_dpad_mode
-          && (settings->uints.input_analog_dpad_mode[i] !=
-               input_st->old_analog_dpad_mode[i]))
+      if (restore_analog_dpad_mode)
          configuration_set_uint(settings,
                settings->uints.input_analog_dpad_mode[i],
-               input_st->old_analog_dpad_mode[i]);
+               input_st->remapping_cache.analog_dpad_mode[i]);
 
-      if (   (input_st->flags & INP_FLAG_OLD_LIBRETRO_DEVICE_SET)
-          && (settings->uints.input_libretro_device[i] !=
-               input_st->old_libretro_device[i]))
-         configuration_set_uint(settings,
-               settings->uints.input_libretro_device[i],
-               input_st->old_libretro_device[i]);
+      configuration_set_uint(settings,
+            settings->uints.input_libretro_device[i],
+            input_st->remapping_cache.libretro_device[i]);
    }
+
+   configuration_set_bool(settings,
+         settings->bools.input_turbo_enable,
+         input_st->remapping_cache.turbo_enable);
+
+   configuration_set_bool(settings,
+         settings->bools.input_turbo_allow_dpad,
+         input_st->remapping_cache.turbo_allow_dpad);
+
+   configuration_set_int(settings,
+         settings->ints.input_turbo_bind,
+         input_st->remapping_cache.turbo_bind);
+
+   configuration_set_uint(settings,
+         settings->uints.input_turbo_mode,
+         input_st->remapping_cache.turbo_mode);
+
+   configuration_set_uint(settings,
+         settings->uints.input_turbo_button,
+         input_st->remapping_cache.turbo_button);
+
+   configuration_set_uint(settings,
+         settings->uints.input_turbo_period,
+         input_st->remapping_cache.turbo_period);
+
+   configuration_set_uint(settings,
+         settings->uints.input_turbo_duty_cycle,
+         input_st->remapping_cache.turbo_duty_cycle);
 
 end:
    if (clear_cache)
-      input_st->flags &= ~(INP_FLAG_OLD_ANALOG_DPAD_MODE_SET
-                         | INP_FLAG_OLD_LIBRETRO_DEVICE_SET
-                         | INP_FLAG_REMAPPING_CACHE_ACTIVE);
+      input_st->flags &= ~INP_FLAG_REMAPPING_CACHE_ACTIVE;
 }
 
 void input_remapping_update_port_map(void)
@@ -7163,15 +7198,56 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
 
                if (ret)
                {
-                  if (a == RETRO_DEVICE_ID_ANALOG_Y && (float)ret / 0x7fff < -joypad_info.axis_threshold)
-                     BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_UP);
-                  else if (a == RETRO_DEVICE_ID_ANALOG_Y && (float)ret / 0x7fff > joypad_info.axis_threshold)
-                     BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_DOWN);
+                  bool playlist = false;
 
+                  /* Replace right analog stick navigation in playlists to thumbnail cycling. */
+                  if (s == RETRO_DEVICE_INDEX_ANALOG_RIGHT)
+                  {
+                     menu_entry_t entry;
+                     MENU_ENTRY_INITIALIZE(entry);
+                     menu_entry_get(&entry, 0, 0, NULL, true);
+
+                     switch (entry.type)
+                     {
+                        case FILE_TYPE_RPL_ENTRY:
+                        case FILE_TYPE_PLAYLIST_ENTRY:
+                        case FILE_TYPE_PLAIN:
+                        case FILE_TYPE_RDB:
+                           playlist = true;
+                           break;
+                        default:
+                           break;
+                     }
+                  }
+
+                  if (a == RETRO_DEVICE_ID_ANALOG_Y && (float)ret / 0x7fff < -joypad_info.axis_threshold)
+                  {
+                     if (playlist)
+                        BIT256_SET_PTR(current_bits, RARCH_ANALOG_RIGHT_Y_MINUS);
+                     else
+                        BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_UP);
+                  }
+                  else if (a == RETRO_DEVICE_ID_ANALOG_Y && (float)ret / 0x7fff > joypad_info.axis_threshold)
+                  {
+                     if (playlist)
+                        BIT256_SET_PTR(current_bits, RARCH_ANALOG_RIGHT_Y_PLUS);
+                     else
+                        BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_DOWN);
+                  }
                   if (a == RETRO_DEVICE_ID_ANALOG_X && (float)ret / 0x7fff < -joypad_info.axis_threshold)
-                     BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_LEFT);
+                  {
+                     if (playlist)
+                        BIT256_SET_PTR(current_bits, RARCH_ANALOG_RIGHT_X_MINUS);
+                     else
+                        BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_LEFT);
+                  }
                   else if (a == RETRO_DEVICE_ID_ANALOG_X && (float)ret / 0x7fff > joypad_info.axis_threshold)
-                     BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_RIGHT);
+                  {
+                     if (playlist)
+                        BIT256_SET_PTR(current_bits, RARCH_ANALOG_RIGHT_X_PLUS);
+                     else
+                        BIT256_SET_PTR(current_bits, RETRO_DEVICE_ID_JOYPAD_RIGHT);
+                  }
                }
             }
          }

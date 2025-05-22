@@ -65,6 +65,10 @@
 #include "../location/drivers/corelocation.m"
 #endif
 
+#ifdef HAVE_AVF
+#include "../camera/drivers/avfoundation.m"
+#endif
+
 #if defined(HAVE_DISCORD)
 #include "../deps/discord-rpc/src/discord_register_osx.m"
 #endif
@@ -80,4 +84,8 @@
 
 #if defined(HAVE_CLOUDSYNC) && defined(HAVE_ICLOUD)
 #include "../network/cloud_sync/icloud.m"
+#endif
+
+#if defined(HAVE_CLOUDSYNC) && defined(HAVE_ICLOUD_DRIVE)
+#include "../network/cloud_sync/icloud_drive.m"
 #endif
