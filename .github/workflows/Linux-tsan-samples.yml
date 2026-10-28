@@ -1,0 +1,65 @@
+name: CI Linux TSan [sample suites]
+
+# The threaded sample suites no other lane runs under ThreadSanitizer.
+# Their own steps build them under ASan, which cannot see a race: an
+# unordered access between two threads passes there and is only found
+# by a developer running TSan by hand. tools/tsan-samples.sh builds each
+# suite in tools/tsan-samples.list with SANITIZER=thread and runs it with
+# halt_on_error, so any report fails the job; the list says what is left
+# out and why.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  linux-tsan-samples:
+    name: TSan, the threaded sample suites
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential zlib1g-dev libasound2-dev libsdl1.2-dev libsdl2-dev libwayland-dev ffmpeg
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Build and run each suite under TSan
+        run: tools/tsan-samples.sh

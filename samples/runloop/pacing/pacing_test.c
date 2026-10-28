@@ -1,0 +1,930 @@
+/* Pacing decisions the runloop makes every iteration.
+ *
+ * Three of them are pure functions of their arguments, and all three
+ * were shipped on the strength of a throwaway model rather than
+ * anything that would notice a later change:
+ *
+ *  - runloop_pace_gap_engages(): the frame limiter holds the loop to
+ *    the display rate when nothing else is pacing it and either audio
+ *    rate control can follow or Scanline Sync is between locks. The
+ *    condition that matters is what it must NOT do - engage while
+ *    another source is already holding the loop, with neither of
+ *    those, or under fast-forward, where running unthrottled is the
+ *    point. All are silent failures: double-pacing runs the frontend
+ *    slow, and a throttled fast-forward looks like a performance bug.
+ *
+ *  - runloop_content_frame_time_us(): the period those waits use. A
+ *    core reports its own rate and is free to report nonsense; zero
+ *    must not divide, a huge rate must not become a busy loop, and a
+ *    tiny one must not stall the frontend for a minute.
+ *
+ *  - runloop_pace_sample_usable(): which intervals feed the measured
+ *    loop rate shown beside the pacing claim. A state load or a shader
+ *    rebuild is a stall, not pacing; before this bound existed a single
+ *    0.9 s sample pulled a 60 fps average to 8 and took several frames
+ *    to climb back, so the overlay lied after every hitch.
+ *
+ * The three live in runloop.h precisely so this runs the shipping
+ * versions. Nothing here is a copy: change the header and this test
+ * changes with it, which is the point.
+ *
+ * The gap predicate is checked over every combination of the six pace
+ * bits by the four boolean inputs - 512 cases, exhaustive, not a
+ * sample. The period is checked over the rates a core can produce
+ * including the degenerate ones, and for monotonicity, since a
+ * clamp that inverts is a clamp nobody notices. The sample filter is
+ * checked at its boundaries and against the regression that motivated
+ * it, by running the same eight-sample average the runloop keeps.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#include <retro_common_api.h>
+#include <retro_inline.h>
+#include <boolean.h>
+
+#include "../../../runloop.h"
+
+static unsigned failures;
+
+static void check(bool ok, const char *what)
+{
+   if (!ok)
+   {
+      printf("   FAIL: %s\n", what);
+      failures++;
+   }
+}
+
+/* --- the gap predicate ------------------------------------------- */
+
+static void test_gap_predicate(void)
+{
+   unsigned pace;
+   int nb, fm, ss, rc;
+   unsigned engaged = 0;
+
+   for (pace = 0; pace < 256; pace++)
+      for (nb = 0; nb < 2; nb++)
+         for (fm = 0; fm < 2; fm++)
+            for (ss = 0; ss < 2; ss++)
+               for (rc = 0; rc < 2; rc++)
+               {
+                  bool got  = runloop_pace_gap_engages(pace,
+                        nb != 0, fm != 0, ss != 0, rc != 0);
+                  bool want = ((pace & ~RUNLOOP_PACE_DRIVER) == RUNLOOP_PACE_NONE)
+                        && !nb && !fm && (ss || rc);
+                  char msg[128];
+
+                  if (got)
+                     engaged++;
+                  snprintf(msg, sizeof(msg),
+                        "pace=0x%02x nonblocking=%d fastmotion=%d "
+                        "scanline=%d ratecontrol=%d -> %d, wanted %d",
+                        pace, nb, fm, ss, rc, (int)got, (int)want);
+                  check(got == want, msg);
+               }
+
+   /* Six of the 2048 combinations may engage: nothing pacing, not
+    * fast-forwarding, with rate control, Scanline Sync, or both - with
+    * or without the driver's release, which is not a clock. */
+   check(engaged == 6, "exactly six combinations engage the gap limiter");
+
+   /* Named cases, so a failure above reads as something rather than a
+    * bit pattern. */
+   check(runloop_pace_gap_engages(RUNLOOP_PACE_NONE, false, false, false, true),
+         "nothing pacing, rate control on, not fast-forwarding: engages");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_NONE, false, false, false, false),
+         "rate control off: the loop runs unlimited as configured");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_NONE, true, false, false, true),
+         "fast-forward (nonblocking) must stay unthrottled");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_NONE, false, true, false, true),
+         "FASTMOTION must stay unthrottled");
+   check(runloop_pace_gap_engages(RUNLOOP_PACE_NONE, false, false, true, false),
+         "Scanline Sync enabled but unlocked, no rate control: bridges the "
+         "recalibration at the display rate");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_VSYNC, false, false, false, true),
+         "vsync already paces: must not double up");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_AUDIO, false, false, false, true),
+         "audio already paces: must not double up");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_TIMER, false, false, false, true),
+         "the frame limiter already paces: must not double up");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_DISPLAY, false, false, false, true),
+         "display pacing keeps the gap limiter out");
+   check(!runloop_pace_gap_engages(RUNLOOP_PACE_NOWINDOW, false, false, false, true),
+         "the no-window wait already paces: must not double up");
+   check(runloop_pace_gap_engages(RUNLOOP_PACE_DRIVER, false, false, false, true),
+         "driver pacing alone is not a clock: the timer's period goes to it");
+
+   printf("   gap predicate: 2048 combinations, exactly six engage\n");
+}
+
+/* --- driver pacing ------------------------------------------------ */
+
+/* The facts of a content frame on the unthreaded path with the
+ * driver's release available: who owns the release, per state. */
+static runloop_pace_facts_t driver_facts(bool vsync, bool audio, bool vrr)
+{
+   runloop_pace_facts_t f = PACE_FACT_FOCUSED | PACE_FACT_CORE_RAN
+      | PACE_FACT_DRIVER_PACING | PACE_FACT_RATE_CONTROL
+      | PACE_FACT_PRESENTABLE;
+   if (vsync) f |= PACE_FACT_VSYNC;
+   if (audio) f |= PACE_FACT_AUDIO_HOLDING;
+   if (vrr)   f |= PACE_FACT_VRR | PACE_FACT_FRAME_LIMIT;
+   return f;
+}
+
+#define DRIVER_ROW(f, want, what) \
+   check(runloop_pace_decide(f) == (want), what)
+
+static void test_driver_pacing(void)
+{
+   runloop_pace_facts_t f;
+   /* In effect: the driver releases beside whatever else holds; the
+    * release is not a clock, so what paced before still does. */
+   DRIVER_ROW(driver_facts(true, false, false),
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_DRIVER,
+         "vsync: VSync+Driver");
+   DRIVER_ROW(driver_facts(false, true, false),
+         RUNLOOP_PACE_AUDIO | RUNLOOP_PACE_DRIVER,
+         "audio sync: Audio+Driver");
+   DRIVER_ROW(driver_facts(false, false, false),
+         RUNLOOP_PACE_TIMER | RUNLOOP_PACE_DRIVER,
+         "nothing else: the gap limiter's period goes to the driver");
+   DRIVER_ROW(driver_facts(false, false, true),
+         RUNLOOP_PACE_TIMER | RUNLOOP_PACE_DRIVER,
+         "VRR: the content period goes to the driver");
+   DRIVER_ROW(driver_facts(true, false, false) & ~PACE_FACT_DRIVER_PACING,
+         RUNLOOP_PACE_VSYNC,
+         "backend not in effect: VSync alone");
+
+   /* Suspended: the existing pacing, nothing more. */
+   f = driver_facts(true, false, false);
+   DRIVER_ROW(f | PACE_FACT_MENU_ALIVE, RUNLOOP_PACE_VSYNC,
+         "menu up: no release");
+   DRIVER_ROW(f | PACE_FACT_PAUSED | PACE_FACT_FRAME_LIMIT,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_TIMER,
+         "paused: no release");
+   DRIVER_ROW((f | PACE_FACT_FASTMOTION | PACE_FACT_NONBLOCKING
+            | PACE_FACT_FRAME_LIMIT) & ~PACE_FACT_VSYNC,
+         RUNLOOP_PACE_TIMER,
+         "fast-forward: no release");
+   DRIVER_ROW(f & ~PACE_FACT_FOCUSED, RUNLOOP_PACE_VSYNC,
+         "unfocused: no release");
+   DRIVER_ROW(f & ~PACE_FACT_CORE_RAN, RUNLOOP_PACE_VSYNC,
+         "no content frame this iteration: no release");
+   DRIVER_ROW(f | PACE_FACT_WRAPPER, RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_DRIVER,
+         "threaded video: the presenter sleeps, this thread waits");
+   DRIVER_ROW(f | PACE_FACT_WRAPPER | PACE_FACT_DISPLAY_PACING,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_DISPLAY | RUNLOOP_PACE_DRIVER,
+         "display pacing: the driver's sleep is the hold's release");
+   DRIVER_ROW(f | PACE_FACT_WRAPPER | PACE_FACT_DISPLAY_PACING
+            | PACE_FACT_MENU_ALIVE,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_DISPLAY,
+         "display pacing, menu up: the hold alone");
+   DRIVER_ROW((f | PACE_FACT_SCANLINE_SYNC | PACE_FACT_SCANLINE_LOCKED)
+            & ~PACE_FACT_VSYNC,
+         RUNLOOP_PACE_SCANLINE,
+         "scanline sync: no release");
+   DRIVER_ROW((f & ~PACE_FACT_PRESENTABLE) & ~PACE_FACT_VSYNC,
+         RUNLOOP_PACE_DRIVER | RUNLOOP_PACE_NOWINDOW,
+         "no window: the wait, not the release");
+
+   printf("   driver pacing: owns the release of a content frame only, "
+          "threaded or not, display pacing's included, never with "
+          "scanline sync, never as a clock\n");
+}
+
+/* The interval each owned release hands the driver, from the whole
+ * decision: a release with nothing else holding the loop keeps the
+ * content's rate rather than none. */
+static void test_driver_interval(void)
+{
+   const retro_time_t timer = 8333, content = 16667;
+   runloop_pace_facts_t th = PACE_FACT_FOCUSED | PACE_FACT_CORE_RAN
+      | PACE_FACT_DRIVER_PACING | PACE_FACT_PRESENTABLE | PACE_FACT_WRAPPER;
+   unsigned pace;
+
+   /* Threaded, vsync and audio sync off, no rate control, display
+    * pacing off: nothing but the release holds the loop */
+   pace = runloop_pace_decide(th);
+   check(pace == RUNLOOP_PACE_DRIVER, "driver alone: Driver");
+   check(runloop_pace_driver_interval(pace, timer, content) == content,
+         "driver alone: the content's period, not unthrottled");
+   pace = runloop_pace_decide(th | PACE_FACT_DISPLAY_PACING);
+   check(runloop_pace_driver_interval(pace, timer, content) == content,
+         "display pacing: the content's period");
+   pace = runloop_pace_decide(th | PACE_FACT_DISPLAY_PACING | PACE_FACT_VSYNC);
+   check(runloop_pace_driver_interval(pace, timer, content) == content,
+         "display pacing with vsync: the content's period");
+   pace = runloop_pace_decide(th | PACE_FACT_RATE_CONTROL);
+   check(pace == (RUNLOOP_PACE_TIMER | RUNLOOP_PACE_DRIVER)
+         && runloop_pace_driver_interval(pace, timer, content) == timer,
+         "gap limiter: the timer's period");
+   pace = runloop_pace_decide(th | PACE_FACT_VSYNC);
+   check(runloop_pace_driver_interval(pace, timer, content) == 0,
+         "vsync holds: no interval");
+   pace = runloop_pace_decide(th | PACE_FACT_AUDIO_HOLDING);
+   check(runloop_pace_driver_interval(pace, timer, content) == 0,
+         "audio holds: no interval");
+
+   printf("   driver pacing interval: the timer's where it holds, the "
+          "content's under display pacing or with nothing else holding, "
+          "none beside vsync or audio\n");
+}
+
+/* --- the frame period -------------------------------------------- */
+
+static void test_frame_period(void)
+{
+   static const struct
+   {
+      float hz;
+      const char *what;
+   } probes[] = {
+      {  0.0f,      "unknown rate"          },
+      { -1.0f,      "negative rate"         },
+      {  0.001f,    "one frame per 1000 s"  },
+      {  1.0f,      "1 Hz"                  },
+      { 50.0f,      "PAL"                   },
+      { 59.94f,     "NTSC"                  },
+      { 60.0f,      "60 Hz"                 },
+      { 120.0f,     "120 Hz"                },
+      { 240.0f,     "240 Hz"                },
+      { 1000000.0f, "a million Hz"          }
+   };
+   size_t i;
+   float hz;
+   retro_time_t prev;
+
+   for (i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
+   {
+      retro_time_t us = runloop_content_frame_time_us(probes[i].hz);
+      char msg[128];
+
+      snprintf(msg, sizeof(msg), "%s (%.3f Hz) -> %ld us, outside 1000-100000",
+            probes[i].what, probes[i].hz, (long)us);
+      check(us >= 1000 && us <= 100000, msg);
+   }
+
+   /* The rates a core actually reports land on the rate asked for,
+    * within the microsecond the truncation costs. */
+   check(runloop_content_frame_time_us(60.0f) == 16666,
+         "60 Hz is 16666 us");
+   check(runloop_content_frame_time_us(59.94f) == 16683,
+         "59.94 Hz is 16683 us");
+   check(runloop_content_frame_time_us(50.0f) == 20000,
+         "50 Hz is 20000 us");
+   /* Unknown means 60 Hz, not zero and not a division. */
+   check(runloop_content_frame_time_us(0.0f) == 16667,
+         "an unknown rate is taken as 60 Hz");
+
+   /* Monotonic across the whole usable range: a faster core never gets
+    * a longer frame. A clamp written the wrong way round still passes
+    * a bounds check. */
+   prev = 100001;
+   for (hz = 0.01f; hz < 2000.0f; hz *= 1.05f)
+   {
+      retro_time_t us = runloop_content_frame_time_us(hz);
+      check(us <= prev, "period must not grow as the rate rises");
+      prev = us;
+   }
+
+   printf("   frame period: bounded to 1-100 ms and monotonic over "
+          "0.01 Hz to 2 kHz\n");
+}
+
+/* --- the measured-rate sample filter ------------------------------ */
+
+/* The average the runloop keeps: an eight-sample exponential, fed only
+ * by intervals the filter accepts. */
+static retro_time_t feed(retro_time_t ema, retro_time_t delta)
+{
+   if (!runloop_pace_sample_usable(delta))
+      return ema;
+   if (ema)
+      return ema + (delta - ema) / 8;
+   return delta;
+}
+
+static void test_sample_filter(void)
+{
+   retro_time_t ema;
+   int i;
+
+   check(!runloop_pace_sample_usable(0),
+         "a zero interval is not a sample");
+   check(!runloop_pace_sample_usable(-1),
+         "a clock that went backwards is not a sample");
+   check(runloop_pace_sample_usable(1),
+         "one microsecond is a sample");
+   check(runloop_pace_sample_usable(249999),
+         "just under a quarter second is a sample");
+   check(!runloop_pace_sample_usable(250000),
+         "a quarter second is a stall, not a sample");
+   check(!runloop_pace_sample_usable(900000),
+         "0.9 s is a stall, not a sample");
+
+   /* Converges on a jittering 60 Hz loop. */
+   ema = 0;
+   for (i = 0; i < 200; i++)
+      ema = feed(ema, (i % 2) ? 16000 : 17334);
+   check(ema > 16000 && ema < 17334,
+         "the average settles inside the jitter it was fed");
+
+   /* The regression this bound exists for: a stall must not move it.
+    * Before the filter, one 0.9 s sample took a 60 fps reading to
+    * about 8 fps and needed several frames to recover. */
+   {
+      retro_time_t before = ema;
+      ema = feed(ema, 900000);
+      check(ema == before,
+            "a 0.9 s stall leaves the average untouched");
+   }
+
+   /* A hitch inside the bound is still averaged - the filter rejects
+    * stalls, it does not pretend the loop is always smooth. */
+   {
+      retro_time_t before = ema;
+      ema = feed(ema, 200000);
+      check(ema > before, "a 0.2 s hitch is averaged in");
+   }
+
+   printf("   sample filter: rejects stalls past 250 ms, averages "
+          "everything under\n");
+}
+
+/* --- the schedule --------------------------------------------------- */
+
+static void test_schedule(void)
+{
+   const int64_t period = 16683350; /* 59.94 Hz, in nanoseconds */
+   int64_t anchor;
+   retro_time_t sleep;
+   unsigned i;
+
+   /* On time: the sleep is what is left, rounded up to a microsecond,
+    * and the anchor is the slot. */
+   anchor = 1000000000LL;
+   sleep  = runloop_pace_schedule(&anchor, period, 1000000 + 12000);
+   check(sleep == 4684 && anchor == 1000000000LL + period,
+         "on time: sleep to the slot, rounded up, anchor on it");
+
+   /* Late by less than a period: no sleep, and the anchor stays on the
+    * slot, so the next frame is due a period after it, not after now -
+    * the lateness is caught up, not kept. */
+   anchor = 1000000000LL;
+   sleep  = runloop_pace_schedule(&anchor, period, 1000000 + 16683 + 400);
+   check(sleep == 0 && anchor == 1000000000LL + period,
+         "late by less than a period: anchor stays on the slot");
+   sleep  = runloop_pace_schedule(&anchor, period, 1000000 + 16683 + 400 + 15000);
+   check(sleep == 1284,
+         "the next frame gets a sleep shorter by the lateness");
+
+   /* Late by a period or more: a stall; the schedule restarts from now
+    * rather than trying to fit two frames into one. */
+   anchor = 1000000000LL;
+   sleep  = runloop_pace_schedule(&anchor, period, 1000000 + 3 * 16683);
+   check(sleep == 0 && anchor == (1000000 + 3 * 16683) * 1000LL,
+         "late by a period or more: restart from now");
+
+   /* A sleep that overshoots every frame does not slow the loop, and
+    * a period that is not a whole microsecond is kept exactly: over
+    * 6000 frames the slots are exactly 6000 periods apart, to the
+    * nanosecond - a whole-microsecond period would be 2.1 ms behind
+    * by then, 21 ppm. */
+   {
+      const retro_time_t overshoot = 900;   /* a coalesced nanosleep */
+      const retro_time_t work      = 15000; /* the frame's own time  */
+      retro_time_t now             = 0;
+      anchor                       = 0;
+      for (i = 0; i < 6000; i++)
+      {
+         now  += work;
+         sleep = runloop_pace_schedule(&anchor, period, now);
+         if (sleep > 0)
+            now += sleep + overshoot;
+      }
+      check(anchor == 6000 * period,
+            "6000 overshooting frames land on the 6000th slot, to the nanosecond");
+   }
+}
+
+/* --- the sleep margin ------------------------------------------------ */
+
+static void test_margin(void)
+{
+   const retro_time_t period = 16683;
+   retro_time_t margin = 0;
+   unsigned i;
+
+   /* Up at once. */
+   margin = runloop_pace_margin_update(margin, 700, period);
+   check(margin == 700, "one overshoot of 700 us sets the margin to 700");
+   /* Down slowly: sixteen quiet sleeps take off well under all of it. */
+   for (i = 0; i < 16; i++)
+      margin = runloop_pace_margin_update(margin, 0, period);
+   check(margin > 200 && margin < 400,
+         "sixteen quiet sleeps leave the margin at about a third");
+   /* Never negative, never past a quarter period. */
+   check(runloop_pace_margin_update(100, -5000, period) < 100,
+         "a negative overshoot counts as none");
+   check(runloop_pace_margin_update(0, 100000, period) == period / 4,
+         "a huge overshoot is capped at a quarter period");
+   /* Settles on a steady overshoot. */
+   margin = 0;
+   for (i = 0; i < 200; i++)
+      margin = runloop_pace_margin_update(margin, 250 + (i & 1) * 50, period);
+   check(margin >= 250 && margin <= 300,
+         "a 250-300 us overshoot settles the margin between them");
+   /* Short periods may follow the timer past a quarter, never past
+    * the period itself. */
+   check(runloop_pace_margin_update(0, 100000, 4166) == 2000,
+         "240 Hz: the margin follows the timer to the floor");
+   check(runloop_pace_margin_update(0, 100000, 555) == 555,
+         "a period under the floor caps the margin at the period");
+}
+
+/* The limiter as runloop_iterate() runs it, over a sleep that lands
+ * @overshoot past what it was asked for - a coarse OS timer. Returns
+ * the achieved frames per second of loop time. */
+static double limiter_rate(retro_time_t period_us, retro_time_t work,
+      retro_time_t overshoot, unsigned frames)
+{
+   int64_t      anchor = 0;
+   retro_time_t margin = 0;
+   retro_time_t now    = 0;
+   unsigned     i;
+
+   for (i = 0; i < frames; i++)
+   {
+      retro_time_t to_sleep;
+      now     += work;
+      to_sleep = runloop_pace_schedule(&anchor, (int64_t)period_us * 1000,
+            now);
+      if (to_sleep > 0)
+      {
+         const retro_time_t deadline = anchor / 1000;
+         if (to_sleep > margin)
+         {
+            const retro_time_t asked_until = deadline - margin;
+            now    = asked_until + overshoot;
+            margin = runloop_pace_margin_update(margin,
+                  now - asked_until, period_us);
+         }
+         if (now < deadline)
+            now = deadline;
+      }
+   }
+   return (double)frames * 1000000.0 / (double)now;
+}
+
+static void test_fastforward_ratios(void)
+{
+   /* 60 fps content, a core that runs a frame in 50 us, and an OS
+    * timer from fine to the 2 ms a coarse one lands past its ask. At
+    * 2 ms the margin held to a quarter period slept every 30x frame
+    * past its slot, and 30x ran slower than 15x. */
+   const double fps = 60.0;
+   retro_time_t overshoot;
+
+   for (overshoot = 250; overshoot <= 2000; overshoot += 250)
+   {
+      double r15 = limiter_rate((retro_time_t)(1000000.0 / (fps * 15.0)),
+            50, overshoot, 6000);
+      double r30 = limiter_rate((retro_time_t)(1000000.0 / (fps * 30.0)),
+            50, overshoot, 6000);
+      double r60 = limiter_rate((retro_time_t)(1000000.0 / (fps * 60.0)),
+            50, overshoot, 6000);
+      char msg[160];
+
+      snprintf(msg, sizeof(msg), "%u us timer: 15x/30x/60x at %.0f/%.0f/%.0f fps,"
+            " wanted 900/1800/3600", (unsigned)overshoot, r15, r30, r60);
+      check(   r15 > fps * 15.0 * 0.97
+            && r30 > fps * 30.0 * 0.97
+            && r60 > fps * 60.0 * 0.97, msg);
+   }
+   /* And the ordinary frame still sleeps most of its period. */
+   check(limiter_rate(16683, 2000, 2000, 600) > 59.0,
+         "60 Hz with a 2 ms timer keeps 60");
+   printf("   fast-forward: 15x, 30x and 60x reach their rates on a "
+          "0.25-2 ms timer\n");
+}
+
+/* Fast-forward's frameskip, decided before the core runs so a core
+ * that asks need not render a dropped frame. */
+static void test_ff_frameskip(void)
+{
+   int32_t acc   = 0;
+   int8_t active = 0;
+   unsigned i, renders = 0;
+   bool ok       = true;
+
+   /* The first frame of a fast-forward only starts the clock */
+   check(!runloop_ff_frameskip_step(&acc, &active, 60000, 8333) && acc == 0,
+         "first fast-forward frame starts the clock, presents nothing");
+
+   /* 1500 frames a second against a 120 Hz display: every 13th frame,
+    * the first whole number of frames to span the period */
+   for (i = 0; i < 1500; i++)
+      if (runloop_ff_frameskip_step(&acc, &active, 667, 8333))
+         renders++;
+   check(renders >= 1500 / 13 - 1 && renders <= 1500 / 13 + 1,
+         "1500 fps fast-forward presents every 13th frame at 120 Hz");
+
+   /* A host short of the target presents every frame, no backlog */
+   for (i = 0; i < 100; i++)
+   {
+      if (!runloop_ff_frameskip_step(&acc, &active, 12000, 8333))
+         ok = false;
+      if (acc > 8333)
+         ok = false;
+   }
+   check(ok, "a host below 1x presents every frame and carries no backlog");
+
+   check(   runloop_ff_skips_render(true, false)
+         && !runloop_ff_skips_render(true, true)
+         && !runloop_ff_skips_render(false, false)
+         && !runloop_ff_skips_render(false, true),
+         "the core is asked to skip only a dropped frame nothing is owed");
+   printf("   fast-forward frameskip: presents at the target, a frame "
+          "owed after a dupe is rendered\n");
+}
+
+/* The video driver's blocking state, as every caller hands it over:
+ * vsync blocks only alone - never with Scanline Sync, a content rate
+ * vsync cannot hold, or fast-forward. */
+static void test_vsync_blocks(void)
+{
+   unsigned m;
+   for (m = 0; m < 16; m++)
+   {
+      bool vsync = (m & 1) != 0, scan = (m & 2) != 0;
+      bool force = (m & 4) != 0, ff   = (m & 8) != 0;
+      char msg[96];
+      snprintf(msg, sizeof(msg), "vsync %d scanline %d force %d ff %d",
+            vsync, scan, force, ff);
+      check(runloop_vsync_blocks(vsync, scan, force, ff)
+            == (vsync && !scan && !force && !ff), msg);
+   }
+   check(!runloop_vsync_blocks(true, true, false, false),
+         "Scanline Sync on: the swap never blocks as well (judder)");
+}
+
+
+/* The pace decision itself, as a table: what holds the loop in the
+ * Quick Menu over a paused core, on a focused window, per combination
+ * of the user's sync settings and the Menu Frame Rate. Each row is a
+ * fact about the shipping decision, not a wish; a row that changes is a
+ * behaviour change, and should be a deliberate one. "VRR" is Sync to
+ * Exact Content Framerate. */
+enum menu_rate_row { AT_DISPLAY, AT_CONTENT };
+
+static runloop_pace_facts_t menu_facts(enum menu_rate_row rate,
+      bool vsync, bool audio, bool display, bool vrr, bool scanline)
+{
+   /* A focused window, the menu up over a paused core (menu pause is
+    * not RUNLOOP_FLAG_PAUSED), rate control on, a surface to present
+    * to, and a frame limit - every menu path that reaches the block
+    * sets one: the display's period at 'Display Rate', the content's
+    * at 'Content Rate'. "Audio" is Audio Sync. At 'Display Rate' the
+    * menu's silence is written non-blocking and never holds; at
+    * 'Content Rate' it is written blocking when Audio Sync is on. */
+   runloop_pace_facts_t f = PACE_FACT_FOCUSED | PACE_FACT_MENU_ALIVE
+      | PACE_FACT_RATE_CONTROL | PACE_FACT_PRESENTABLE | PACE_FACT_FRAME_LIMIT;
+   f |= (rate == AT_DISPLAY) ? PACE_FACT_MENU_DISPLAY_RATE
+                             : PACE_FACT_MENU_CONTENT_RATE;
+   if (vsync)    f |= PACE_FACT_VSYNC;
+   if (vrr)      f |= PACE_FACT_VRR;
+   if (display)  f |= PACE_FACT_WRAPPER | PACE_FACT_DISPLAY_PACING;
+   if (scanline) f |= PACE_FACT_SCANLINE_SYNC | PACE_FACT_SCANLINE_LOCKED;
+   if (audio && rate == AT_CONTENT)
+      f |= PACE_FACT_AUDIO_HOLDING;
+   return f;
+}
+
+/* --- the derived swap interval ----------------------------------- */
+
+/* The default audio_max_timing_skew, which is what the runloop hands
+ * runloop_video_swap_interval_for(). */
+#define PACING_TEST_MAX_SKEW 0.05f
+
+/* The ceiling a driver with no limit of its own gets: config.def.h's
+ * MAXIMUM_SWAP_INTERVAL, restated here because this test links against
+ * nothing and the value is part of what is being asserted. A driver
+ * that caps lower - the D3D family reports four - passes its own. */
+#define PACING_TEST_CEILING 16
+
+static void check_interval(float timing_fps, float input_fps,
+      unsigned ceiling, unsigned want, const char *what)
+{
+   char     msg[160];
+   unsigned got = runloop_video_swap_interval_for(timing_fps, input_fps,
+         PACING_TEST_MAX_SKEW, ceiling);
+
+   snprintf(msg, sizeof(msg), "%.2f Hz / %.2f fps, ceiling %u -> %u, "
+         "wanted %u (%s)", timing_fps, input_fps, ceiling, got, want, what);
+   check(got == want, msg);
+}
+
+static void test_swap_interval(void)
+{
+   static const float rates[] =
+   {
+      0.0f, 1.0f, 23.976f, 24.0f, 25.0f, 29.97f, 30.0f, 50.0f,
+      59.94f, 60.0f, 72.0f, 75.0f, 90.0f, 100.0f, 119.88f, 120.0f,
+      144.0f, 165.0f, 200.0f, 240.0f, 280.0f, 360.0f, 480.0f, 500.0f
+   };
+   unsigned i;
+   unsigned j;
+
+   /* A panel is a whole multiple of the content rate: one content
+    * frame is held for that many display frames. */
+   check_interval(60.0f,  59.94f, PACING_TEST_CEILING, 1,
+         "60 Hz panel, 60 fps content");
+   check_interval(120.0f, 59.94f, PACING_TEST_CEILING, 2,
+         "120 Hz panel, 60 fps content");
+   check_interval(240.0f, 59.94f, PACING_TEST_CEILING, 4,
+         "240 Hz panel, 60 fps content");
+   check_interval(480.0f, 59.94f, PACING_TEST_CEILING, 8,
+         "480 Hz panel, 60 fps content");
+   check_interval(480.0f, 30.0f,  PACING_TEST_CEILING, 16,
+         "480 Hz panel, 30 fps content: the ceiling itself");
+   check_interval(360.0f, 24.0f,  PACING_TEST_CEILING, 15,
+         "360 Hz panel, 24 fps content");
+   check_interval(60.0f,  30.0f,  PACING_TEST_CEILING, 2,
+         "60 Hz panel, 30 fps content");
+
+   /* A driver that cannot hold a frame for the full multiple takes
+    * the ceiling down, and the multiple it cannot reach falls back
+    * rather than clamping short: a short multiple paces the loop
+    * fast, which is worse than leaving it to vsync. */
+   check_interval(480.0f, 59.94f, 4, 1,
+         "480 Hz on a driver capped at four: falls back, does not clamp to 4");
+   check_interval(240.0f, 59.94f, 4, 4,
+         "240 Hz on a driver capped at four: still exactly four");
+   check_interval(120.0f, 59.94f, 4, 2,
+         "120 Hz on a driver capped at four: unaffected");
+
+   /* Not a whole multiple within the skew tolerance: vsync paces at
+    * the display rate and rate control absorbs the difference. */
+   check_interval(100.0f, 60.0f,  PACING_TEST_CEILING, 1,
+         "100 Hz panel, 60 fps content: no whole multiple");
+   check_interval(75.0f,  59.94f, PACING_TEST_CEILING, 1,
+         "75 Hz panel, 60 fps content: no whole multiple");
+   check_interval(144.0f, 59.94f, PACING_TEST_CEILING, 1,
+         "144 Hz panel, 60 fps content: no whole multiple");
+
+   /* Degenerate inputs. A core is free to report nonsense, and a
+    * panel slower than the content has no multiple to hold. */
+   check_interval(0.0f,   59.94f, PACING_TEST_CEILING, 1, "no display rate");
+   check_interval(480.0f, 0.0f,   PACING_TEST_CEILING, 1, "no content rate");
+   check_interval(-60.0f, 59.94f, PACING_TEST_CEILING, 1, "negative display rate");
+   check_interval(480.0f, -60.0f, PACING_TEST_CEILING, 1, "negative content rate");
+   check_interval(60.0f,  119.88f, PACING_TEST_CEILING, 1,
+         "content faster than the panel");
+   check_interval(480.0f, 59.94f, 0, 1, "a ceiling of zero admits nothing");
+
+   /* Whatever the pair, the answer is a usable interval: never zero,
+    * which would mean no sync at all, and never past what the driver
+    * said it can present. */
+   for (i = 0; i < ARRAY_SIZE(rates); i++)
+      for (j = 0; j < ARRAY_SIZE(rates); j++)
+      {
+         unsigned c;
+
+         for (c = 1; c <= PACING_TEST_CEILING; c++)
+         {
+            unsigned got = runloop_video_swap_interval_for(rates[i],
+                  rates[j], PACING_TEST_MAX_SKEW, c);
+            char     msg[160];
+
+            snprintf(msg, sizeof(msg),
+                  "%.2f Hz / %.2f fps, ceiling %u -> %u, out of range",
+                  rates[i], rates[j], c, got);
+            check(got >= 1 && got <= c, msg);
+         }
+      }
+
+   printf("   swap interval: multiples up to %d derived, %u pairs bounded "
+          "by the driver's cap\n", PACING_TEST_CEILING,
+          (unsigned)(ARRAY_SIZE(rates) * ARRAY_SIZE(rates)
+                * PACING_TEST_CEILING));
+}
+
+/* --- how a display/content pair is synced ------------------------ */
+
+#define SP_V RUNLOOP_SYNC_VSYNC_HOLDS
+#define SP_E RUNLOOP_SYNC_EXACT_RATE
+#define SP_W RUNLOOP_SYNC_WITHIN_SKEW
+
+static void check_plan(float display_hz, float input_fps, float multiple,
+      bool vrr, unsigned want, const char *what)
+{
+   char     msg[192];
+   unsigned got = runloop_sync_plan_for(display_hz, input_fps, multiple,
+         PACING_TEST_MAX_SKEW, vrr);
+
+   snprintf(msg, sizeof(msg), "%.4f Hz / %.4f fps x%.0f%s -> %s%s%s, "
+         "wanted %s%s%s (%s)", display_hz, input_fps, multiple,
+         vrr ? " VRR" : "",
+         (got  & SP_V) ? "V" : "-", (got  & SP_E) ? "E" : "-",
+         (got  & SP_W) ? "W" : "-",
+         (want & SP_V) ? "V" : "-", (want & SP_E) ? "E" : "-",
+         (want & SP_W) ? "W" : "-", what);
+   check(got == want, msg);
+}
+
+static void test_sync_plan(void)
+{
+   static const float displays[] =
+   {
+      0.0f, 50.0f, 59.94f, 60.0f, 75.0f, 100.0f, 119.88f, 120.0f,
+      144.0f, 165.0f, 240.0f, 360.0f
+   };
+   static const float contents[] =
+   {
+      0.0f, 24.0f, 30.0f, 49.7f, 50.0f, 53.7f, 57.5f, 59.8261f,
+      59.94f, 60.0f, 60.0988f, 61.0f, 75.0f, 120.0f
+   };
+   static const float multiples[] = { 1.0f, 2.0f, 3.0f, 4.0f };
+   unsigned i, j, k;
+
+   /* Issue 19600: a 60.0988 Hz core at swap interval 2 on a 120 Hz
+    * panel is 0.16% past what the panel presents. VSync paces it,
+    * audio is skewed; the loop is never forced nonblocking over it. */
+   check_plan(120.0f, 60.0988f, 2.0f, true,  SP_V | SP_W,
+         "SNES, interval 2, 120 Hz, VRR: vsync holds, rate skewed");
+   check_plan(120.0f, 59.8261f, 2.0f, true,  SP_V | SP_E | SP_W,
+         "TG16, interval 2, 120 Hz, VRR: exact rate");
+   check_plan(120.0f, 60.0988f, 2.0f, false, SP_V | SP_W,
+         "SNES, interval 2, 120 Hz: vsync holds, rate skewed");
+   check_plan(60.0f,  60.0988f, 1.0f, true,  SP_V | SP_W,
+         "SNES on a 60 Hz VRR ceiling: vsync holds, rate skewed");
+   check_plan(120.0f, 60.0988f, 2.0f * 1.0f, true, SP_V | SP_W,
+         "SNES, one black frame, 120 Hz, VRR");
+
+   /* Past the tolerance the content keeps its own rate under VRR,
+    * with vsync off; without VRR vsync is simply not relied on. */
+   check_plan(120.0f, 75.0f, 2.0f, true,  SP_E,
+         "75 Hz content, interval 2, 120 Hz, VRR: own rate, no vsync");
+   check_plan(60.0f,  75.0f, 1.0f, true,  SP_E,
+         "75 Hz content on 60 Hz, VRR: own rate, no vsync");
+   check_plan(60.0f,  75.0f, 1.0f, false, 0,
+         "75 Hz content on 60 Hz: no vsync");
+
+   /* Under the panel's rate: vsync holds either way, VRR keeps the
+    * exact rate however far the skew. */
+   check_plan(144.0f, 60.0988f, 1.0f, true,  SP_V | SP_E,
+         "60 Hz content on 144 Hz, VRR");
+   check_plan(75.0f,  60.0f,    1.0f, false, SP_V,
+         "60 Hz content on 75 Hz: vsync, rate not skewed");
+
+   /* Degenerate rates change nothing. */
+   check_plan(120.0f, 0.0f,  2.0f, true,  SP_V | SP_E, "no content rate, VRR");
+   check_plan(120.0f, 0.0f,  2.0f, false, SP_V,        "no content rate");
+   check_plan(0.0f,   60.0f, 2.0f, true,  SP_V | SP_E, "no display rate, VRR");
+   check_plan(120.0f, 60.0f, 0.0f, false, SP_V,        "no multiple");
+
+   /* Over every pair: VRR never decides whether vsync holds, only
+    * whether the content keeps its own rate - and it does so exactly
+    * when vsync can present it or the skew is too far to follow. */
+   for (i = 0; i < ARRAY_SIZE(displays); i++)
+      for (j = 0; j < ARRAY_SIZE(contents); j++)
+         for (k = 0; k < ARRAY_SIZE(multiples); k++)
+         {
+            char     msg[160];
+            unsigned off = runloop_sync_plan_for(displays[i], contents[j],
+                  multiples[k], PACING_TEST_MAX_SKEW, false);
+            unsigned on  = runloop_sync_plan_for(displays[i], contents[j],
+                  multiples[k], PACING_TEST_MAX_SKEW, true);
+
+            snprintf(msg, sizeof(msg), "%.4f Hz / %.4f fps x%.0f: "
+                  "VRR moved vsync or the skew (%u vs %u)",
+                  displays[i], contents[j], multiples[k], on, off);
+            check((on & (SP_V | SP_W)) == (off & (SP_V | SP_W)), msg);
+
+            snprintf(msg, sizeof(msg), "%.4f Hz / %.4f fps x%.0f: "
+                  "VRR plan %u holds neither vsync nor the rate",
+                  displays[i], contents[j], multiples[k], on);
+            check((on & (SP_V | SP_E)) != 0, msg);
+
+            snprintf(msg, sizeof(msg), "%.4f Hz / %.4f fps x%.0f: "
+                  "within skew but vsync dropped (%u)",
+                  displays[i], contents[j], multiples[k], on);
+            check(!(on & SP_W) || (on & SP_V), msg);
+
+            check(!(off & SP_E), "exact rate without VRR");
+         }
+
+   printf("   sync plan: %u display/content/multiple triples, VRR "
+          "drops vsync only past the skew tolerance\n",
+          (unsigned)(ARRAY_SIZE(displays) * ARRAY_SIZE(contents)
+                * ARRAY_SIZE(multiples)));
+}
+
+#define MENU_ROW(rate, v, a, d, r, sc, want, what) \
+   check(runloop_pace_decide(menu_facts(rate, v, a, d, r, sc)) == (want), what)
+
+static void test_menu_table(void)
+{
+   /* 'Display Rate': the display's own pace - vsync, the display
+    * pacing hold, or the timer at the display's period - and never
+    * audio, never the content's period. */
+   MENU_ROW(AT_DISPLAY, 1, 0, 0, 0, 0, RUNLOOP_PACE_VSYNC,
+         "display rate: VSync -> VSync");
+   MENU_ROW(AT_DISPLAY, 1, 1, 0, 0, 0, RUNLOOP_PACE_VSYNC,
+         "display rate: VSync+Audio -> VSync (the silence does not block)");
+   MENU_ROW(AT_DISPLAY, 1, 1, 0, 1, 0, RUNLOOP_PACE_VSYNC,
+         "display rate: VSync+Audio+VRR -> VSync (no content-rate timer)");
+   MENU_ROW(AT_DISPLAY, 0, 1, 0, 0, 0, RUNLOOP_PACE_TIMER,
+         "display rate: Audio -> Timer (the display's period)");
+   MENU_ROW(AT_DISPLAY, 0, 0, 0, 1, 0, RUNLOOP_PACE_TIMER,
+         "display rate: VRR -> Timer (the display's period)");
+   MENU_ROW(AT_DISPLAY, 0, 0, 1, 0, 0, RUNLOOP_PACE_DISPLAY,
+         "display rate: Display -> Display");
+   MENU_ROW(AT_DISPLAY, 1, 0, 1, 0, 0, RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_DISPLAY,
+         "display rate: Display+VSync -> VSync+Display");
+   MENU_ROW(AT_DISPLAY, 0, 1, 1, 1, 0, RUNLOOP_PACE_DISPLAY,
+         "display rate: Display+Audio+VRR -> Display");
+   /* Threaded video without the display pacing hold: vsync blocks the
+    * video thread, not the runloop, so the timer holds the menu to the
+    * display's period. */
+   check(runloop_pace_decide(menu_facts(AT_DISPLAY, 1, 1, 0, 0, 0)
+            | PACE_FACT_WRAPPER) == (RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_TIMER),
+         "display rate: VSync+Audio, threaded -> VSync+Timer");
+   /* Scanline Sync holds the focused menu as vsync does: the frame
+    * limit the menu path leaves standing then is whatever fast-forward
+    * last set, and a timer on it ran the menu at the fast-forward
+    * ratio - below 1.0x, slower than the display. Between locks the
+    * gap limiter bridges at the display's period. */
+   MENU_ROW(AT_DISPLAY, 0, 0, 0, 0, 1, RUNLOOP_PACE_SCANLINE,
+         "display rate: Scanline -> Scanline (no fast-forward-period timer)");
+   check(runloop_pace_decide(menu_facts(AT_DISPLAY, 0, 0, 0, 0, 1)
+            & ~PACE_FACT_SCANLINE_LOCKED) == RUNLOOP_PACE_TIMER,
+         "display rate: Scanline between locks -> Timer (the gap limiter, "
+         "at the display's period)");
+   check(runloop_pace_decide(menu_facts(AT_DISPLAY, 0, 0, 0, 0, 1)
+            & ~PACE_FACT_FOCUSED)
+            == (RUNLOOP_PACE_SCANLINE | RUNLOOP_PACE_TIMER),
+         "display rate: Scanline, unfocused -> Scanline+Timer (the menu "
+         "path sets the display's period there)");
+
+   /* 'Content Rate': held to the content's period by audio when it
+    * blocks, by the timer when it does not - one or the other, never
+    * both, except under VRR, which times every frame to the content
+    * as it does in play. */
+   MENU_ROW(AT_CONTENT, 1, 1, 0, 0, 0, RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_AUDIO,
+         "content rate: VSync+Audio -> VSync+Audio");
+   MENU_ROW(AT_CONTENT, 1, 0, 0, 0, 0, RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_TIMER,
+         "content rate: VSync -> VSync+Timer (the content's period)");
+   MENU_ROW(AT_CONTENT, 0, 1, 0, 0, 0, RUNLOOP_PACE_AUDIO,
+         "content rate: Audio -> Audio");
+   MENU_ROW(AT_CONTENT, 0, 0, 0, 0, 0, RUNLOOP_PACE_TIMER,
+         "content rate: nothing -> Timer (the content's period)");
+   MENU_ROW(AT_CONTENT, 1, 1, 0, 1, 0,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_AUDIO | RUNLOOP_PACE_TIMER,
+         "content rate: VSync+Audio+VRR -> VSync+Audio+Timer, as in play");
+   MENU_ROW(AT_CONTENT, 0, 1, 1, 0, 0, RUNLOOP_PACE_AUDIO | RUNLOOP_PACE_DISPLAY,
+         "content rate: Display+Audio -> Audio+Display");
+   MENU_ROW(AT_CONTENT, 0, 0, 1, 0, 0, RUNLOOP_PACE_DISPLAY,
+         "content rate: Display -> Display (the hold keeps the content's "
+         "period; a timer as well would beat against it)");
+}
+
+int main(void)
+{
+   printf("runloop pacing decisions:\n");
+
+   test_gap_predicate();
+   test_frame_period();
+   test_sample_filter();
+   test_schedule();
+   test_margin();
+   test_fastforward_ratios();
+   test_ff_frameskip();
+   test_vsync_blocks();
+   test_swap_interval();
+   test_sync_plan();
+   test_menu_table();
+   test_driver_pacing();
+   test_driver_interval();
+
+   if (failures)
+   {
+      printf("FAILED: %u check(s)\n", failures);
+      return 1;
+   }
+
+   printf("ok: the gap limiter engages only when nothing else paces and "
+          "fast-forward is off, the period is always a sane frame, a "
+          "stall never moves the measured rate, an overshooting sleep "
+          "never slows the loop, the margin follows the overshoot, and "
+          "the swap interval is the multiple the display actually is of "
+          "the content, within what the driver can present, VRR drops "
+          "vsync only for a content rate past the skew tolerance, and "
+          "fast-forward's frameskip presents at the display's rate\n");
+   return 0;
+}

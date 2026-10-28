@@ -37,6 +37,24 @@ static const char* d3dcompiler_dll_list[] = {
    "D3DCompiler_35.dll", "D3DCompiler_34.dll", "D3DCompiler_33.dll", NULL,
 };
 
+static pD3DCompile d3dcompile_fp;
+
+/* Resolves D3DCompile once.  The deferred shader loads compile on the
+ * task threads, several at a time, so they call this from the thread
+ * that starts the load first and only ever read what it wrote. */
+static bool d3d_compiler_resolve(void)
+{
+   const char** dll_name = d3dcompiler_dll_list;
+   if (d3dcompile_fp)
+      return true;
+   while (!d3dcompiler_dll && *dll_name)
+      d3dcompiler_dll = dylib_load(*dll_name++);
+   if (!d3dcompiler_dll)
+      return false;
+   d3dcompile_fp = (pD3DCompile)dylib_proc(d3dcompiler_dll, "D3DCompile");
+   return d3dcompile_fp != NULL;
+}
+
 HRESULT WINAPI D3DCompile(
       LPCVOID pSrcData,
       SIZE_T  SrcDataSize,
@@ -50,15 +68,10 @@ HRESULT WINAPI D3DCompile(
       ID3DBlob**              ppCode,
       ID3DBlob**              ppErrorMsgs)
 {
-   static pD3DCompile fp;
-   const char** dll_name = d3dcompiler_dll_list;
-   while (!d3dcompiler_dll && *dll_name)
-      if (!(d3dcompiler_dll = dylib_load(*dll_name++)))
-         return TYPE_E_CANTLOADLIBRARY;
-   if (!fp)
-      if (!(fp = (pD3DCompile)dylib_proc(d3dcompiler_dll, "D3DCompile")))
-         return TYPE_E_DLLFUNCTIONNOTFOUND;
-   return fp(
+   if (!d3d_compiler_resolve())
+      return d3dcompiler_dll ? TYPE_E_DLLFUNCTIONNOTFOUND
+         : TYPE_E_CANTLOADLIBRARY;
+   return d3dcompile_fp(
          pSrcData, SrcDataSize, pSourceName,
          pDefines, pInclude, pEntrypoint, pTarget,
          Flags1,   Flags2, ppCode, ppErrorMsgs);
@@ -115,14 +128,23 @@ HRESULT WINAPI
 }
 #endif
 
+bool d3d_compiler_load(void)
+{
+#if defined(HAVE_DYLIB) && !defined(__WINRT__)
+   return d3d_compiler_resolve();
+#else
+   return true;
+#endif
+}
+
 bool d3d_compile(const char* src, size_t len,
       LPCSTR src_name, LPCSTR entrypoint, LPCSTR target, D3DBlob* out)
 {
-   D3DBlob error_msg;
+   D3DBlob err = NULL;
 #ifdef DEBUG
-   UINT compileflags    = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+   UINT compileflags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #else
-   UINT compileflags    = 0;
+   UINT compileflags = 0;
 #endif
 
    if (!len)
@@ -130,15 +152,18 @@ bool d3d_compile(const char* src, size_t len,
 
    if (FAILED(D3DCompile(
              src, len, src_name, NULL, NULL,
-             entrypoint, target, compileflags, 0, out, &error_msg)))
+             entrypoint, target, compileflags, 0, out, &err)))
    {
-      if (error_msg)
+      if (err)
       {
-         const char* msg = (const char*)error_msg->lpVtbl->GetBufferPointer(error_msg);
-         RARCH_ERR("D3DCompile failed :\n%s\n", msg);
-         /* Place a breakpoint here, if you want,
-            to see shader compilation issues */
-         Release(error_msg);
+         const char* msg = (const char*)err->lpVtbl->GetBufferPointer(err);
+         if (msg)
+         {
+            RARCH_ERR("D3DCompile failed: %s.\n", msg);
+            /* Place a breakpoint here, if you want,
+               to see shader compilation issues */
+         }
+         Release(err);
       }
       return false;
    }
@@ -149,22 +174,23 @@ bool d3d_compile(const char* src, size_t len,
 bool d3d_compile_from_file(LPCWSTR filename,
       LPCSTR entrypoint, LPCSTR target, D3DBlob* out)
 {
-   D3DBlob error_msg;
+   D3DBlob err = NULL;
 #ifdef DEBUG
-   UINT compileflags    = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+   UINT compileflags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #else
-   UINT compileflags    = 0;
+   UINT compileflags = 0;
 #endif
 
    if (FAILED(D3DCompileFromFile(
              filename, NULL, NULL, entrypoint,
-             target, compileflags, 0, out, &error_msg)))
+             target, compileflags, 0, out, &err)))
    {
-      if (error_msg)
+      if (err)
       {
-         RARCH_ERR("D3DCompile failed :\n%s\n",
-               (const char*)error_msg->lpVtbl->GetBufferPointer(error_msg));
-         Release(error_msg);
+         const char* msg = (const char*)err->lpVtbl->GetBufferPointer(err);
+         if (msg)
+            RARCH_ERR("D3DCompile failed: %s.\n", msg);
+         Release(err);
       }
       return false;
    }

@@ -1,0 +1,122 @@
+include ../../sample_objdir.mk
+
+TARGET := bsv_replay_init_test
+
+# The units under test are compiled from the tree, not copied: the
+# shipping tasks/task_movie.c and input/bsv/bsvmovie.c, driven through
+# the real task queue, intfstream and VFS.  The core, the settings and
+# the runloop's two-line replay protocol are the test's.
+#
+# HAVE_RZSTD on and HAVE_STATESTREAM off matches the iOS build the bug
+# was reported against (pkg/apple/BaseConfig.xcconfig): a checkpoint is
+# a RAW-encoded state under Zstandard compression.  HAVE_ZLIB stays off
+# so no system zlib is needed.
+REPO_ROOT         := ../../..
+LIBRETRO_COMM_DIR := $(REPO_ROOT)/libretro-common
+
+SOURCES := bsv_replay_init_test.c \
+           $(REPO_ROOT)/tasks/task_movie.c \
+           $(REPO_ROOT)/input/bsv/bsvmovie.c \
+           $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+           $(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
+           $(LIBRETRO_COMM_DIR)/encodings/encoding_rzstd.c \
+           $(LIBRETRO_COMM_DIR)/encodings/encoding_xxh64.c \
+           $(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+           $(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
+           $(LIBRETRO_COMM_DIR)/features/features_cpu.c \
+           $(LIBRETRO_COMM_DIR)/string/rstrtod.c \
+           $(LIBRETRO_COMM_DIR)/file/file_path.c \
+           $(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+           $(LIBRETRO_COMM_DIR)/lists/string_list.c \
+           $(LIBRETRO_COMM_DIR)/queues/task_queue.c \
+           $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+           $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
+           $(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+           $(LIBRETRO_COMM_DIR)/streams/interface_stream.c \
+           $(LIBRETRO_COMM_DIR)/streams/memory_stream.c \
+           $(LIBRETRO_COMM_DIR)/string/stdstring.c \
+           $(LIBRETRO_COMM_DIR)/time/rtime.c \
+           $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+
+CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
+           -DHAVE_BSV_MOVIE -DHAVE_RZSTD -DHAVE_THREADS \
+           -I$(REPO_ROOT) \
+           -I$(LIBRETRO_COMM_DIR)/include
+
+LDFLAGS += -lpthread -lm
+
+# STATESTREAM=1 adds the deduplicating checkpoint encoding, the default
+# on desktop builds.
+ifeq ($(STATESTREAM),1)
+   SOURCES += $(REPO_ROOT)/input/bsv/uint32s_index.c \
+              $(LIBRETRO_COMM_DIR)/encodings/encoding_xxh3.c \
+              $(REPO_ROOT)/libretro-db/rmsgpack.c \
+              $(REPO_ROOT)/libretro-db/rmsgpack_dom.c
+   CFLAGS  += -DHAVE_STATESTREAM
+endif
+
+# NETPLAY=1 exercises the recorder and the real rollback/confirmation loop
+# against the deterministic fixture, with the ordinary BSV reader on replay.
+ifeq ($(NETPLAY),1)
+   CFLAGS += -DHAVE_NETWORKING -DBSV_TEST_NETPLAY
+   BSV_NETPLAY_SRC := $(REPO_ROOT)/network/netplay/netplay_frontend.c
+   BSV_FRAGMENTS := netplay_bsv_recording.inc netplay_bsv_post.inc netplay_bsv_eligibility.inc netplay_bsv_frontend.inc
+   bsv_replay_init_test.o: $(BSV_FRAGMENTS) bsv_netplay_test.inc
+
+netplay_bsv_frontend.inc: $(REPO_ROOT)/input/input_driver.c
+	sed -n '/===== BEGIN netplay BSV frontend =====/,/===== END netplay BSV frontend =====/p' $< > $@
+netplay_bsv_recording.inc: $(BSV_NETPLAY_SRC)
+	sed -n '/===== BEGIN netplay BSV recording =====/,/===== END netplay BSV recording =====/p' $< > $@
+netplay_bsv_post.inc: $(BSV_NETPLAY_SRC)
+	sed -n '/===== BEGIN netplay BSV post frame =====/,/===== END netplay BSV post frame =====/p' $< > $@
+netplay_bsv_eligibility.inc: $(BSV_NETPLAY_SRC)
+	sed -n '/===== BEGIN netplay BSV eligibility =====/,/===== END netplay BSV eligibility =====/p' $< > $@
+endif
+
+CFLAGS += $(EXTRA_CFLAGS)
+
+OBJS := $(call sample_objs,$(SOURCES:.c=.o))
+
+ifneq ($(SANITIZER),)
+   CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
+   LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
+endif
+
+.DEFAULT_GOAL := all
+
+all: $(TARGET)
+
+%.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# allocator_may_return_null lets a too-large allocation fail the way it
+# does outside ASan, so the test sees the NULL.
+SWEEP_ASAN := ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+              UBSAN_OPTIONS=print_stacktrace=1
+
+sweep:
+	$(MAKE) clean && $(MAKE) && ./$(TARGET)
+	$(MAKE) clean && $(MAKE) SANITIZER=address,undefined && \
+	   $(SWEEP_ASAN) ./$(TARGET)
+	$(MAKE) clean && $(MAKE) STATESTREAM=1 SANITIZER=address,undefined && \
+	   $(SWEEP_ASAN) ./$(TARGET)
+	@# The short-header probe in lane_checkpoint is an uninitialised
+	@# read, which no sanitizer above reports; valgrind does.
+	@if command -v valgrind >/dev/null 2>&1; then \
+	   $(MAKE) clean && $(MAKE) && \
+	   valgrind -q --error-exitcode=1 ./$(TARGET); \
+	else echo "valgrind not installed: uninitialised-read probe not run"; fi
+	@echo "sweep clean"
+
+clean:
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(TARGET) $(OBJS) $(TARGET).replay netplay_bsv_*.inc bsv_netplay_*.replay
+
+.PHONY: all sweep clean

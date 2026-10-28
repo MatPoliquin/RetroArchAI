@@ -56,6 +56,19 @@ struct filter_data
    float phosphor_bloom_565[64];
    float scan_range_8888[256];
    float scan_range_565[64];
+   /* What the float expressions below give for every input they can
+    * see, each worked out once at create with the same expression, so
+    * the lines look the results up instead of converting, multiplying
+    * and truncating per channel per pixel. bleed_rb is the red and blue
+    * bleed of a channel value, bleed_g the green; scan is the scanline
+    * level of a channel value c in a pixel whose brightest channel is
+    * max, at [max][c]. */
+   uint8_t bleed_rb_8888[256];
+   uint8_t bleed_g_8888[256];
+   uint8_t bleed_rb_565[64];
+   uint8_t bleed_g_565[64];
+   uint8_t scan_8888[256][256];
+   uint8_t scan_565[64][64];
 };
 
 #define clamp8(x) ((x) > 255 ? 255 : ((x < 0) ? 0 : (uint32_t)x))
@@ -102,115 +115,6 @@ static INLINE unsigned max_component_rgb565(uint32_t color)
    return max;
 }
 
-static void blit_linear_line_xrgb8888(uint32_t * out,
-      const uint32_t *in, unsigned width)
-{
-   unsigned i;
-
-   /* Splat pixels out on the line. */
-   for (i = 0; i < width; i++)
-      out[i << 1] = in[i];
-
-   /* Blend in-between pixels. */
-   for (i = 1; i < (width << 1) - 1; i += 2)
-      out[i] = blend_pixels_xrgb8888(out[i - 1], out[i + 1]);
-
-   /* Blend edge pixels against black. */
-   out[0] = blend_pixels_xrgb8888(out[0], 0);
-   out[(width << 1) - 1] =
-      blend_pixels_xrgb8888(out[(width << 1) - 1], 0);
-}
-
-static void blit_linear_line_rgb565(uint16_t * out,
-      const uint16_t *in, unsigned width)
-{
-   unsigned i;
-
-   /* Splat pixels out on the line. */
-   for (i = 0; i < width; i++)
-      out[i << 1] = in[i];
-
-   /* Blend in-between pixels. */
-   for (i = 1; i < (width << 1) - 1; i += 2)
-      out[i] =
-         blend_pixels_rgb565(out[i - 1], out[i + 1]);
-
-   /* Blend edge pixels against black. */
-   out[0] = blend_pixels_rgb565(out[0], 0);
-   out[(width << 1) - 1] =
-      blend_pixels_rgb565(out[(width << 1) - 1], 0);
-}
-
-static void bleed_phosphors_xrgb8888(void *data,
-      uint32_t *scanline, unsigned width)
-{
-   unsigned x;
-   struct filter_data *filt = (struct filter_data*)data;
-
-   /* Red phosphor */
-   for (x = 0; x < width; x += 2)
-   {
-      unsigned r = red_xrgb8888(scanline[x]);
-      unsigned r_set = clamp8(r * filt->phosphor_bleed *
-            filt->phosphor_bloom_8888[r]);
-      set_red_xrgb8888(scanline[x + 1], r_set);
-   }
-
-   /* Green phosphor */
-   for (x = 0; x < width; x++)
-   {
-      unsigned g = green_xrgb8888(scanline[x]);
-      unsigned g_set = clamp8((g >> 1) + 0.5 * g *
-            filt->phosphor_bleed * filt->phosphor_bloom_8888[g]);
-      set_green_xrgb8888(scanline[x], g_set);
-   }
-
-   /* Blue phosphor */
-   set_blue_xrgb8888(scanline[0], 0);
-   for (x = 1; x < width; x += 2)
-   {
-      unsigned b = blue_xrgb8888(scanline[x]);
-      unsigned b_set = clamp8(b * filt->phosphor_bleed *
-            filt->phosphor_bloom_8888[b]);
-      set_blue_xrgb8888(scanline[x + 1], b_set);
-   }
-}
-
-static void bleed_phosphors_rgb565(void *data,
-      uint16_t *scanline, unsigned width)
-{
-   unsigned x;
-   struct filter_data *filt = (struct filter_data*)data;
-
-   /* Red phosphor */
-   for (x = 0; x < width; x += 2)
-   {
-      unsigned r = red_rgb565(scanline[x]);
-      unsigned r_set = clamp6(r * filt->phosphor_bleed *
-            filt->phosphor_bloom_565[r]);
-      set_red_rgb565(scanline[x + 1], r_set);
-   }
-
-   /* Green phosphor */
-   for (x = 0; x < width; x++)
-   {
-      unsigned g = green_rgb565(scanline[x]);
-      unsigned g_set = clamp6((g >> 1) + 0.5 * g *
-            filt->phosphor_bleed * filt->phosphor_bloom_565[g]);
-      set_green_rgb565(scanline[x], g_set);
-   }
-
-   /* Blue phosphor */
-   set_blue_rgb565(scanline[0], 0);
-   for (x = 1; x < width; x += 2)
-   {
-      unsigned b = blue_rgb565(scanline[x]);
-      unsigned b_set = clamp6(b * filt->phosphor_bleed *
-            filt->phosphor_bloom_565[b]);
-      set_blue_rgb565(scanline[x + 1], b_set);
-   }
-}
-
 static unsigned phosphor2x_generic_input_fmts(void)
 {
    return SOFTFILTER_FMT_RGB565 | SOFTFILTER_FMT_XRGB8888;
@@ -244,7 +148,7 @@ static void *phosphor2x_generic_create(const struct softfilter_config *config,
    }
    /* Apparently the code is not thread-safe,
     * so force single threaded operation... */
-   filt->threads        = 1;
+   filt->threads        = threads;
    filt->in_fmt         = in_fmt;
 
    filt->phosphor_bleed = 0.78;
@@ -253,12 +157,6 @@ static void *phosphor2x_generic_create(const struct softfilter_config *config,
    filt->scanrange_low  = 0.5;
    filt->scanrange_high = 0.65;
 
-#if 0
-   /* Initialize lookup tables: */
-   phosphorBloom = (scaleTimes .*
-         linspace(0, 1, 255) .^ (1/2.2)) + scaleAdd;
-   /* Not exactly sure of order of operations here ... */
-#endif
    for (i = 0; i < 256; i++)
    {
       filt->phosphor_bloom_8888[i] =
@@ -276,6 +174,36 @@ static void *phosphor2x_generic_create(const struct softfilter_config *config,
       filt->scan_range_565[i]     =
          filt->scanrange_low + i *
          (filt->scanrange_high - filt->scanrange_low) / 31.0f;
+   }
+
+   /* The lookup tables, from the expressions the lines used to
+    * evaluate per pixel, operand types included. */
+   for (i = 0; i < 256; i++)
+   {
+      unsigned v = i, c;
+      unsigned r_set = clamp8(v * filt->phosphor_bleed *
+            filt->phosphor_bloom_8888[v]);
+      unsigned g_set = clamp8((v >> 1) + 0.5 * v *
+            filt->phosphor_bleed * filt->phosphor_bloom_8888[v]);
+      filt->bleed_rb_8888[i] = (uint8_t)r_set;
+      filt->bleed_g_8888[i]  = (uint8_t)g_set;
+      for (c = 0; c < 256; c++)
+         filt->scan_8888[i][c] = (uint8_t)(uint32_t)
+            (filt->scan_range_8888[i] * c);
+   }
+   for (i = 0; i < 64; i++)
+   {
+      unsigned v = i;
+      int c;
+      unsigned r_set = clamp6(v * filt->phosphor_bleed *
+            filt->phosphor_bloom_565[v]);
+      unsigned g_set = clamp6((v >> 1) + 0.5 * v *
+            filt->phosphor_bleed * filt->phosphor_bloom_565[v]);
+      filt->bleed_rb_565[i] = (uint8_t)r_set;
+      filt->bleed_g_565[i]  = (uint8_t)g_set;
+      for (c = 0; c < 64; c++)
+         filt->scan_565[i][c] = (uint8_t)(uint16_t)
+            (filt->scan_range_565[i] * c);
    }
 
    return filt;
@@ -300,6 +228,53 @@ static void phosphor2x_generic_destroy(void *data)
    free(filt);
 }
 
+/* One line pair in a single pass. The line is the source stretched to
+ * twice its width (even pixels the source pixels, the first blended with
+ * black; odd pixels the blend of the two either side, the last black),
+ * then the phosphor bleed: each odd pixel takes the bled red of the even
+ * pixel before it, each even pixel after the first the bled blue of the
+ * odd pixel before it (the first one's blue is cleared), and every green
+ * is run through its table. The scanline below takes each finished
+ * pixel's levels. Each output pixel needs only the stretched pixel
+ * before it, so it is built in a register with the set_ macros, and the
+ * two lines are written once. */
+#define PHOSPHOR2X_LINE(TYPE, FMT, RB, GT, SCAN) \
+   { \
+      const uint8_t *rb = filt->RB; \
+      const uint8_t *gt = filt->GT; \
+      uint32_t prev_odd = 0; /* the stretched pixel before this one */ \
+      unsigned i; \
+      for (i = 0; i < width; i++) \
+      { \
+         uint32_t cur    = in_line[i]; \
+         uint32_t s_even = i ? cur : blend_pixels_##FMT(cur, 0); \
+         uint32_t s_odd  = (i + 1 < width) \
+            ? blend_pixels_##FMT(cur, (uint32_t)in_line[i + 1]) : 0; \
+         uint32_t ev     = s_even; \
+         uint32_t od     = s_odd; \
+         set_green_##FMT(ev, (uint32_t)gt[green_##FMT(ev)]); \
+         set_blue_##FMT(ev, i ? (uint32_t)rb[blue_##FMT(prev_odd)] : 0); \
+         set_red_##FMT(od, (uint32_t)rb[red_##FMT(s_even)]); \
+         set_green_##FMT(od, (uint32_t)gt[green_##FMT(od)]); \
+         out_line[2 * i]     = (TYPE)ev; \
+         out_line[2 * i + 1] = (TYPE)od; \
+         { \
+            const uint8_t *le = filt->SCAN[max_component_##FMT(ev)]; \
+            const uint8_t *lo = filt->SCAN[max_component_##FMT(od)]; \
+            uint32_t se = 0, so = 0; \
+            set_red_##FMT(se,   (uint32_t)le[red_##FMT(ev)]); \
+            set_green_##FMT(se, (uint32_t)le[green_##FMT(ev)]); \
+            set_blue_##FMT(se,  (uint32_t)le[blue_##FMT(ev)]); \
+            set_red_##FMT(so,   (uint32_t)lo[red_##FMT(od)]); \
+            set_green_##FMT(so, (uint32_t)lo[green_##FMT(od)]); \
+            set_blue_##FMT(so,  (uint32_t)lo[blue_##FMT(od)]); \
+            scan_out[2 * i]     = (TYPE)se; \
+            scan_out[2 * i + 1] = (TYPE)so; \
+         } \
+         prev_odd = s_odd; \
+      } \
+   }
+
 static void phosphor2x_generic_xrgb8888(void *data,
       unsigned width, unsigned height,
       int first, int last, uint32_t *src,
@@ -308,40 +283,14 @@ static void phosphor2x_generic_xrgb8888(void *data,
    unsigned y;
    struct filter_data *filt = (struct filter_data*)data;
 
-   memset(dst, 0, height * dst_stride);
-
    for (y = 0; y < height; y++)
    {
-      unsigned x;
-      uint32_t *scan_out      = NULL;
-      const uint32_t *in_line = (const uint32_t*)(src + y * (src_stride));
-
-      /* output in a scanlines fashion. */
-      uint32_t *out_line      = (uint32_t*)(dst + y * (dst_stride) * 2);
-
-      /* Bilinear stretch horizontally. */
-      blit_linear_line_xrgb8888(out_line, in_line, width);
-
-      /* Mask 'n bleed phosphors */
-      bleed_phosphors_xrgb8888(filt, out_line, width << 1);
-
-      /* Apply scanlines */
-
-      scan_out = (uint32_t*)out_line + (dst_stride);
-
-      for (x = 0; x < (width << 1); x++)
-      {
-         unsigned max = max_component_xrgb8888(out_line[x]);
-         set_red_xrgb8888(scan_out[x],
-               (uint32_t)(filt->scan_range_8888[max] *
-                  red_xrgb8888(out_line[x])));
-         set_green_xrgb8888(scan_out[x],
-               (uint32_t)(filt->scan_range_8888[max] *
-                  green_xrgb8888(out_line[x])));
-         set_blue_xrgb8888(scan_out[x],
-               (uint32_t)(filt->scan_range_8888[max] *
-                  blue_xrgb8888(out_line[x])));
-      }
+      const uint32_t *in_line = src + y * src_stride;
+      /* Output in a scanlines fashion. */
+      uint32_t *out_line      = dst + y * dst_stride * 2;
+      uint32_t *scan_out      = out_line + dst_stride;
+      PHOSPHOR2X_LINE(uint32_t, xrgb8888, bleed_rb_8888, bleed_g_8888,
+            scan_8888)
    }
 }
 
@@ -353,38 +302,14 @@ static void phosphor2x_generic_rgb565(void *data,
    unsigned y;
    struct filter_data *filt = (struct filter_data*)data;
 
-   memset(dst, 0, height * dst_stride);
-
    for (y = 0; y < height; y++)
    {
-      unsigned x;
+      const uint16_t *in_line = src + y * src_stride;
       /* Output in a scanlines fashion. */
-      uint16_t *scan_out      = NULL;
-      uint16_t      *out_line = (uint16_t*)(dst + y * (dst_stride) * 2);
-      const uint16_t *in_line = (const uint16_t*)(src + y * (src_stride));
-
-      /* Bilinear stretch horizontally. */
-      blit_linear_line_rgb565(out_line, in_line, width);
-
-      /* Mask 'n bleed phosphors. */
-      bleed_phosphors_rgb565(filt, out_line, width << 1);
-
-      /* Apply scanlines. */
-      scan_out = (uint16_t*)(out_line + (dst_stride));
-
-      for (x = 0; x < (width << 1); x++)
-      {
-         unsigned max = max_component_rgb565(out_line[x]);
-         set_red_rgb565(scan_out[x],
-               (uint16_t)(filt->scan_range_565[max] *
-                  red_rgb565(out_line[x])));
-         set_green_rgb565(scan_out[x],
-               (uint16_t)(filt->scan_range_565[max] *
-                  green_rgb565(out_line[x])));
-         set_blue_rgb565(scan_out[x],
-               (uint16_t)(filt->scan_range_565[max] *
-                  blue_rgb565(out_line[x])));
-      }
+      uint16_t *out_line      = dst + y * dst_stride * 2;
+      uint16_t *scan_out      = out_line + dst_stride;
+      PHOSPHOR2X_LINE(uint16_t, rgb565, bleed_rb_565, bleed_g_565,
+            scan_565)
    }
 }
 
@@ -446,10 +371,6 @@ static void phosphor2x_generic_packets(void *data,
 
       if (filt->in_fmt == SOFTFILTER_FMT_RGB565)
          packets[i].work     = phosphor2x_work_cb_rgb565;
-#if 0
-      else if (filt->in_fmt == SOFTFILTER_FMT_RGB4444)
-         packets[i].work     = phosphor2x_work_cb_rgb4444;
-#endif
       if (filt->in_fmt == SOFTFILTER_FMT_XRGB8888)
          packets[i].work     = phosphor2x_work_cb_xrgb8888;
       packets[i].thread_data = thr;

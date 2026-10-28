@@ -29,18 +29,23 @@
 
 #if defined(HAVE_FFMPEG) && defined(HAVE_AVFORMAT) && defined(HAVE_AVCODEC) && \
    defined(HAVE_AVDEVICE) && defined(HAVE_AVUTIL) && defined(HAVE_SWSCALE)
-/* FFMPEG consists of several libraries, and the camera driver needs most of them */
+/* FFMPEG consists of several libraries, and the camera driver needs most of them.
+ * The camera driver uses APIs introduced in avformat 58 (ffmpeg 4.0). */
+#include <libavformat/version.h>
+#if LIBAVFORMAT_VERSION_MAJOR >= 58
 #define HAVE_FFMPEG_CAMERA
+#endif
 #endif
 
 static void *nullcamera_init(const char *device, uint64_t caps,
-      unsigned width, unsigned height) { return (void*)-1; }
+      unsigned dims) { return (void*)-1; }
 static void nullcamera_free(void *data) { }
 static void nullcamera_stop(void *data) { }
 static bool nullcamera_start(void *data) { return true; }
 static bool nullcamera_poll(void *a,
       retro_camera_frame_raw_framebuffer_t b,
-      retro_camera_frame_opengl_texture_t c) { return true; }
+      retro_camera_frame_opengl_texture_t c,
+      retro_camera_frame_planar_t d) { return true; }
 
 static camera_driver_t camera_null = {
    nullcamera_init,
@@ -55,10 +60,10 @@ const camera_driver_t *camera_drivers[] = {
 #ifdef HAVE_V4L2
    &camera_v4l2,
 #endif
-#ifdef HAVE_PIPEWIRE_STABLE
+#if defined(HAVE_PIPEWIRE) && defined(HAVE_PIPEWIRE_STABLE)
    &camera_pipewire,
 #endif
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
    &camera_rwebcam,
 #endif
 #ifdef ANDROID
@@ -74,7 +79,7 @@ const camera_driver_t *camera_drivers[] = {
    NULL,
 };
 
-static camera_driver_state_t camera_driver_st     = {0};
+static camera_driver_state_t camera_driver_st;
 
 camera_driver_state_t *camera_state_get_ptr(void)
 {
@@ -106,7 +111,18 @@ bool driver_camera_start(void)
       settings_t *settings = config_get_ptr();
       bool camera_allow    = settings->bools.camera_allow;
       if (camera_allow)
-         return camera_st->driver->start(camera_st->data);
+      {
+         bool ok = camera_st->driver->start(camera_st->data);
+         /* The bit means "poll this every frame": up only when the
+          * driver can be polled and the core gave it somewhere to
+          * deliver. Everything the iterate used to re-test lives
+          * here, once, at the edge. */
+         runloop_frame_work_set(RUNLOOP_WORK_CAMERA,
+                  ok
+               && camera_st->driver->poll
+               && camera_st->cb.caps);
+         return ok;
+      }
 
       runloop_msg_queue_push(
             "Camera is explicitly disabled.\n",
@@ -124,6 +140,7 @@ void driver_camera_stop(void)
          && camera_st->driver->stop
          && camera_st->data)
       camera_st->driver->stop(camera_st->data);
+   runloop_frame_work_set(RUNLOOP_WORK_CAMERA, false);
 }
 
 bool camera_driver_find_driver(const char *prefix,

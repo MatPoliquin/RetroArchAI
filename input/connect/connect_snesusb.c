@@ -28,7 +28,8 @@ struct hidpad_snesusb_data
    struct pad_connection* connection;
    uint32_t slot;
    uint32_t buttons;
-   uint8_t data[64];
+   uint8_t axis[2];
+   input_pad_view_t view;  /* what the getters answer */
 };
 
 static void* hidpad_snesusb_init(void *data,
@@ -63,16 +64,22 @@ static void hidpad_snesusb_deinit(void *data)
 
 static void hidpad_snesusb_get_buttons(void *data, input_bits_t *state)
 {
-	struct hidpad_snesusb_data *device = (struct hidpad_snesusb_data*)data;
-	if (device)
-   {
-		BITS_COPY16_PTR(state, device->buttons);
-	}
+   struct hidpad_snesusb_data *device = (struct hidpad_snesusb_data*)data;
+   if (device)
+      *state = device->view.buttons;
    else
-		BIT256_CLEAR_ALL_PTR(state);
+      BIT256_CLEAR_ALL_PTR(state);
 }
 
 static int16_t hidpad_snesusb_get_axis(void *data, unsigned axis)
+{
+   struct hidpad_snesusb_data *device = (struct hidpad_snesusb_data*)data;
+   if (!device || axis >= INPUT_PAD_VIEW_AXES)
+      return 0;
+   return device->view.axes[axis];
+}
+
+static int16_t hidpad_snesusb_axis_of(void *data, unsigned axis)
 {
    int val;
    struct hidpad_snesusb_data *device = (struct hidpad_snesusb_data*)data;
@@ -80,7 +87,7 @@ static int16_t hidpad_snesusb_get_axis(void *data, unsigned axis)
    if (!device || axis >= 2)
       return 0;
 
-   val = device->data[axis];
+   val = device->axis[axis];
    val = (val << 8) - 0x8000;
 
    if (abs(val) > 0x1000)
@@ -113,19 +120,27 @@ static void hidpad_snesusb_packet_handler(void *data,
    };
    struct hidpad_snesusb_data *device = (struct hidpad_snesusb_data*)data;
 
-   if (!device)
+   if (!device || size < 7)
       return;
 
-   memcpy(device->data, packet, size);
+   device->axis[0] = packet[0];
+   device->axis[1] = packet[1];
 
    device->buttons = 0;
 
-   pressed_keys  = device->data[6] | (device->data[5] << 8);
+   pressed_keys  = packet[6] | (packet[5] << 8);
 
    for (i = 0; i < 16; i ++)
       if (button_mapping[i] != NO_BTN)
          device->buttons |= (pressed_keys & (1 << i)) 
             ? (1 << button_mapping[i]) : 0;
+   /* the view, which the getters and the frontend read */
+   pad_view_set_buttons(&device->view, device->buttons & 0xffff, false);
+   {
+      unsigned a;
+      for (a = 0; a < 2; a++)
+         device->view.axes[a] = hidpad_snesusb_axis_of(device, a);
+   }
 }
 
 static void hidpad_snesusb_set_rumble(void *data,
@@ -142,7 +157,12 @@ static int32_t hidpad_snesusb_button(void *data, uint16_t joykey)
    struct hidpad_snesusb_data *pad = (struct hidpad_snesusb_data*)data;
    if (!pad || joykey > 31)
       return 0;
-   return pad->buttons & (1 << joykey);
+   return BIT256_GET(pad->view.buttons, joykey) ? 1 : 0;
+}
+
+static const input_pad_view_t *hidpad_snesusb_view(void *data)
+{
+   return &((struct hidpad_snesusb_data*)data)->view;
 }
 
 pad_connection_interface_t pad_connection_snesusb = {
@@ -154,5 +174,12 @@ pad_connection_interface_t pad_connection_snesusb = {
    hidpad_snesusb_get_axis,
    hidpad_snesusb_get_name,
    hidpad_snesusb_button,
-   false
+   false, /* multi_pad */
+   0,     /* max_pad */
+   NULL,  /* pad_init */
+   NULL,  /* pad_deinit */
+   NULL,  /* status */
+   NULL,  /* joypad */
+   NULL,  /* set_player */
+   hidpad_snesusb_view
 };

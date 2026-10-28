@@ -16,6 +16,8 @@
 
 #include <string/stdstring.h>
 
+#include <compat/strl.h>
+
 #ifdef HAVE_CHEEVOS
 #include "cheevos/cheevos.h"
 #endif
@@ -26,6 +28,7 @@
 
 #include "core_option_manager.h"
 #include "msg_hash.h"
+#include "verbosity.h"
 
 /*********************/
 /* Option Conversion */
@@ -58,7 +61,7 @@ struct retro_core_options_v2 *core_option_manager_convert_v1(
    /* Determine number of options */
    for (;;)
    {
-      if (string_is_empty(options_v1[num_options].key))
+      if (!options_v1[num_options].key || !*options_v1[num_options].key)
          break;
       num_options++;
    }
@@ -103,8 +106,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v1(
       option_v2_defs[i].default_value = options_v1[i].default_value;
 
       /* Set desc and info strings */
-      option_v2_defs[i].desc = options_v1[i].desc;
-      option_v2_defs[i].info = options_v1[i].info;
+      option_v2_defs[i].desc          = options_v1[i].desc;
+      option_v2_defs[i].info          = options_v1[i].info;
 
       /* v1 options have no concept of categories
        * (Note: These are already nullified by
@@ -117,7 +120,7 @@ struct retro_core_options_v2 *core_option_manager_convert_v1(
       /* Determine number of values */
       for (;;)
       {
-         if (string_is_empty(options_v1[i].values[num_values].value))
+         if (!options_v1[i].values[num_values].value || !*options_v1[i].values[num_values].value)
             break;
          num_values++;
       }
@@ -171,7 +174,7 @@ struct retro_core_options_v2 *core_option_manager_convert_v1_intl(
    /* Determine number of options */
    for (;;)
    {
-      if (string_is_empty(option_defs_us[num_options].key))
+      if (!option_defs_us[num_options].key || !*option_defs_us[num_options].key)
          break;
       num_options++;
    }
@@ -227,10 +230,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v1_intl(
          for (;;)
          {
             const char *local_key = option_defs_local[index].key;
-
-            if (string_is_empty(local_key))
+            if (!local_key || !*local_key)
                break;
-
             if (string_is_equal(key, local_key))
             {
                local_desc   = option_defs_local[index].desc;
@@ -244,10 +245,10 @@ struct retro_core_options_v2 *core_option_manager_convert_v1_intl(
       }
 
       /* Set desc and info strings */
-      option_v2_defs[i].desc = string_is_empty(local_desc) ?
-            option_defs_us[i].desc : local_desc;
-      option_v2_defs[i].info = string_is_empty(local_info) ?
-            option_defs_us[i].info : local_info;
+      option_v2_defs[i].desc = (local_desc && *local_desc)
+            ? local_desc : option_defs_us[i].desc;
+      option_v2_defs[i].info = (local_info && *local_info)
+            ? local_info : option_defs_us[i].info;
 
       /* v1 options have no concept of categories
        * (Note: These are already nullified by
@@ -261,7 +262,7 @@ struct retro_core_options_v2 *core_option_manager_convert_v1_intl(
        * (always taken from us english defs) */
       for (;;)
       {
-         if (string_is_empty(option_defs_us[i].values[num_values].value))
+         if (!option_defs_us[i].values[num_values].value || !*option_defs_us[i].values[num_values].value)
             break;
          num_values++;
       }
@@ -283,10 +284,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v1_intl(
             for (;;)
             {
                const char *local_value = local_values[value_index].value;
-
-               if (string_is_empty(local_value))
+               if (!local_value || !*local_value)
                   break;
-
                if (string_is_equal(value, local_value))
                {
                   local_label = local_values[value_index].label;
@@ -298,8 +297,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v1_intl(
          }
 
          /* Set value label string */
-         option_v2_defs[i].values[j].label = string_is_empty(local_label) ?
-               option_defs_us[i].values[j].label : local_label;
+         option_v2_defs[i].values[j].label = (local_label && *local_label)
+               ? local_label : option_defs_us[i].values[j].label;
       }
    }
 
@@ -337,8 +336,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
    options_v2_us    = options_v2_intl->us;
    options_v2_local = options_v2_intl->local;
 
-   if (!options_v2_us ||
-       !options_v2_us->definitions)
+   if (     !options_v2_us
+         || !options_v2_us->definitions)
       return NULL;
 
    /* Determine number of categories
@@ -347,7 +346,7 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
    {
       for (;;)
       {
-         if (string_is_empty(options_v2_us->categories[num_categories].key))
+         if (!options_v2_us->categories[num_categories].key || !*options_v2_us->categories[num_categories].key)
             break;
          num_categories++;
       }
@@ -356,7 +355,7 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
    /* Determine number of options */
    for (;;)
    {
-      if (string_is_empty(options_v2_us->definitions[num_options].key))
+      if (!options_v2_us->definitions[num_options].key || !*options_v2_us->definitions[num_options].key)
          break;
       num_options++;
    }
@@ -415,18 +414,16 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
 
       /* Try to find corresponding entry in local
        * categories array */
-      if (options_v2_local &&
-          options_v2_local->categories)
+      if (     options_v2_local
+            && options_v2_local->categories)
       {
          size_t index = 0;
 
          for (;;)
          {
             const char *local_key = options_v2_local->categories[index].key;
-
-            if (string_is_empty(local_key))
+            if (!local_key || !*local_key)
                break;
-
             if (string_is_equal(key, local_key))
             {
                local_desc = options_v2_local->categories[index].desc;
@@ -439,10 +436,10 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
       }
 
       /* Set desc and info strings */
-      option_v2_cats[i].desc = string_is_empty(local_desc) ?
-            options_v2_us->categories[i].desc : local_desc;
-      option_v2_cats[i].info = string_is_empty(local_info) ?
-            options_v2_us->categories[i].info : local_info;
+      option_v2_cats[i].desc = (local_desc && *local_desc)
+            ? local_desc : options_v2_us->categories[i].desc;
+      option_v2_cats[i].info = (local_info && *local_info)
+            ? local_info : options_v2_us->categories[i].info;
 
    }
 
@@ -465,18 +462,16 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
       option_v2_defs[i].default_value = options_v2_us->definitions[i].default_value;
 
       /* Try to find corresponding entry in local defs array */
-      if (options_v2_local &&
-          options_v2_local->definitions)
+      if (     options_v2_local
+            && options_v2_local->definitions)
       {
          size_t index = 0;
 
          for (;;)
          {
             const char *local_key = options_v2_local->definitions[index].key;
-
-            if (string_is_empty(local_key))
+            if (!local_key || !*local_key)
                break;
-
             if (string_is_equal(key, local_key))
             {
                local_desc             = options_v2_local->definitions[index].desc;
@@ -492,14 +487,14 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
       }
 
       /* Set desc and info strings */
-      option_v2_defs[i].desc             = string_is_empty(local_desc) ?
-            options_v2_us->definitions[i].desc : local_desc;
-      option_v2_defs[i].desc_categorized = string_is_empty(local_desc_categorized) ?
-            options_v2_us->definitions[i].desc_categorized : local_desc_categorized;
-      option_v2_defs[i].info             = string_is_empty(local_info) ?
-            options_v2_us->definitions[i].info : local_info;
-      option_v2_defs[i].info_categorized = string_is_empty(local_info_categorized) ?
-            options_v2_us->definitions[i].info_categorized : local_info_categorized;
+      option_v2_defs[i].desc             = (local_desc && *local_desc)
+            ? local_desc : options_v2_us->definitions[i].desc;
+      option_v2_defs[i].desc_categorized = (local_desc_categorized && *local_desc_categorized)
+            ? local_desc_categorized : options_v2_us->definitions[i].desc_categorized;
+      option_v2_defs[i].info             = (local_info && *local_info)
+            ? local_info : options_v2_us->definitions[i].info;
+      option_v2_defs[i].info_categorized = (local_info_categorized && *local_info_categorized)
+            ? local_info_categorized : options_v2_us->definitions[i].info_categorized;
 
       /* Category key is always taken from us english defs */
       option_v2_defs[i].category_key = options_v2_us->definitions[i].category_key;
@@ -508,8 +503,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
        * (always taken from us english defs) */
       for (;;)
       {
-         if (string_is_empty(
-               options_v2_us->definitions[i].values[num_values].value))
+         if (     ! options_v2_us->definitions[i].values[num_values].value
+               || !*options_v2_us->definitions[i].values[num_values].value)
             break;
          num_values++;
       }
@@ -531,10 +526,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
             for (;;)
             {
                const char *local_value = local_values[value_index].value;
-
-               if (string_is_empty(local_value))
+               if (!local_value || !*local_value)
                   break;
-
                if (string_is_equal(value, local_value))
                {
                   local_label = local_values[value_index].label;
@@ -546,8 +539,8 @@ struct retro_core_options_v2 *core_option_manager_convert_v2_intl(
          }
 
          /* Set value label string */
-         option_v2_defs[i].values[j].label = string_is_empty(local_label) ?
-               options_v2_us->definitions[i].values[j].label : local_label;
+         option_v2_defs[i].values[j].label = (local_label && *local_label)
+               ? local_label : options_v2_us->definitions[i].values[j].label;
       }
    }
 
@@ -598,6 +591,69 @@ static uint32_t core_option_manager_hash_string(const char *str)
    return (hash ? hash : 1);
 }
 
+/* Up to this many options are looked for in order, which is quicker
+ * than probing the slots */
+#define CORE_OPTION_SCAN_MAX 64
+
+/* The slots of every keyed option, the first of a key kept */
+static bool core_option_manager_index_keys(core_option_manager_t *opt)
+{
+   size_t cap = 4, i;
+   if (opt->size <= CORE_OPTION_SCAN_MAX)
+      return true;
+   while (cap < 2 * opt->size)
+      cap <<= 1;
+   if (!(opt->key_slots = (uint32_t*)calloc(cap, sizeof(uint32_t))))
+      return false;
+   opt->key_mask = cap - 1;
+   for (i = 0; i < opt->size; i++)
+   {
+      const struct core_option *option = &opt->opts[i];
+      size_t at = option->key_hash & opt->key_mask;
+      if (!option->key)
+         continue;
+      for (;;)
+      {
+         uint32_t slot = opt->key_slots[at];
+         if (!slot)
+         {
+            opt->key_slots[at] = (uint32_t)(i + 1);
+            break;
+         }
+         if (     opt->opts[slot - 1].key_hash == option->key_hash
+               && string_is_equal(opt->opts[slot - 1].key, option->key))
+            break;
+         at = (at + 1) & opt->key_mask;
+      }
+   }
+   return true;
+}
+
+/* The index of the option of @key, or -1 */
+static INLINE size_t core_option_manager_find(
+      const core_option_manager_t *opt, const char *key)
+{
+   uint32_t hash = core_option_manager_hash_string(key);
+   size_t   at;
+   if (!opt->key_slots)
+   {
+      for (at = 0; at < opt->size; at++)
+         if (     opt->opts[at].key_hash == hash
+               && string_is_equal(key, opt->opts[at].key))
+            return at;
+      return (size_t)-1;
+   }
+   for (at = hash & opt->key_mask; ; at = (at + 1) & opt->key_mask)
+   {
+      uint32_t slot = opt->key_slots[at];
+      if (!slot)
+         return (size_t)-1;
+      if (     opt->opts[slot - 1].key_hash == hash
+            && string_is_equal(key, opt->opts[slot - 1].key))
+         return slot - 1;
+   }
+}
+
 /* Sanitises a core option value label, handling the case
  * where an explicit label is not provided and performing
  * conversion of various true/false identifiers to
@@ -606,18 +662,16 @@ static const char *core_option_manager_parse_value_label(
       const char *value, const char *value_label)
 {
    /* 'value_label' may be NULL */
-   const char *label = string_is_empty(value_label) ?
-         value : value_label;
-
-   if (string_is_empty(label))
+   const char *label = (value_label && *value_label)
+         ? value_label : value;
+   if (!label || !*label)
       return NULL;
-
    /* Any label starting with a digit (or +/-)
     * cannot be a boolean string, and requires
     * no further processing */
-   if (ISDIGIT((unsigned char)*label) ||
-       (*label == '+') ||
-       (*label == '-'))
+   if (     ISDIGIT((unsigned char)*label)
+         || (*label == '+')
+         || (*label == '-'))
       return label;
 
    /* Core devs have a habit of using arbitrary
@@ -633,39 +687,71 @@ static const char *core_option_manager_parse_value_label(
     *   strings. This function is not performance
     *   critical, so these extra comparisons do
     *   no harm */
-   if (string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_ENABLED)) ||
-       string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_ENABLED)) ||
-       string_is_equal_noncase(label, "enable") ||
-       string_is_equal_noncase(label, "on") ||
-       string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_ON)) ||
-       string_is_equal_noncase(label, "true") ||
-       string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_TRUE)))
+   if (     string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_ENABLED))
+         || string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_ENABLED))
+         || string_is_equal_noncase(label, "enable")
+         || string_is_equal_noncase(label, "on")
+         || string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_ON))
+         || string_is_equal_noncase(label, "true")
+         || string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_TRUE)))
       label = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_ON);
-   else if (string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_DISABLED)) ||
-            string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DISABLED)) ||
-            string_is_equal_noncase(label, "disable") ||
-            string_is_equal_noncase(label, "off") ||
-            string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_OFF)) ||
-            string_is_equal_noncase(label, "false") ||
-            string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_FALSE)))
+   else if (string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_DISABLED))
+         || string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DISABLED))
+         || string_is_equal_noncase(label, "disable")
+         || string_is_equal_noncase(label, "off")
+         || string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_OFF))
+         || string_is_equal_noncase(label, "false")
+         || string_is_equal_noncase(label, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_FALSE)))
       label = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_OFF);
 
    return label;
 }
 
+/* Returns the start of the value list of a legacy
+ * core options variable ("<desc>; <val>|<val>|..."),
+ * or NULL if it has none */
+static const char *core_option_manager_var_values(
+      const char *value, size_t *desc_len)
+{
+   const char *p;
+   if (!value)
+      return NULL;
+   for (p = value; *p; p++)
+   {
+      if (p[0] == ';' && p[1] == ' ')
+      {
+         *desc_len = (size_t)(p - value);
+         return p + 2;
+      }
+   }
+   return NULL;
+}
+
+/* Upper bound on the number of values string_split()
+ * extracts from a legacy value list */
+static size_t core_option_manager_var_num_values(const char *val_start)
+{
+   size_t n = 1;
+   for (; *val_start; val_start++)
+      if (*val_start == '|')
+         n++;
+   return n;
+}
+
 /* Parses a single legacy core options interface
  * variable, extracting all present core_option
- * information */
+ * information. @val_hashes has room for every value
+ * the variable defines. */
 static bool core_option_manager_parse_variable(
       core_option_manager_t *opt, size_t idx,
       const struct retro_variable *var,
-      config_file_t *config_src)
+      config_file_t *config_src,
+      uint32_t *val_hashes)
 {
    size_t i;
    union string_list_elem_attr attr;
+   size_t desc_len            = 0;
    const char *val_start      = NULL;
-   char *value                = NULL;
-   char *desc_end             = NULL;
    struct core_option *option = (struct core_option*)&opt->opts[idx];
    struct config_entry_list
          *entry               = NULL;
@@ -677,40 +763,37 @@ static bool core_option_manager_parse_variable(
    /* All options are visible by default */
    option->visible            = true;
 
-   if (!string_is_empty(var->key))
+   if (var->key && *var->key)
    {
       option->key             = strdup(var->key);
       option->key_hash        = core_option_manager_hash_string(var->key);
    }
 
-   if (!string_is_empty(var->value))
-      value                   = strdup(var->value);
+   if (!(val_start = core_option_manager_var_values(var->value, &desc_len)))
+      return false;
 
-   if (!string_is_empty(value))
-      desc_end                = strstr(value, "; ");
+   if (desc_len > 0)
+   {
+      if (!(option->desc = (char*)malloc(desc_len + 1)))
+         return false;
+      memcpy(option->desc, var->value, desc_len);
+      option->desc[desc_len] = '\0';
+   }
 
-   if (!desc_end)
-      goto error;
-
-   *desc_end    = '\0';
-
-   if (!string_is_empty(value))
-      option->desc    = strdup(value);
-
-   val_start          = desc_end + 2;
    option->vals       = string_split(val_start, "|");
 
    if (!option->vals)
-      goto error;
+      return false;
 
    /* Legacy core option interface has no concept
     * of value labels
     * > Use actual values for display purposes */
    attr.i             = 0;
    option->val_labels = string_list_new();
+   option->val_hashes = val_hashes;
 
    if (!option->val_labels)
-      goto error;
+      return false;
 
    /* > Loop over values and:
     *   - Set value hashes
@@ -718,20 +801,18 @@ static bool core_option_manager_parse_variable(
    for (i = 0; i < option->vals->size; i++)
    {
       const char *value       = option->vals->elems[i].data;
-      uint32_t *value_hash    = (uint32_t *)malloc(sizeof(uint32_t));
       const char *value_label = core_option_manager_parse_value_label(
             value, NULL);
 
-      /* Set value hash */
-      *value_hash                     = core_option_manager_hash_string(value);
-      option->vals->elems[i].userdata = (void*)value_hash;
+      val_hashes[i]           = core_option_manager_hash_string(value);
 
       /* Redundant safely check... */
-      if (string_is_empty(value_label))
+      if (!value_label || !*value_label)
          value_label = value;
 
       /* Append value label string */
-      string_list_append(option->val_labels, value_label, attr);
+      if (!string_list_append(option->val_labels, value_label, attr))
+         return false;
    }
 
    /* Legacy core option interface always uses first
@@ -745,17 +826,14 @@ static bool core_option_manager_parse_variable(
       entry              = config_get_entry(opt->conf,  option->key);
 
    /* Set current config value */
-   if (entry && !string_is_empty(entry->value))
+   if (entry && entry->value && *entry->value)
    {
       uint32_t entry_value_hash = core_option_manager_hash_string(entry->value);
 
       for (i = 0; i < option->vals->size; i++)
       {
-         const char *value   = option->vals->elems[i].data;
-         uint32_t value_hash = *((uint32_t*)option->vals->elems[i].userdata);
-
-         if (   (value_hash == entry_value_hash)
-             && string_is_equal(value, entry->value))
+         if (     val_hashes[i] == entry_value_hash
+               && string_is_equal(option->vals->elems[i].data, entry->value))
          {
             option->index = i;
             break;
@@ -769,12 +847,7 @@ static bool core_option_manager_parse_variable(
    option->info_categorized = NULL;
    option->category_key     = NULL;
 
-   free(value);
    return true;
-
-error:
-   free(value);
-   return false;
 }
 
 /**
@@ -799,6 +872,7 @@ core_option_manager_t *core_option_manager_new_vars(
 {
    const struct retro_variable *var = NULL;
    size_t _len                      = 0;
+   size_t num_vals                  = 0;
    config_file_t *config_src        = NULL;
    core_option_manager_t *opt       = NULL;
 
@@ -817,14 +891,18 @@ core_option_manager_t *core_option_manager_new_vars(
    opt->cats_size                   = 0;
    opt->opts                        = NULL;
    opt->size                        = 0;
+   opt->val_hashes                  = NULL;
+   opt->key_slots                   = NULL;
+   opt->key_mask                    = 0;
    opt->option_map                  = nested_list_init();
    opt->updated                     = false;
+   opt->log                         = true;
 
    if (!opt->option_map)
       goto error;
 
    /* Open 'output' config file */
-   if (!string_is_empty(conf_path))
+   if (conf_path && *conf_path)
       if (!(opt->conf = config_file_new_from_path_to_string(conf_path)))
          if (!(opt->conf = config_file_new_alloc()))
             goto error;
@@ -832,27 +910,38 @@ core_option_manager_t *core_option_manager_new_vars(
    strlcpy(opt->conf_path, conf_path, sizeof(opt->conf_path));
 
    /* Load source config file, if required */
-   if (!string_is_empty(src_conf_path))
+   if (src_conf_path && *src_conf_path)
       config_src = config_file_new_from_path_to_string(src_conf_path);
 
-   /* Get number of variables */
+   /* Get number of variables and values */
    for (var = vars; var->key && var->value; var++)
+   {
+      size_t desc_len       = 0;
+      const char *val_start = core_option_manager_var_values(
+            var->value, &desc_len);
+      if (val_start)
+         num_vals          += core_option_manager_var_num_values(val_start);
       _len++;
+   }
 
-   if (_len == 0)
+   if (_len == 0 || num_vals == 0)
       goto error;
 
-   /* Create options array */
+   /* Create options array and value hash pool */
    if (!(opt->opts = (struct core_option*)calloc(_len, sizeof(*opt->opts))))
+      goto error;
+   if (!(opt->val_hashes = (uint32_t*)malloc(num_vals * sizeof(uint32_t))))
       goto error;
 
    opt->size = _len;
    _len      = 0;
+   num_vals  = 0;
 
    /* Parse each variable */
    for (var = vars; var->key && var->value; _len++, var++)
    {
-      if (core_option_manager_parse_variable(opt, _len, var, config_src))
+      if (core_option_manager_parse_variable(opt, _len, var, config_src,
+               opt->val_hashes + num_vals))
       {
          size_t __len = 0;
          /* If variable is read correctly, add it to
@@ -874,10 +963,14 @@ core_option_manager_t *core_option_manager_new_vars(
          if (!nested_list_add_item(opt->option_map,
                address, NULL, (const void*)&opt->opts[_len]))
             goto error;
+         num_vals += opt->opts[_len].vals->size;
       }
       else
          goto error;
    }
+
+   if (!core_option_manager_index_keys(opt))
+      goto error;
 
    if (config_src)
       config_file_free(config_src);
@@ -891,18 +984,31 @@ error:
    return NULL;
 }
 
+/* Number of values a v2 option definition lists */
+static size_t core_option_manager_def_num_values(
+      const struct retro_core_option_value *values)
+{
+   size_t n = 0;
+   while (     n < RETRO_NUM_CORE_OPTION_VALUES_MAX
+         && values[n].value && *values[n].value)
+      n++;
+   return n;
+}
+
 /* Parses a single v2 core options interface
  * option, extracting all present core_option
- * information */
+ * information. @val_hashes has room for every value
+ * the option defines. */
 static bool core_option_manager_parse_option(
       core_option_manager_t *opt, size_t idx,
       const struct retro_core_option_v2_definition *option_def,
-      config_file_t *config_src)
+      config_file_t *config_src,
+      uint32_t *val_hashes)
 {
    size_t i;
    union string_list_elem_attr attr;
    struct config_entry_list
-      *entry                  = NULL;
+         *entry               = NULL;
    size_t num_vals            = 0;
    struct core_option *option = (struct core_option*)&opt->opts[idx];
    const char *key            = option_def->key;
@@ -917,10 +1023,10 @@ static bool core_option_manager_parse_option(
    /* All options are visible by default */
    option->visible            = true;
 
-   if (!string_is_empty(option_def->desc))
+   if (option_def->desc && *option_def->desc)
       option->desc            = strdup(option_def->desc);
 
-   if (!string_is_empty(option_def->info))
+   if (option_def->info && *option_def->info)
       option->info            = strdup(option_def->info);
 
    /* Set category-related parameters
@@ -928,25 +1034,25 @@ static bool core_option_manager_parse_option(
     *   match an entry in the categories array
     * > Category key cannot contain a map delimiter
     *   character */
-   if (    opt->cats
-       && !string_is_empty(category_key)
-       && !strstr(category_key, ":"))
+   if (     opt->cats
+         && (category_key && *category_key)
+         && !strchr(category_key, ':'))
    {
       for (i = 0; i < opt->cats_size; i++)
       {
          const char *search_key = opt->cats[i].key;
 
-         if (string_is_empty(search_key))
+         if (!search_key || !*search_key)
             break;
 
          if (string_is_equal(search_key, category_key))
          {
             option->category_key        = strdup(category_key);
 
-            if (!string_is_empty(option_def->desc_categorized))
+            if (option_def->desc_categorized && *option_def->desc_categorized)
                option->desc_categorized = strdup(option_def->desc_categorized);
 
-            if (!string_is_empty(option_def->info_categorized))
+            if (option_def->info_categorized && *option_def->info_categorized)
                option->info_categorized = strdup(option_def->info_categorized);
 
             break;
@@ -956,33 +1062,26 @@ static bool core_option_manager_parse_option(
 
    /* Have to set key *after* checking for option
     * categories */
-   if (!string_is_empty(option_def->key))
+   if (option_def->key && *option_def->key)
    {
       /* If option has a category, option key
        * cannot contain a map delimiter character */
-      if (  !string_is_empty(option->category_key)
-          && strstr(key, ":"))
+      if (     (option->category_key && *option->category_key)
+            && strchr(key, ':'))
          return false;
 
       option->key      = strdup(key);
       option->key_hash = core_option_manager_hash_string(key);
    }
 
-   /* Get number of values */
-   for (;;)
-   {
-      if (string_is_empty(values[num_vals].value))
-         break;
-      num_vals++;
-   }
-
-   if (num_vals < 1)
+   if ((num_vals = core_option_manager_def_num_values(values)) < 1)
       return false;
 
    /* Initialise string lists */
    attr.i             = 0;
    option->vals       = string_list_new();
    option->val_labels = string_list_new();
+   option->val_hashes = val_hashes;
 
    if (!option->vals || !option->val_labels)
       return false;
@@ -995,30 +1094,30 @@ static bool core_option_manager_parse_option(
    for (i = 0; i < num_vals; i++)
    {
       const char *value       = values[i].value;
-      uint32_t *value_hash    = (uint32_t *)malloc(sizeof(uint32_t));
       const char *value_label = values[i].label;
 
       /* Append value string
        * > We know that 'value' is always valid */
-      string_list_append(option->vals, value, attr);
+      if (!string_list_append(option->vals, value, attr))
+         return false;
 
       /* > Set value hash */
-      *value_hash = core_option_manager_hash_string(value);
-      option->vals->elems[option->vals->size - 1].userdata = (void*)value_hash;
+      val_hashes[i] = core_option_manager_hash_string(value);
 
       /* Value label requires additional processing */
       value_label = core_option_manager_parse_value_label(
             value, value_label);
 
       /* > Redundant safely check... */
-      if (string_is_empty(value_label))
+      if (!value_label || !*value_label)
          value_label = value;
 
       /* Append value label string */
-      string_list_append(option->val_labels, value_label, attr);
+      if (!string_list_append(option->val_labels, value_label, attr))
+         return false;
 
       /* Check whether this value is the default setting */
-      if (!string_is_empty(option_def->default_value))
+      if (option_def->default_value && *option_def->default_value)
       {
          if (string_is_equal(option_def->default_value, value))
          {
@@ -1034,17 +1133,14 @@ static bool core_option_manager_parse_option(
       entry              = config_get_entry(opt->conf,  option->key);
 
    /* Set current config value */
-   if (entry && !string_is_empty(entry->value))
+   if (entry && entry->value && *entry->value)
    {
       uint32_t entry_value_hash = core_option_manager_hash_string(entry->value);
 
       for (i = 0; i < option->vals->size; i++)
       {
-         const char *value   = option->vals->elems[i].data;
-         uint32_t value_hash = *((uint32_t*)option->vals->elems[i].userdata);
-
-         if ((value_hash == entry_value_hash) &&
-             string_is_equal(value, entry->value))
+         if (     val_hashes[i] == entry_value_hash
+               && string_is_equal(option->vals->elems[i].data, entry->value))
          {
             option->index = i;
             break;
@@ -1086,11 +1182,12 @@ core_option_manager_t *core_option_manager_new(
    struct retro_core_option_v2_definition *option_defs      = NULL;
    size_t cats_size                                         = 0;
    size_t _len                                              = 0;
+   size_t num_vals                                          = 0;
    config_file_t *config_src                                = NULL;
    core_option_manager_t *opt                               = NULL;
 
-   if (   !options_v2
-       || !options_v2->definitions)
+   if (     !options_v2
+         || !options_v2->definitions)
       return NULL;
 
    option_cats = options_v2->categories;
@@ -1105,14 +1202,18 @@ core_option_manager_t *core_option_manager_new(
    opt->cats_size                    = 0;
    opt->opts                         = NULL;
    opt->size                         = 0;
+   opt->val_hashes                   = NULL;
+   opt->key_slots                    = NULL;
+   opt->key_mask                     = 0;
    opt->option_map                   = nested_list_init();
    opt->updated                      = false;
+   opt->log                          = true;
 
    if (!opt->option_map)
       goto error;
 
    /* Open 'output' config file */
-   if (!string_is_empty(conf_path))
+   if (conf_path && *conf_path)
       if (!(opt->conf = config_file_new_from_path_to_string(conf_path)))
          if (!(opt->conf = config_file_new_alloc()))
             goto error;
@@ -1120,34 +1221,37 @@ core_option_manager_t *core_option_manager_new(
    strlcpy(opt->conf_path, conf_path, sizeof(opt->conf_path));
 
    /* Load source config file, if required */
-   if (!string_is_empty(src_conf_path))
+   if (src_conf_path && *src_conf_path)
       config_src = config_file_new_from_path_to_string(src_conf_path);
 
    /* Get number of categories, if required
     * > Note: 'option_cat->info == NULL' is valid */
    if (categorized && option_cats)
    {
-      for (option_cat = option_cats;
-           !string_is_empty(option_cat->key) &&
-                  !string_is_empty(option_cat->desc);
-           option_cat++)
+      for ( option_cat = option_cats;
+               (option_cat->key && *option_cat->key)
+            && (option_cat->desc && *option_cat->desc);
+            option_cat++)
          cats_size++;
    }
 
    /* Get number of options
     * > Note: 'option_def->info == NULL' is valid */
-   for (option_def = option_defs;
-        option_def->key && option_def->desc && option_def->values[0].value;
-        option_def++)
+   for ( option_def = option_defs;
+         option_def->key && option_def->desc && option_def->values[0].value;
+         option_def++)
+   {
+      num_vals += core_option_manager_def_num_values(option_def->values);
       _len++;
+   }
 
-   if (_len == 0)
+   if (_len == 0 || num_vals == 0)
       goto error;
 
    /* Create categories array */
    if (cats_size > 0)
    {
-      if (!(opt->cats = (struct core_category*)calloc(_len,
+      if (!(opt->cats = (struct core_category*)calloc(cats_size,
                   sizeof(*opt->cats))))
          goto error;
 
@@ -1156,69 +1260,73 @@ core_option_manager_t *core_option_manager_new(
 
       /* Parse each category
        * > Note: 'option_cat->info == NULL' is valid */
-      for (option_cat = option_cats;
-           !string_is_empty(option_cat->key) &&
-                  !string_is_empty(option_cat->desc);
-           cats_size++, option_cat++)
+      for ( option_cat = option_cats;
+               (option_cat->key  && *option_cat->key)
+            && (option_cat->desc && *option_cat->desc);
+            cats_size++, option_cat++)
       {
          opt->cats[cats_size].key      = strdup(option_cat->key);
          opt->cats[cats_size].key_hash = core_option_manager_hash_string(option_cat->key);
          opt->cats[cats_size].desc     = strdup(option_cat->desc);
 
-         if (!string_is_empty(option_cat->info))
+         if (option_cat->info && *option_cat->info)
             opt->cats[cats_size].info  = strdup(option_cat->info);
       }
    }
 
-   /* Create options array */
+   /* Create options array and value hash pool */
    if (!(opt->opts = (struct core_option*)calloc(_len, sizeof(*opt->opts))))
+      goto error;
+   if (!(opt->val_hashes = (uint32_t*)malloc(num_vals * sizeof(uint32_t))))
       goto error;
 
    opt->size = _len;
    _len      = 0;
+   num_vals  = 0;
 
    /* Parse each option
     * > Note: 'option_def->info == NULL' is valid */
-   for (option_def = option_defs;
-        option_def->key && option_def->desc && option_def->values[0].value;
-        _len++, option_def++)
+   for ( option_def = option_defs;
+         option_def->key && option_def->desc && option_def->values[0].value;
+         _len++, option_def++)
    {
-      if (core_option_manager_parse_option(opt, _len, option_def, config_src))
+      if (core_option_manager_parse_option(opt, _len, option_def, config_src,
+               opt->val_hashes + num_vals))
       {
          /* If option is read correctly, add it to
           * the map */
          const char *category_key = opt->opts[_len].category_key;
          char address[256];
+         size_t __len = 0;
 
          /* Address string is nominally:
           *    <category_key><delim><tag><option_key>
           * ...where <tag> is prepended to the option
           * key in order to avoid category/option key
           * collisions */
-         if (string_is_empty(category_key))
-         {
-            size_t __len     = 0;
+         if (!category_key || !*category_key)
             address[  __len] = '#';
-            address[++__len] = '\0';
-            strlcpy(address + __len, option_def->key, sizeof(address) - __len);
-         }
          else
          {
-            size_t __len      = strlcpy(address, category_key, sizeof(address) - 3);
+            __len = strlcpy(address, category_key, sizeof(address) - 3);
             address[  __len]  = ':';
             address[++__len]  = '#';
-            address[++__len]  = '\0';
-            strlcpy(address + __len, option_def->key, sizeof(address) - __len);
          }
+         address[++__len]  = '\0';
+         strlcpy(address + __len, option_def->key, sizeof(address) - __len);
 
          if (!nested_list_add_item(opt->option_map,
                address, ":",
                (const void*)&opt->opts[_len]))
             goto error;
+         num_vals += opt->opts[_len].vals->size;
       }
       else
          goto error;
    }
+
+   if (!core_option_manager_index_keys(opt))
+      goto error;
 
    if (config_src)
       config_file_free(config_src);
@@ -1262,31 +1370,35 @@ void core_option_manager_free(core_option_manager_t *opt)
 
    for (i = 0; i < opt->size; i++)
    {
-      if (opt->opts[i].desc)
-         free(opt->opts[i].desc);
-      if (opt->opts[i].desc_categorized)
-         free(opt->opts[i].desc_categorized);
-      if (opt->opts[i].info)
-         free(opt->opts[i].info);
-      if (opt->opts[i].info_categorized)
-         free(opt->opts[i].info_categorized);
-      if (opt->opts[i].key)
-         free(opt->opts[i].key);
-      if (opt->opts[i].category_key)
-         free(opt->opts[i].category_key);
+      struct core_option *option = (struct core_option*)&opt->opts[i];
+      if (option)
+      {
+         if (option->desc)
+            free(option->desc);
+         if (option->desc_categorized)
+            free(option->desc_categorized);
+         if (option->info)
+            free(option->info);
+         if (option->info_categorized)
+            free(option->info_categorized);
+         if (option->key)
+            free(option->key);
+         if (option->category_key)
+            free(option->category_key);
 
-      if (opt->opts[i].vals)
-         string_list_free(opt->opts[i].vals);
-      if (opt->opts[i].val_labels)
-         string_list_free(opt->opts[i].val_labels);
+         if (option->vals)
+            string_list_free(option->vals);
+         if (option->val_labels)
+            string_list_free(option->val_labels);
 
-      opt->opts[i].desc             = NULL;
-      opt->opts[i].desc_categorized = NULL;
-      opt->opts[i].info             = NULL;
-      opt->opts[i].info_categorized = NULL;
-      opt->opts[i].key              = NULL;
-      opt->opts[i].category_key     = NULL;
-      opt->opts[i].vals             = NULL;
+         option->desc             = NULL;
+         option->desc_categorized = NULL;
+         option->info             = NULL;
+         option->info_categorized = NULL;
+         option->key              = NULL;
+         option->category_key     = NULL;
+         option->vals             = NULL;
+      }
    }
 
    if (opt->option_map)
@@ -1297,6 +1409,8 @@ void core_option_manager_free(core_option_manager_t *opt)
 
    free(opt->cats);
    free(opt->opts);
+   free(opt->val_hashes);
+   free(opt->key_slots);
    free(opt);
 }
 
@@ -1318,14 +1432,13 @@ void core_option_manager_free(core_option_manager_t *opt)
  * specified option category if successful,
  * otherwise NULL.
  **/
-const char *core_option_manager_get_category_desc(core_option_manager_t *opt,
-      const char *key)
+const char *core_option_manager_get_category_desc(
+      core_option_manager_t *opt, const char *key)
 {
-   uint32_t key_hash;
    size_t i;
+   uint32_t key_hash;
 
-   if (  !opt
-       || string_is_empty(key))
+   if (!opt || (!key || !*key))
       return NULL;
 
    key_hash = core_option_manager_hash_string(key);
@@ -1334,9 +1447,9 @@ const char *core_option_manager_get_category_desc(core_option_manager_t *opt,
    {
       struct core_category *category = &opt->cats[i];
 
-      if (   (key_hash == category->key_hash)
-          && !string_is_empty(category->key)
-          &&  string_is_equal(key, category->key))
+      if (     (key_hash == category->key_hash)
+            && (category->key && *category->key)
+            && string_is_equal(key, category->key))
          return category->desc;
    }
 
@@ -1360,11 +1473,10 @@ const char *core_option_manager_get_category_desc(core_option_manager_t *opt,
 const char *core_option_manager_get_category_info(core_option_manager_t *opt,
       const char *key)
 {
-   uint32_t key_hash;
    size_t i;
+   uint32_t key_hash;
 
-   if (!opt ||
-       string_is_empty(key))
+   if (!opt || (!key || !*key))
       return NULL;
 
    key_hash = core_option_manager_hash_string(key);
@@ -1373,9 +1485,9 @@ const char *core_option_manager_get_category_info(core_option_manager_t *opt,
    {
       struct core_category *category = &opt->cats[i];
 
-      if (   (key_hash == category->key_hash)
-          && !string_is_empty(category->key)
-          &&  string_is_equal(key, category->key))
+      if (     (key_hash == category->key_hash)
+            && (category->key && *category->key)
+            && string_is_equal(key, category->key))
          return category->info;
    }
 
@@ -1404,8 +1516,7 @@ bool core_option_manager_get_category_visible(core_option_manager_t *opt,
    nested_list_item_t *category_item = NULL;
    nested_list_t *option_list        = NULL;
 
-   if (  !opt
-       || string_is_empty(key))
+   if (!opt || (!key || !*key))
       return false;
 
    /* Fetch category item from map */
@@ -1453,30 +1564,12 @@ bool core_option_manager_get_category_visible(core_option_manager_t *opt,
 bool core_option_manager_get_idx(core_option_manager_t *opt,
       const char *key, size_t *idx)
 {
-   uint32_t key_hash;
    size_t i;
-
-   if (  !opt
-       || string_is_empty(key)
-       || !idx)
+   if (!opt || (!key || !*key) || !idx
+         || (i = core_option_manager_find(opt, key)) == (size_t)-1)
       return false;
-
-   key_hash = core_option_manager_hash_string(key);
-
-   for (i = 0; i < opt->size; i++)
-   {
-      struct core_option *option = &opt->opts[i];
-
-      if (   (key_hash == option->key_hash)
-          && !string_is_empty(option->key)
-          &&  string_is_equal(key, option->key))
-      {
-         *idx = i;
-         return true;
-      }
-   }
-
-   return false;
+   *idx = i;
+   return true;
 }
 
 /**
@@ -1504,10 +1597,10 @@ bool core_option_manager_get_val_idx(core_option_manager_t *opt,
    uint32_t val_hash;
    size_t i;
 
-   if (   !opt
-       || (idx >= opt->size)
-       || string_is_empty(val)
-       || !val_idx)
+   if (     !opt
+         || (idx >= opt->size)
+         || (!val || !*val)
+         || !val_idx)
       return false;
 
    val_hash = core_option_manager_hash_string(val);
@@ -1516,11 +1609,10 @@ bool core_option_manager_get_val_idx(core_option_manager_t *opt,
    for (i = 0; i < option->vals->size; i++)
    {
       const char *option_val   = option->vals->elems[i].data;
-      uint32_t option_val_hash = *((uint32_t*)option->vals->elems[i].userdata);
 
-      if ((val_hash == option_val_hash) &&
-          !string_is_empty(option_val) &&
-          string_is_equal(val, option_val))
+      if (     (val_hash == option->val_hashes[i])
+            && (option_val && *option_val)
+            && string_is_equal(val, option_val))
       {
          *val_idx = i;
          return true;
@@ -1553,8 +1645,8 @@ const char *core_option_manager_get_desc(core_option_manager_t *opt,
 {
    const char *desc = NULL;
 
-   if (   !opt
-       || (idx >= opt->size))
+   if (     !opt
+         || (idx >= opt->size))
       return NULL;
    /* Try categorised description first,
     * if requested */
@@ -1562,7 +1654,7 @@ const char *core_option_manager_get_desc(core_option_manager_t *opt,
       desc = opt->opts[idx].desc_categorized;
    /* Fall back to legacy description, if
     * required */
-   if (string_is_empty(desc))
+   if (!desc || !*desc)
       return opt->opts[idx].desc;
    return desc;
 }
@@ -1590,8 +1682,8 @@ const char *core_option_manager_get_info(core_option_manager_t *opt,
 {
    const char *info = NULL;
 
-   if (   !opt
-       || (idx >= opt->size))
+   if (     !opt
+         || (idx >= opt->size))
       return NULL;
 
    /* Try categorised information first,
@@ -1600,7 +1692,7 @@ const char *core_option_manager_get_info(core_option_manager_t *opt,
       info = opt->opts[idx].info_categorized;
    /* Fall back to legacy information, if
     * required */
-   if (string_is_empty(info))
+   if (!info || !*info)
       return opt->opts[idx].info;
    return info;
 }
@@ -1622,8 +1714,8 @@ const char *core_option_manager_get_val(core_option_manager_t *opt,
 {
    struct core_option *option = NULL;
 
-   if (   !opt
-       || (idx >= opt->size))
+   if (     !opt
+         || (idx >= opt->size))
       return NULL;
 
    option = (struct core_option*)&opt->opts[idx];
@@ -1649,8 +1741,8 @@ const char *core_option_manager_get_val_label(core_option_manager_t *opt,
 {
    struct core_option *option = NULL;
 
-   if (   !opt
-       || (idx >= opt->size))
+   if (     !opt
+         || (idx >= opt->size))
       return NULL;
 
    option = (struct core_option*)&opt->opts[idx];
@@ -1673,8 +1765,8 @@ const char *core_option_manager_get_val_label(core_option_manager_t *opt,
 bool core_option_manager_get_visible(core_option_manager_t *opt,
       size_t idx)
 {
-   if (    !opt
-       || (idx >= opt->size))
+   if (     !opt
+         || (idx >= opt->size))
       return false;
 
    return opt->opts[idx].visible;
@@ -1707,14 +1799,23 @@ void core_option_manager_set_val(core_option_manager_t *opt,
       size_t idx, size_t val_idx, bool refresh_menu)
 {
    struct core_option *option = NULL;
+   size_t cur_idx = 0;
 
-   if (!opt ||
-       (idx >= opt->size))
+   if (     !opt
+         || (idx >= opt->size))
       return;
 
    option        = (struct core_option*)&opt->opts[idx];
+   cur_idx       = option->index;
    option->index = val_idx % option->vals->size;
    opt->updated  = true;
+   opt->log      = false;
+
+   /* Log changes only */
+   if (cur_idx != opt->opts[idx].index)
+      RARCH_DBG("[Core] Set option: %s = \"%s\"\n",
+            opt->opts[idx].key,
+            option->vals->elems[option->index].data);
 
 #ifdef HAVE_CHEEVOS
    rcheevos_validate_config_settings();
@@ -1758,15 +1859,24 @@ void core_option_manager_set_val(core_option_manager_t *opt,
 void core_option_manager_adjust_val(core_option_manager_t* opt,
       size_t idx, int adjustment, bool refresh_menu)
 {
-   struct core_option* option = NULL;
+   struct core_option *option = NULL;
+   size_t cur_idx = 0;
 
-   if (   !opt
-       || (idx >= opt->size))
+   if (     !opt
+         || (idx >= opt->size))
       return;
 
    option        = (struct core_option*)&opt->opts[idx];
+   cur_idx       = option->index;
    option->index = (option->index + option->vals->size + adjustment) % option->vals->size;
    opt->updated  = true;
+   opt->log      = false;
+
+   /* Log changes only */
+   if (cur_idx != opt->opts[idx].index)
+      RARCH_DBG("[Core] Set option: %s = \"%s\"\n",
+            opt->opts[idx].key,
+            option->vals->elems[option->index].data);
 
 #ifdef HAVE_CHEEVOS
    rcheevos_validate_config_settings();
@@ -1807,12 +1917,24 @@ void core_option_manager_adjust_val(core_option_manager_t* opt,
 void core_option_manager_set_default(core_option_manager_t *opt,
       size_t idx, bool refresh_menu)
 {
-   if (   !opt
-       || (idx >= opt->size))
+   struct core_option *option = NULL;
+   size_t cur_idx = 0;
+
+   if (     !opt
+         || (idx >= opt->size))
       return;
 
-   opt->opts[idx].index = opt->opts[idx].default_index;
-   opt->updated         = true;
+   option        = (struct core_option*)&opt->opts[idx];
+   cur_idx       = option->index;
+   option->index = option->default_index;
+   opt->updated  = true;
+   opt->log      = false;
+
+   /* Log changes only */
+   if (cur_idx != option->index)
+      RARCH_DBG("[Core] Reset option: %s = \"%s\"\n",
+            opt->opts[idx].key,
+            option->vals->elems[option->index].data);
 
 #ifdef HAVE_CHEEVOS
    rcheevos_validate_config_settings();
@@ -1833,7 +1955,7 @@ void core_option_manager_set_default(core_option_manager_t *opt,
 }
 
 /**
- * core_option_manager_set_visible:
+ * core_option_manager_set_display:
  *
  * @opt     : options manager handle
  * @key     : core option key string (variable to query
@@ -1844,29 +1966,20 @@ void core_option_manager_set_default(core_option_manager_t *opt,
  * Sets the in-menu visibility of the core option
  * identified by the specified @key.
  **/
-void core_option_manager_set_visible(core_option_manager_t *opt,
+void core_option_manager_set_display(core_option_manager_t *opt,
       const char *key, bool visible)
 {
-   uint32_t key_hash;
+   struct core_option *option;
    size_t i;
-
-   if (!opt || string_is_empty(key))
+   if (!opt || (!key || !*key)
+         || (i = core_option_manager_find(opt, key)) == (size_t)-1)
       return;
-
-   key_hash = core_option_manager_hash_string(key);
-
-   for (i = 0; i < opt->size; i++)
-   {
-      struct core_option *option = &opt->opts[i];
-
-      if ((key_hash == option->key_hash) &&
-          !string_is_empty(option->key) &&
-          string_is_equal(key, option->key))
-      {
-         option->visible = visible;
-         return;
-      }
-   }
+   option = &opt->opts[i];
+   if (option->visible != visible && !opt->log)
+      RARCH_DBG("[Core] Set display: %s = %s\n",
+            option->key,
+            visible ? "visible" : "hidden");
+   option->visible = visible;
 }
 
 /**********************/

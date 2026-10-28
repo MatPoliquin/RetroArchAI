@@ -1,0 +1,481 @@
+/**
+ *  RetroArch - A frontend for libretro.
+ *
+ *  RetroArch is free software: you can redistribute it and/or modify it under
+ *  the terms of the GNU General Public License as published by the Free
+ *  Software Foundation, either version 3 of the License, or (at your option)
+ *  any later version.
+ *
+ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT
+ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ *  more details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with RetroArch. If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#ifdef HAVE_STATESTREAM
+#include "uint32s_index.h"
+#include <string.h>
+#include <array/rhmap.h>
+#include <array/rbuf.h>
+#include <retro_common_api.h>
+#include "../../verbosity.h"
+
+#include <encodings/xxh3.h>
+
+#define HASHMAP_CAP 65536
+/* A test build can define its own hash to force collisions. */
+#ifndef uint32s_hash_bytes
+#define uint32s_hash_bytes(bytes, len) ((uint32_t)xxh3_64(bytes, len, 0))
+#endif
+
+/* Room for one more object in every per-object list, so the pushes
+ * that record it cannot fail half way. */
+static bool uint32s_index_reserve(uint32s_index_t *index)
+{
+   return RBUF_TRYFIT(index->objects,   RBUF_LEN(index->objects)   + 1)
+       && RBUF_TRYFIT(index->counts,    RBUF_LEN(index->counts)    + 1)
+       && RBUF_TRYFIT(index->hashes,    RBUF_LEN(index->hashes)    + 1)
+       && RBUF_TRYFIT(index->additions, RBUF_LEN(index->additions) + 1);
+}
+
+uint32s_index_t *uint32s_index_new(size_t object_size,
+      uint8_t commit_interval, uint8_t commit_threshold)
+{
+   uint32_t *zeros         = (uint32_t*)calloc(object_size ? object_size : 1, sizeof(uint32_t));
+   uint32s_index_t *index  = (uint32s_index_t *)malloc(sizeof(uint32s_index_t));
+   if (!zeros || !index)
+   {
+      free(zeros);
+      free(index);
+      return NULL;
+   }
+   index->object_size      = object_size;
+   index->index            = NULL;
+   RHMAP_FIT(index->index, HASHMAP_CAP);
+   index->objects          = NULL;
+   index->counts           = NULL;
+   index->hashes           = NULL;
+   index->additions        = NULL;
+   index->commit_interval  = commit_interval;
+   index->commit_threshold = commit_threshold;
+   /* transfers ownership of zero buffer */
+   if (!index->index || !uint32s_index_insert_exact(index, 0, zeros, 0))
+   {
+      free(zeros);
+      uint32s_index_free(index);
+      return NULL;
+   }
+   RBUF_CLEAR(index->additions); /* scrap first addition, we never want to delete 0s during rewind */
+   return index;
+}
+
+void uint32s_bucket_free(struct uint32s_bucket *bucket)
+{
+   if (bucket->len > 3)
+   {
+      free(bucket->contents.vec.idxs);
+      bucket->contents.vec.idxs = NULL;
+      bucket->contents.vec.cap  = 0;
+   }
+   /* RHMAP_CLEAR leaves value-array entries untouched; subsequent
+    * RHMAP_PTR (which auto-creates) on the cleared slot would re-read
+    * the stale len/vec.idxs and double-free.  Reset len to 0 so the
+    * bucket is unambiguously inline-empty after free. */
+   bucket->len = 0;
+}
+
+bool uint32s_bucket_get(uint32s_index_t *index, struct uint32s_bucket *bucket, uint32_t *object, size_t size_bytes, uint32_t *out_idx)
+{
+   uint32_t i;
+   uint32_t *coll = bucket->len < 4 ? bucket->contents.idxs : bucket->contents.vec.idxs;
+   for (i = 0; i < bucket->len; i++)
+   {
+      uint32_t idx = coll[i];
+      if (memcmp(index->objects[idx], object, size_bytes) == 0)
+      {
+         *out_idx = idx;
+         return true;
+      }
+   }
+   return false;
+}
+
+/* Adds idx to the bucket; false, with the bucket unchanged, when it
+ * cannot grow. */
+static bool uint32s_bucket_expand(struct uint32s_bucket *bucket, uint32_t idx)
+{
+   if (bucket->len < 3)
+      bucket->contents.idxs[bucket->len] = idx;
+   else if (bucket->len == 3)
+   {
+      uint32_t *idxs = (uint32_t*)calloc(8, sizeof(uint32_t));
+      if (!idxs)
+         return false;
+      memcpy(idxs, bucket->contents.idxs, 3*sizeof(uint32_t));
+      bucket->contents.vec.cap  = 8;
+      bucket->contents.vec.idxs = idxs;
+      bucket->contents.vec.idxs[bucket->len] = idx;
+   }
+   else if (bucket->len < bucket->contents.vec.cap)
+      bucket->contents.vec.idxs[bucket->len] = idx;
+   else /* bucket->len == bucket->contents.vec.cap */
+   {
+      uint32_t  new_cap = bucket->contents.vec.cap * 2;
+      uint32_t *tmp     = (uint32_t*)realloc(bucket->contents.vec.idxs,
+            new_cap * sizeof(uint32_t));
+      if (!tmp)
+         return false;
+      bucket->contents.vec.cap  = new_cap;
+      bucket->contents.vec.idxs = tmp;
+      bucket->contents.vec.idxs[bucket->len] = idx;
+   }
+   bucket->len++;
+   return true;
+}
+
+bool uint32s_bucket_remove(struct uint32s_bucket *bucket, uint32_t idx)
+{
+   int i;
+   bool small     = bucket->len < 4;
+   uint32_t *coll = small ? bucket->contents.idxs : bucket->contents.vec.idxs;
+   if (idx == 0) /* never remove 0s pattern */
+      return false;
+
+   for (i = 0; i < (int)bucket->len; i++)
+   {
+      if (coll[i] == idx)
+      {
+         memmove((uint8_t*)(coll+i), (uint8_t*)(coll+i+1), (bucket->len-(i+1))*sizeof(uint32_t));
+         bucket->len--;
+         if (bucket->len == 3)
+         {
+            memcpy(bucket->contents.idxs, coll, 3*sizeof(uint32_t));
+            free(coll);
+         }
+         return true;
+      }
+   }
+   RARCH_ERR("[STATESTREAM] didn't find index %d during remove\n",idx);
+   return false;
+}
+
+uint32s_insert_result_t uint32s_index_insert(uint32s_index_t *index, uint32_t *object, uint64_t frame)
+{
+   uint32_t idx;
+   uint32_t *copy;
+   struct uint32s_bucket *bucket;
+   uint32s_insert_result_t result;
+   size_t size_bytes      = index->object_size * sizeof(uint32_t);
+   uint32_t hash          = uint32s_hash_bytes((uint8_t *)object, size_bytes);
+   uint32_t additions_len = RBUF_LEN(index->additions);
+   result.index  = 0;
+   result.is_new = false;
+   if (RHMAP_HAS(index->index, hash))
+   {
+      bucket = RHMAP_PTR(index->index, hash);
+      if (uint32s_bucket_get(index, bucket, object, size_bytes, &result.index))
+      {
+         if (index->objects[result.index])
+         {
+            result.is_new = false;
+            index->counts[result.index]++;
+            return result;
+         }
+
+         RARCH_LOG("[STATESTREAM] accessed collected index %u\n", result.index);
+      }
+      idx  = RBUF_LEN(index->objects);
+      if (     !uint32s_index_reserve(index)
+            || !(copy = (uint32_t*)malloc(size_bytes)))
+      {
+         result.index = UINT32S_INDEX_NONE;
+         return result;
+      }
+      memcpy(copy, object, size_bytes);
+      /* The bucket takes the index first, so an object is never stored
+       * where a lookup cannot find it. */
+      if (!uint32s_bucket_expand(bucket, idx))
+      {
+         free(copy);
+         result.index = UINT32S_INDEX_NONE;
+         return result;
+      }
+      RBUF_PUSH(index->objects, copy);
+      RBUF_PUSH(index->counts, 1);
+      RBUF_PUSH(index->hashes, hash);
+      result.index = idx;
+      result.is_new = true;
+   }
+   else
+   {
+      struct uint32s_bucket new_bucket;
+      idx  = RBUF_LEN(index->objects);
+      if (     !uint32s_index_reserve(index)
+            || !(copy = (uint32_t*)malloc(size_bytes)))
+      {
+         result.index = UINT32S_INDEX_NONE;
+         return result;
+      }
+      memcpy(copy, object, size_bytes);
+      RBUF_PUSH(index->objects, copy);
+      RBUF_PUSH(index->counts, 1);
+      RBUF_PUSH(index->hashes, hash);
+      new_bucket.len = 1;
+      new_bucket.contents.idxs[0] = idx;
+      new_bucket.contents.idxs[1] = 0;
+      new_bucket.contents.idxs[2] = 0;
+      RHMAP_SET(index->index, hash, new_bucket);
+      result.index = idx;
+      result.is_new = true;
+   }
+   if (additions_len == 0 || index->additions[additions_len-1].frame_counter < frame)
+   {
+      struct uint32s_frame_addition addition;
+      addition.frame_counter = frame;
+      addition.first_index = result.index;
+      RBUF_PUSH(index->additions, addition);
+   }
+   return result;
+}
+
+bool uint32s_index_insert_exact(uint32s_index_t *index, uint32_t idx, uint32_t *object, uint64_t frame)
+{
+   struct uint32s_bucket *bucket;
+   uint32_t hash;
+   size_t size_bytes;
+   uint32_t additions_len;
+   if (idx != RBUF_LEN(index->objects) || !uint32s_index_reserve(index))
+      return false;
+   size_bytes = index->object_size * sizeof(uint32_t);
+   hash = uint32s_hash_bytes((uint8_t *)object, size_bytes);
+   additions_len = RBUF_LEN(index->additions);
+   if (RHMAP_HAS(index->index, hash))
+   {
+      bucket = RHMAP_PTR(index->index, hash);
+      if (!uint32s_bucket_expand(bucket, idx))
+         return false;
+   }
+   else
+   {
+      struct uint32s_bucket new_bucket;
+      new_bucket.len = 1;
+      new_bucket.contents.idxs[0] = idx;
+      new_bucket.contents.idxs[1] = 0;
+      new_bucket.contents.idxs[2] = 0;
+      RHMAP_SET(index->index, hash, new_bucket);
+   }
+   /* RARCH_LOG("[STATESTREAM] insert index %d\n",idx); */
+   RBUF_PUSH(index->objects, object);
+   RBUF_PUSH(index->counts, 1);
+   RBUF_PUSH(index->hashes, hash);
+   if (   additions_len == 0
+       || index->additions[additions_len-1].frame_counter < frame)
+   {
+      struct uint32s_frame_addition addition;
+      addition.frame_counter = frame;
+      addition.first_index = idx;
+      RBUF_PUSH(index->additions, addition);
+   }
+   return true;
+}
+
+void uint32s_index_commit(uint32s_index_t *index)
+{
+   uint32_t i, interval=index->commit_interval,threshold=index->commit_threshold;
+   struct uint32s_frame_addition prev,cur;
+   uint32_t additions_len = RBUF_LEN(index->additions), limit;
+   /* The interval comes from the replay header.  Below 2 there is no
+    * addition after the one being collected, so cur would be read one
+    * past the end of the log; collect nothing instead. */
+   if (additions_len < interval || interval < 2)
+      return;
+   prev  = index->additions[additions_len-interval];
+   cur   = index->additions[additions_len-(interval-1)];
+   limit = cur.first_index;
+   if (limit > RBUF_LEN(index->objects))
+      limit = (uint32_t)RBUF_LEN(index->objects);
+   for (i = prev.first_index; i < limit; i++)
+   {
+      struct uint32s_bucket *bucket;
+      if (index->counts[i] >= threshold || index->objects[i] == NULL)
+         continue;
+      free(index->objects[i]);
+      index->objects[i] = NULL;
+      /* RHMAP_PTR adds on a miss; see uint32s_index_pop. */
+      if (!RHMAP_HAS(index->index, index->hashes[i]))
+         continue;
+      bucket = RHMAP_PTR(index->index, index->hashes[i]);
+      uint32s_bucket_remove(bucket, i);
+      if (bucket->len == 0)
+      {
+         uint32s_bucket_free(bucket);
+         if (!RHMAP_DEL(index->index, index->hashes[i]))
+            RARCH_ERR("[STATESTREAM] Trying to remove absent hash %x\n",index->hashes[i]);
+      }
+   }
+}
+
+void uint32s_index_bump_count(uint32s_index_t *index, uint32_t which)
+{
+   if (which >= RBUF_LEN(index->counts))
+      return;
+   index->counts[which]++;
+}
+
+uint32_t *uint32s_index_get(uint32s_index_t *index, uint32_t which)
+{
+   if (which >= RBUF_LEN(index->objects))
+      return NULL;
+   if (!index->objects[which])
+   {
+      int i;
+      RARCH_LOG("[STATESTREAM] accessed garbage collected block %u\n", which);
+      for (i = RBUF_LEN(index->additions); i != 0; i--)
+      {
+         if (which >= index->additions[i - 1].first_index)
+         {
+            RARCH_LOG("[STATESTREAM] originally allocated on frame "
+                  STRING_REP_UINT64 "\n", index->additions[i - 1].frame_counter);
+            break;
+         }
+      }
+      return NULL;
+   }
+   return index->objects[which];
+}
+
+void uint32s_index_pop(uint32s_index_t *index)
+{
+   uint32_t idx;
+   uint32_t hash;
+   /* Trust boundary: BSV replay file controls index state.  Bail before
+    * RBUF_LEN(...)-1 underflows to UINT32_MAX (turning the next line
+    * into a wild read of index->hashes[]). */
+   if (RBUF_LEN(index->objects) == 0)
+   {
+      RARCH_ERR("[STATESTREAM] trying to pop from empty index\n");
+      return;
+   }
+   idx  = RBUF_LEN(index->objects) - 1;
+   hash = index->hashes[idx];
+   /* RHMAP_PTR has add-on-miss semantics; gate on RHMAP_HAS so a
+    * corrupted hashes[] entry that points to a no-longer-present hash
+    * can't auto-create a stale-content bucket and fall through into
+    * uint32s_bucket_remove with garbage len.  The counts are still
+    * adjusted below, so uint32s_index_remove_after keeps making
+    * progress. */
+   if (index->objects[idx] != NULL && !RHMAP_HAS(index->index, hash))
+      RARCH_ERR("[STATESTREAM] pop: missing hash %x for idx %u\n",
+            hash, idx);
+   else if (index->objects[idx] != NULL) {
+      struct uint32s_bucket *bucket = RHMAP_PTR(index->index, hash);
+      uint32_t old_len = bucket->len;
+      if (old_len == 0)
+         RARCH_ERR("[STATESTREAM] Trying to remove from empty bucket, this should never happen");
+      if (!uint32s_bucket_remove(bucket, idx))
+         RARCH_WARN("[STATESTREAM] Failed to remove idx from bucket");
+      if (old_len == 1) {
+         uint32s_bucket_free(bucket);
+         if (!RHMAP_DEL(index->index, hash))
+            RARCH_ERR("[STATESTREAM] Trying to remove absent hash %x\n",hash);
+      }
+   }
+   /* else: already garbage collected, just adjust counts */
+   /* The resize below drops the last reference to the object. */
+   free(index->objects[idx]);
+   RBUF_RESIZE(index->objects, idx);
+   RBUF_RESIZE(index->counts, idx);
+   RBUF_RESIZE(index->hashes, idx);
+}
+
+/* goes backwards from end of additions */
+void uint32s_index_remove_after(uint32s_index_t *index, uint64_t frame)
+{
+   int i;
+   for(i = RBUF_LEN(index->additions)-1; i >= 0; i--)
+   {
+      struct uint32s_frame_addition add = index->additions[i];
+      if (add.frame_counter <= frame)
+         break;
+      while(add.first_index < RBUF_LEN(index->objects))
+         uint32s_index_pop(index);
+   }
+   RBUF_RESIZE(index->additions, i+1);
+}
+
+/* removes all data from index */
+void uint32s_index_clear(uint32s_index_t *index)
+{
+   size_t i, cap;
+   uint32_t *zeros = index->objects[0];
+   for(i = 0, cap = RHMAP_CAP(index->index); i != cap; i++)
+      if (RHMAP_KEY(index->index, i))
+         uint32s_bucket_free(&index->index[i]);
+   RHMAP_CLEAR(index->index);
+   /* don't dealloc all-zeros pattern */
+   for(i = 1; i < RBUF_LEN(index->objects); i++)
+      free(index->objects[i]);
+   RBUF_CLEAR(index->objects);
+   RBUF_CLEAR(index->counts);
+   RBUF_CLEAR(index->hashes);
+   uint32s_index_insert_exact(index, 0, zeros, 0);
+   /* wipe additions */
+   RBUF_CLEAR(index->additions);
+}
+
+void uint32s_index_free(uint32s_index_t *index)
+{
+   size_t i, cap;
+   if (!index)
+      return;
+   for(i = 0, cap = RHMAP_CAP(index->index); i != cap; i++)
+      if (RHMAP_KEY(index->index, i))
+         uint32s_bucket_free(&index->index[i]);
+   RHMAP_FREE(index->index);
+   for(i = 0; i < RBUF_LEN(index->objects); i++)
+      free(index->objects[i]);
+   RBUF_FREE(index->objects);
+   RBUF_FREE(index->counts);
+   RBUF_FREE(index->hashes);
+   RBUF_FREE(index->additions);
+   free(index);
+}
+
+uint32_t uint32s_index_count(uint32s_index_t *index)
+{
+   if (!index || !index->objects)
+      return 0;
+   return RBUF_LEN(index->objects);
+}
+
+#if DEBUG
+#define BIN_COUNT 1000
+uint32_t bins[BIN_COUNT];
+void uint32s_index_print_count_data(uint32s_index_t *index)
+{
+   uint32_t i;
+   /* TODO/FIXME: Don't count or differently count NULL objects entries */
+   uint32_t max=1;
+   if (!index)
+      return;
+   for(i = 0; i < BIN_COUNT; i++)
+      bins[i] = 0;
+   for(i = 1; i < RBUF_LEN(index->counts); i++)
+      max = MAX(max, index->counts[i]);
+   max = max + 1;
+   for(i = 1; i < RBUF_LEN(index->counts); i++)
+      bins[(int)((((float)index->counts[i]) / (float)max)*BIN_COUNT)]++;
+   for(i = 0; i < BIN_COUNT; i++)
+   {
+      uint32_t bin_start = MAX(1,(i*(float)max/(float)BIN_COUNT));
+      uint32_t bin_end = ((i+1)*(float)max/(float)BIN_COUNT);
+      if (bins[i] == 0)
+         continue;
+      RARCH_DBG("%d--%d: %d\n", bin_start, bin_end, bins[i]);
+   }
+}
+#endif
+#endif

@@ -1,0 +1,182 @@
+#!/bin/bash
+# The exact cases on d3d11 or d3d12: software and hardware frames, the
+# stock chain, a preset that reads the frame where it is (pass.slangp)
+# and one that keeps history (history.slangp), threaded and not. Every
+# pixel of each view must be its source pixel, as in run.py. Then the
+# rect presets on a hardware frame in the corner of a larger texture.
+#
+# Usage: d3d.sh <directory holding a mingw retroarch.exe> <output dir>
+#        [d3d11|d3d12]
+#
+# On Windows it runs from an MSYS2 MINGW64 shell, with python3. Elsewhere
+# it needs wine, Xvfb and x86_64-w64-mingw32-gcc; Wine's own d3dcompiler
+# can't compile the d3d11 driver's sprite geometry shader, so a native
+# d3dcompiler_47.dll goes next to retroarch.exe. Not run in CI.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../../../.." && pwd)
+exe_dir=$(cd "$1" && pwd)
+out=$(mkdir -p "$2" && cd "$2" && pwd)
+driver=${3:-d3d11}
+case $(uname -s) in
+   MINGW*|MSYS*)
+      native=1
+      winpath() { cygpath -w "$1"; }
+      ;;
+   *)
+      native=0
+      winpath() { echo "Z:$(echo "$1" | tr / '\\')"; }
+      ;;
+esac
+
+${CC:-x86_64-w64-mingw32-gcc} -O2 -Wall -std=gnu99 \
+   -I"$root/libretro-common/include" -I"$root/gfx/include" \
+   -o "$out/video_views_libretro.dll" "$here/../video_views_core.c" \
+   -shared -static-libgcc -Wl,-Bstatic -lpthread -ldxguid
+
+if [ "$native" = 0 ] && [ -z "${DISPLAY:-}" ]; then
+   Xvfb :87 -screen 0 1920x1200x24 -nolisten tcp >/dev/null 2>&1 &
+   xpid=$!
+   trap 'kill $xpid 2>/dev/null || true; wineserver -k 2>/dev/null || true' EXIT
+   export DISPLAY=:87
+   sleep 2
+fi
+export WINEDEBUG=-all WINEDLLOVERRIDES="d3dcompiler_47=n"
+
+# run_ra <dir> <threaded> <preset path or empty> [smooth]: RetroArch on
+# the core with <dir>/opts.cfg; its screenshot at the last frame in
+# <dir>/shot.png.
+run_ra() {
+   local d=$1 threaded=$2 preset=$3 smooth=${4:-false}
+   {
+      echo "video_driver = \"$driver\""
+      echo 'input_joypad_driver = "null"'
+      echo 'audio_driver = "null"'
+      echo 'video_font_enable = "false"'
+      echo 'menu_enable_widgets = "false"'
+      echo 'video_windowed_position_width = "1600"'
+      echo 'video_windowed_position_height = "960"'
+      echo 'video_scale_integer = "true"'
+      echo "video_smooth = \"$smooth\""
+      echo 'video_gpu_screenshot = "true"'
+      echo 'video_waitable_swapchains = "false"'
+      echo 'config_save_on_exit = "false"'
+      echo 'global_core_options = "true"'
+      echo "core_options_path = \"$(winpath "$d/opts.cfg")\""
+      echo "log_dir = \"$(winpath "$d")\""
+      echo 'log_to_file = "true"'
+      echo "video_threaded = \"$threaded\""
+      [ -z "$preset" ] || echo 'video_shader_enable = "true"'
+   } > "$d/ra.cfg"
+   set -- --config "$(winpath "$d/ra.cfg")" \
+      -L "$(winpath "$out/video_views_libretro.dll")" --verbose \
+      --max-frames=180 --max-frames-ss \
+      --max-frames-ss-path="$(winpath "$d/shot.png")"
+   [ -z "$preset" ] || set -- "$@" --set-shader="$(winpath "$preset")"
+   if [ "$native" = 1 ]; then
+      timeout 180 "$exe_dir/retroarch.exe" "$@" >"$d/run.log" 2>&1 || true
+   else
+      timeout 180 wine "$exe_dir/retroarch.exe" "$@" >"$d/run.log" 2>&1 || true
+   fi
+}
+
+failed=0
+for threaded in false true; do
+   for hw in off "$driver"; do
+      for preset in none pass history; do
+         d="$out/$threaded-$hw-$preset"
+         rm -rf "$d"; mkdir -p "$d"
+         printf 'video_views_test_map = "none"\nvideo_views_test_hw = "%s"\nvideo_views_test_pattern = "noise"\n' \
+            "$hw" > "$d/opts.cfg"
+         p=""
+         [ "$preset" = none ] || p="$here/$preset.slangp"
+         run_ra "$d" "$threaded" "$p"
+         if python3 - "$here/run.py" "$d/shot.png" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('run', sys.argv[1])
+r = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r)
+try:
+    w, h, bpp, rows = r.read_png(sys.argv[2])
+except OSError:
+    print('    no screenshot')
+    sys.exit(1)
+r.W, r.H = w, h
+rows = [bytes(r.rgb_row(rows, bpp, y, 0, w)) for y in range(h)]
+errors = r.exact_errors(rows, 3, r.EXACT_VIEWS['3ds'])
+for e in errors:
+    print('    ' + e)
+sys.exit(1 if errors else 0)
+PY
+         then echo "pass $driver/$threaded-$hw-$preset"
+         else echo "FAIL $driver/$threaded-$hw-$preset"; failed=$((failed + 1))
+         fi
+      done
+   done
+done
+# A preset reads a hardware frame in the corner of a larger texture
+# where it lies: the core draws its DS frame into a texture of its
+# regular maximum. Each preset runs on that and on the software frame,
+# which comes on its own; the screenshots must match, linear filtering
+# with border wrap to within a step (its blend of the edge texels with
+# the border is the shader's). A filter the preset leaves unspecified is
+# read as the smooth setting has it, each way.
+# preset:read in place:tolerance:smooth
+for case in rect_nearest:1:0:false rect_nearest_edge:1:0:false \
+            rect_nearest_repeat:1:0:false rect_nearest_mirror:1:0:false \
+            rect_linear:1:0:false rect_linear_border:1:1:false \
+            rect_full:1:0:false rect_two:1:0:false \
+            rect_unspec:1:0:false rect_unspec:1:1:true; do
+   IFS=: read -r preset want tol smooth <<EOF
+$case
+EOF
+   name=$preset
+   [ "$smooth" = false ] || name=$preset-smooth
+   # d3d12's passes filter an unspecified filter linearly either way.
+   [ "$driver.$preset" != d3d12.rect_unspec ] || tol=1
+   for hw in off "$driver"; do
+      d="$out/rect-$hw-$name"
+      rm -rf "$d"; mkdir -p "$d"
+      printf 'video_views_test_map = "ds"\nvideo_views_test_hw = "%s"\nvideo_views_test_pattern = "noise"\nvideo_views_test_max = "large"\n' \
+         "$hw" > "$d/opts.cfg"
+      run_ra "$d" false "$here/$preset.slangp" "$smooth"
+   done
+   if python3 - "$here/run.py" "$out/rect-off-$name" \
+         "$out/rect-$driver-$name" "$want" "$tol" <<'PY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('run', sys.argv[1])
+r = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r)
+def png_rows(path):
+    w, h, bpp, rows = r.read_png(path)
+    return [bytes(r.rgb_row(rows, bpp, y, 0, w)) for y in range(h)]
+try:
+    sw = png_rows(sys.argv[2] + '/shot.png')
+    hw = png_rows(sys.argv[3] + '/shot.png')
+except OSError:
+    print('    no screenshot')
+    sys.exit(1)
+logs = ''
+for name in os.listdir(sys.argv[3]):
+    if name.endswith('.log'):
+        with open(os.path.join(sys.argv[3], name), errors='replace') as f:
+            logs += f.read()
+in_place = 'Preset reads frames where the core leaves them' in logs
+errors = []
+bad = r.rows_differ(sw, hw, int(sys.argv[5]))
+if bad or len(sw) != len(hw):
+    errors.append('the hardware frame draws other than the software one'
+                  ' (%d pixels)' % bad)
+if in_place != (sys.argv[4] == '1'):
+    errors.append('frame %s where it lies' % ('read' if in_place else 'not read'))
+for e in errors:
+    print('    ' + e)
+sys.exit(1 if errors else 0)
+PY
+   then echo "pass $driver/rect-$name"
+   else echo "FAIL $driver/rect-$name"; failed=$((failed + 1))
+   fi
+done
+
+echo "$failed failed"
+[ "$failed" = 0 ]

@@ -14,17 +14,44 @@
  */
 
 #import <CoreLocation/CoreLocation.h>
+#include "../../apple_runtime.h"
 #include "../../location_driver.h"
 #include "../../retroarch.h"
 #include "../../verbosity.h"
+#ifdef __MACH__
+#include <TargetConditionals.h>
+#endif
 @interface CoreLocationManager : NSObject <CLLocationManagerDelegate>
 @property (strong, nonatomic) CLLocationManager *locationManager;
 @property (assign) double latitude;
 @property (assign) double longitude;
 @property (assign) bool authorized;
+/* What the authorization callback does, for the request to call
+ * directly rather than through the deprecated delegate method. */
+- (void)applyAuthorizationStatus:(CLAuthorizationStatus)status;
 @end
 
+/* -locationManager:didChangeAuthorizationStatus:, which macOS 11 / iOS 14
+ * replaced with -locationManagerDidChangeAuthorization: and deprecated:
+ * installed by +initialize on the releases before, the only ones that
+ * call it. */
+static void corelocation_did_change_status(id self, SEL _cmd,
+      id manager, int status)
+{
+   [(CoreLocationManager*)self
+      applyAuthorizationStatus:(CLAuthorizationStatus)status];
+}
+
 @implementation CoreLocationManager
+
++ (void)initialize {
+    if (self != [CoreLocationManager class])
+        return;
+    if (!apple_runtime_available(APPLE_RUNTIME_VER(11, 0, 0), APPLE_RUNTIME_VER(14, 0, 0), APPLE_RUNTIME_VER(14, 0, 0)))
+        apple_rt_add_method(self,
+              "locationManager:didChangeAuthorizationStatus:",
+              corelocation_did_change_status, "v@:@i");
+}
 
 + (instancetype)sharedInstance {
     static CoreLocationManager *sharedInstance = nil;
@@ -37,7 +64,8 @@
 
 - (instancetype)init {
     self = [super init];
-    if (self) {
+    if (self)
+    {
         _locationManager = [[CLLocationManager alloc] init];
         _locationManager.delegate = self;
         _locationManager.desiredAccuracy = kCLLocationAccuracyBest;
@@ -48,15 +76,30 @@
 
 - (void)requestAuthorization {
     CLAuthorizationStatus status;
-    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *))
-        status = [_locationManager authorizationStatus];
+    /* The instance property is macOS 11 / iOS 14, the class method it
+     * replaces deprecated there: both are sent by selector, so neither
+     * warns whichever floor the build has. */
+    if (apple_runtime_available(APPLE_RUNTIME_VER(11, 0, 0), APPLE_RUNTIME_VER(14, 0, 0), APPLE_RUNTIME_VER(14, 0, 0)))
+        status = (CLAuthorizationStatus)apple_rt_get_int(_locationManager,
+              @selector(authorizationStatus));
     else
-        status = [CLLocationManager authorizationStatus];
+        status = (CLAuthorizationStatus)apple_rt_get_int([CLLocationManager class],
+              @selector(authorizationStatus));
 
     if (status == kCLAuthorizationStatusNotDetermined)
-        [_locationManager requestWhenInUseAuthorization];
+    {
+        if (apple_runtime_available(APPLE_RUNTIME_VER(10, 15, 0), 0, 0))
+            apple_rt_send_void(_locationManager,
+                  sel_registerName("requestWhenInUseAuthorization"));
+#if TARGET_OS_OSX
+        else
+            /* Pre-10.15 macOS has no explicit when-in-use request API; starting
+             * location updates raises the authorization prompt implicitly. */
+            [_locationManager startUpdatingLocation];
+#endif
+    }
     else
-        [self locationManager:_locationManager didChangeAuthorizationStatus:status];
+        [self applyAuthorizationStatus:status];
 }
 
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
@@ -66,16 +109,21 @@
 }
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error {
-    RARCH_WARN("[LOCATION]: Location manager failed with error: %s\n", error.description.UTF8String);
+    RARCH_WARN("[Location] Location manager failed with error: %s.\n", error.description.UTF8String);
     NSLog(@"Location manager failed with error: %@", error);
 }
 
-- (void)locationManager:(CLLocationManager *)manager didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+    [self applyAuthorizationStatus:(CLAuthorizationStatus)apple_rt_get_int(
+          manager, @selector(authorizationStatus))];
+}
+
+- (void)applyAuthorizationStatus:(CLAuthorizationStatus)status {
 #if TARGET_OS_OSX
-    if (@available(macOS 10.12, *))
+    if (apple_runtime_available(APPLE_RUNTIME_VER(10, 12, 0), 0, 0))
         self.authorized = (status == kCLAuthorizationStatusAuthorizedAlways);
 #elif TARGET_OS_IPHONE
-    if (@available(iOS 8.0, tvOS 9.0, *))
+    if (apple_runtime_available(0, APPLE_RUNTIME_VER(8, 0, 0), APPLE_RUNTIME_VER(9, 0, 0)))
         self.authorized = (status == kCLAuthorizationStatusAuthorizedWhenInUse ||
                            status == kCLAuthorizationStatusAuthorizedAlways);
 #endif
@@ -91,71 +139,75 @@ typedef struct corelocation {
     CoreLocationManager *manager;
 } corelocation_t;
 
-static void *corelocation_init(void) {
-    corelocation_t *corelocation = (corelocation_t*)calloc(1, sizeof(*corelocation));
-    if (!corelocation)
-        return NULL;
+static void *corelocation_init(void)
+{
+   corelocation_t *corelocation = (corelocation_t*)calloc(1, sizeof(*corelocation));
+   if (!corelocation)
+      return NULL;
 
-    corelocation->manager = [CoreLocationManager sharedInstance];
-    [corelocation->manager requestAuthorization];
+   corelocation->manager = [CoreLocationManager sharedInstance];
+   [corelocation->manager requestAuthorization];
 
-    return corelocation;
+   return corelocation;
 }
 
-static void corelocation_free(void *data) {
-    corelocation_t *corelocation = (corelocation_t*)data;
-    if (!corelocation)
-        return;
+static void corelocation_free(void *data)
+{
+   corelocation_t *corelocation = (corelocation_t*)data;
+   if (!corelocation)
+      return;
 
-    free(corelocation);
+   free(corelocation);
 }
 
-static bool corelocation_start(void *data) {
-    corelocation_t *corelocation = (corelocation_t*)data;
-    if (!corelocation || !corelocation->manager.authorized)
-        return false;
+static bool corelocation_start(void *data)
+{
+   corelocation_t *corelocation = (corelocation_t*)data;
+   if (!corelocation || !corelocation->manager.authorized)
+      return false;
 
 #if !TARGET_OS_TV
-    [corelocation->manager.locationManager startUpdatingLocation];
+   [corelocation->manager.locationManager startUpdatingLocation];
 #endif
-    return true;
+   return true;
 }
 
-static void corelocation_stop(void *data) {
-    corelocation_t *corelocation = (corelocation_t*)data;
-    if (!corelocation)
-        return;
-
-    [corelocation->manager.locationManager stopUpdatingLocation];
+static void corelocation_stop(void *data)
+{
+   corelocation_t *corelocation = (corelocation_t*)data;
+   if (corelocation)
+      [corelocation->manager.locationManager stopUpdatingLocation];
 }
 
 static bool corelocation_get_position(void *data, double *lat, double *lon,
-                                     double *horiz_accuracy, double *vert_accuracy) {
-    corelocation_t *corelocation = (corelocation_t*)data;
-    if (!corelocation || !corelocation->manager.authorized)
-        return false;
+      double *horiz_accuracy, double *vert_accuracy)
+{
+   corelocation_t *corelocation = (corelocation_t*)data;
+   if (!corelocation || !corelocation->manager.authorized)
+      return false;
 
 #if TARGET_OS_TV
-    CLLocation *location = [corelocation->manager.locationManager location];
-    *lat = location.coordinate.latitude;
-    *lon = location.coordinate.longitude;
+   CLLocation *location = [corelocation->manager.locationManager location];
+   *lat = location.coordinate.latitude;
+   *lon = location.coordinate.longitude;
 #else
-    *lat = corelocation->manager.latitude;
-    *lon = corelocation->manager.longitude;
+   *lat = corelocation->manager.latitude;
+   *lon = corelocation->manager.longitude;
 #endif
-    *horiz_accuracy = 0.0; // CoreLocation doesn't provide this directly
-    *vert_accuracy = 0.0;  // CoreLocation doesn't provide this directly
-    return true;
+   *horiz_accuracy = 0.0; // CoreLocation doesn't provide this directly
+   *vert_accuracy = 0.0;  // CoreLocation doesn't provide this directly
+   return true;
 }
 
 static void corelocation_set_interval(void *data, unsigned interval_ms,
-                                    unsigned interval_distance) {
-    corelocation_t *corelocation = (corelocation_t*)data;
-    if (!corelocation)
-        return;
+      unsigned interval_distance)
+{
+   corelocation_t *corelocation = (corelocation_t*)data;
+   if (!corelocation)
+      return;
 
-    corelocation->manager.locationManager.distanceFilter = interval_distance;
-    corelocation->manager.locationManager.desiredAccuracy = kCLLocationAccuracyBest;
+   corelocation->manager.locationManager.distanceFilter = interval_distance;
+   corelocation->manager.locationManager.desiredAccuracy = kCLLocationAccuracyBest;
 }
 
 location_driver_t location_corelocation = {

@@ -25,13 +25,15 @@
 #include "menu_displaylist.h"
 #include "../file_path_special.h"
 #include "../core_info.h"
+#include "../msg_hash_lbl_str.h"
+#include "../gfx/gfx_surface.h"
 
 #define CONTENTLESS_CORE_ICON_DEFAULT "default.png"
 
 typedef struct
 {
-   uintptr_t **system;
-   uintptr_t fallback;
+   gfx_surface_t **system;
+   gfx_surface_t *fallback;
 } contentless_core_icons_t;
 
 typedef struct
@@ -116,13 +118,24 @@ static void contentless_cores_init_info_entries(
    {
       core_info_t *core_info = core_info_get(core_info_list, i);
 
-      if (   core_info
-          && core_info->supports_no_game)
+      if (    core_info
+          && (core_info->flags & CORE_INFO_FLAG_SUPPORTS_NO_GAME))
       {
          char licenses_str[MENU_LABEL_MAX_LENGTH];
          contentless_core_info_entry_t *entry =
                (contentless_core_info_entry_t*)malloc(sizeof(*entry));
-         size_t _len          = strlcpy(licenses_str,
+         size_t _len;
+
+         /* NULL-check entry: the field writes below (licenses_str
+          * strdup, runtime.* init, hashmap insert) NULL-deref on
+          * OOM.  Void-returning function, void caller; skip this
+          * core's info entry and continue the enumeration loop -
+          * the core just won't appear in the contentless-cores
+          * list until next scan. */
+         if (!entry)
+            continue;
+
+         _len                 = strlcpy(licenses_str,
                msg_hash_to_str(MENU_ENUM_LABEL_VALUE_CORE_INFO_LICENSES),
                sizeof(licenses_str) - 3);
          licenses_str[  _len] = ':';
@@ -162,7 +175,7 @@ void menu_contentless_cores_set_runtime(const char *core_id,
    if (   !contentless_cores_state
        || !contentless_cores_state->info_entries
        || !runtime_info
-       || string_is_empty(core_id))
+       || (!core_id || !*core_id))
       return;
 
    info_entry = RHMAP_GET_STR(contentless_cores_state->info_entries, core_id);
@@ -170,7 +183,7 @@ void menu_contentless_cores_set_runtime(const char *core_id,
    if (!info_entry)
       return;
 
-   if (!string_is_empty(runtime_info->runtime_str))
+   if (runtime_info->runtime_str && *runtime_info->runtime_str)
    {
       if (info_entry->runtime.runtime_str)
          free(info_entry->runtime.runtime_str);
@@ -178,7 +191,7 @@ void menu_contentless_cores_set_runtime(const char *core_id,
       info_entry->runtime.runtime_str = strdup(runtime_info->runtime_str);
    }
 
-   if (!string_is_empty(runtime_info->last_played_str))
+   if (runtime_info->last_played_str && *runtime_info->last_played_str)
    {
       if (info_entry->runtime.last_played_str)
          free(info_entry->runtime.last_played_str);
@@ -197,7 +210,7 @@ void menu_contentless_cores_get_info(const char *core_id,
 
    if (   !contentless_cores_state
        || !contentless_cores_state->info_entries
-       || string_is_empty(core_id))
+       || (!core_id || !*core_id))
       *info = NULL;
 
    *info = RHMAP_GET_STR(contentless_cores_state->info_entries, core_id);
@@ -232,22 +245,12 @@ static void contentless_cores_unload_icons(contentless_cores_state_t *state)
    if (!state || !state->icons)
       return;
 
-   if (state->icons->fallback)
-      video_driver_texture_unload(&state->icons->fallback);
+   gfx_surface_free(state->icons->fallback);
+   state->icons->fallback = NULL;
 
    for (i = 0, cap = RHMAP_CAP(state->icons->system); i != cap; i++)
-   {
       if (RHMAP_KEY(state->icons->system, i))
-      {
-         uintptr_t *icon = state->icons->system[i];
-
-         if (!icon)
-            continue;
-
-         video_driver_texture_unload(icon);
-         free(icon);
-      }
-   }
+         gfx_surface_free(state->icons->system[i]);
 
    RHMAP_FREE(state->icons->system);
    free(state->icons);
@@ -259,7 +262,7 @@ static void contentless_cores_load_icons(contentless_cores_state_t *state)
    size_t i;
    char icon_path[PATH_MAX_LENGTH];
    char icon_directory[DIR_MAX_LENGTH];
-   bool rgba_supported              = video_driver_supports_rgba();
+   bool rgba_supported              = gfx_surface_wants_rgba();
    core_info_list_t *core_info_list = NULL;
 
    if (!state)
@@ -280,7 +283,7 @@ static void contentless_cores_load_icons(contentless_cores_state_t *state)
          sizeof(icon_directory),
          APPLICATION_SPECIAL_DIRECTORY_ASSETS_SYSICONS);
 
-   if (string_is_empty(icon_directory))
+   if (!*icon_directory)
       return;
 
    /* Load fallback icon */
@@ -289,21 +292,10 @@ static void contentless_cores_load_icons(contentless_cores_state_t *state)
 
    if (path_is_valid(icon_path))
    {
-      struct texture_image ti;
-      ti.pixels               = NULL;
-      ti.width                = 0;
-      ti.height               = 0;
-      ti.supports_rgba        = rgba_supported;
-
-      if (image_texture_load(&ti, icon_path))
-      {
-         if (ti.pixels)
-            video_driver_texture_load(&ti,
-                  TEXTURE_FILTER_MIPMAP_LINEAR,
-                  &state->icons->fallback);
-
-         image_texture_free(&ti);
-      }
+      state->icons->fallback = gfx_surface_new_still(
+            gfx_display_texture_filter());
+      gfx_surface_submit_path(state->icons->fallback, icon_path,
+            rgba_supported);
    }
 
    /* Get icons for all contentless cores */
@@ -316,14 +308,11 @@ static void contentless_cores_load_icons(contentless_cores_state_t *state)
    {
       core_info_t *core_info = core_info_get(core_info_list, i);
 
-      /* Icon name is the first entry in the core
-       * info database list */
       if (    core_info
-          &&  core_info->supports_no_game
+          && (core_info->flags & CORE_INFO_FLAG_SUPPORTS_NO_GAME)
           &&  core_info->databases_list
           && (core_info->databases_list->size > 0))
       {
-         struct texture_image ti;
          const char *icon_name   =
                core_info->databases_list->elems[0].data;
          size_t _len             = fill_pathname_join_special(
@@ -335,29 +324,18 @@ static void contentless_cores_load_icons(contentless_cores_state_t *state)
          icon_path[++_len]       = 'g';
          icon_path[++_len]       = '\0';
 
-         ti.pixels               = NULL;
-         ti.width                = 0;
-         ti.height               = 0;
-         ti.supports_rgba        = rgba_supported;
-
          if (!path_is_valid(icon_path))
             continue;
 
-         if (image_texture_load(&ti, icon_path))
          {
-            if (ti.pixels)
-            {
-               uintptr_t *icon = (uintptr_t*)calloc(1, sizeof(*icon));
+            gfx_surface_t *icon = gfx_surface_new_still(
+                  gfx_display_texture_filter());
+            if (!icon)
+               continue;
 
-               video_driver_texture_load(&ti,
-                     TEXTURE_FILTER_MIPMAP_LINEAR,
-                     icon);
-
-               /* Add icon to hash map */
-               RHMAP_SET_STR(state->icons->system, core_info->core_file_id.str, icon);
-            }
-
-            image_texture_free(&ti);
+            RHMAP_SET_STR(state->icons->system,
+                  core_info->core_file_id.str, icon);
+            gfx_surface_submit_path(icon, icon_path, rgba_supported);
          }
       }
    }
@@ -366,15 +344,15 @@ static void contentless_cores_load_icons(contentless_cores_state_t *state)
 uintptr_t menu_contentless_cores_get_entry_icon(const char *core_id)
 {
    contentless_cores_state_t *state = contentless_cores_state;
-   uintptr_t *icon                  = NULL;
+   gfx_surface_t *icon              = NULL;
    if (   !state
        || !state->icons_enabled
        || !state->icons
-       || string_is_empty(core_id))
+       || (!core_id || !*core_id))
       return 0;
    if ((icon = RHMAP_GET_STR(state->icons->system, core_id)))
-      return *icon;
-   return state->icons->fallback;
+      return GFX_SURFACE_HANDLE(icon);
+   return GFX_SURFACE_HANDLE(state->icons->fallback);
 }
 
 void menu_contentless_cores_context_init(void)
@@ -427,17 +405,17 @@ unsigned menu_displaylist_contentless_cores(file_list_t *list,
             switch (core_display_type)
             {
                case MENU_CONTENTLESS_CORES_DISPLAY_ALL:
-                  if (!(      core_info->supports_no_game))
+                  if (!(core_info->flags & CORE_INFO_FLAG_SUPPORTS_NO_GAME))
                      continue;
                   break;
                case MENU_CONTENTLESS_CORES_DISPLAY_SINGLE_PURPOSE:
-                  if (!(      core_info->supports_no_game
-                           && core_info->single_purpose))
+                  if (!(     (core_info->flags & CORE_INFO_FLAG_SUPPORTS_NO_GAME)
+                          && (core_info->flags & CORE_INFO_FLAG_SINGLE_PURPOSE)))
                      continue;
                   break;
                case MENU_CONTENTLESS_CORES_DISPLAY_CUSTOM:
-                  if (!(       core_info->supports_no_game
-                           && !core_info->is_standalone_exempt))
+                  if (!(      (core_info->flags & CORE_INFO_FLAG_SUPPORTS_NO_GAME)
+                          && !(core_info->flags & CORE_INFO_FLAG_IS_STANDALONE_EXEMPT)))
                      continue;
                   break;
                default:
@@ -480,7 +458,7 @@ unsigned menu_displaylist_contentless_cores(file_list_t *list,
    if (  (count == 0)
        && menu_entries_append(list,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_CORES_AVAILABLE),
-            msg_hash_to_str(MENU_ENUM_LABEL_NO_CORES_AVAILABLE),
+            MENU_ENUM_LABEL_NO_CORES_AVAILABLE_STR,
             MENU_ENUM_LABEL_NO_CORES_AVAILABLE,
             0, 0, 0, NULL))
       count++;

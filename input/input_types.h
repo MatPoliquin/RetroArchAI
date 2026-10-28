@@ -55,41 +55,135 @@ struct input_bind_map
 /* Turbo support. */
 struct turbo_buttons
 {
-   int32_t turbo_pressed[MAX_USERS];
+   uint32_t turbo_pressed[MAX_USERS];
    unsigned count;
    uint16_t enable[MAX_USERS];
    bool frame_enable[MAX_USERS];
    bool mode1_enable[MAX_USERS];
 };
 
-struct retro_keybind
+/* Hold button support. */
+struct hold_buttons
 {
-   /* Human-readable label for the control. */
-   char     *joykey_label;
-   /* Human-readable label for an analog axis. */
-   char     *joyaxis_label;
-   /*
-    * Joypad axis. Negative and positive axes are both 
-    * represented by this variable.
-    */
+   int32_t hold_pressed[MAX_USERS];  /* Edge detection for toggle */
+   uint16_t enable[MAX_USERS];       /* Bitmask of held buttons */
+   bool frame_enable[MAX_USERS];     /* Hold modifier pressed this frame */
+};
+
+/* Human-readable names for a bind's joypad button and analog axis, supplied
+ * by an autoconfig profile or a config file. Display-only: nothing in the
+ * input poll path ever reads them, so they are held in arrays parallel to the
+ * bind sets rather than inside struct retro_keybind, which is swept in full
+ * several times per frame. Keeping the two pointers out of the bind takes it
+ * from 48 to 28 bytes. */
+struct input_bind_label
+{
+   char     *joykey;
+   char     *joyaxis;
+};
+
+/* What a bind starts as, with what it is called and its number: an
+ * entry of the default tables in config.def.keybinds.h, which are read
+ * when binds are reset and when a bind's label is wanted, and are
+ * constant. A bind as it is used is struct retro_keybind below. */
+struct retro_keybind_def
+{
+   /* Joypad axis. Negative and positive axes are both represented by
+    * this variable. */
    uint32_t joyaxis;
-   /* Default joy axis binding value for resetting bind to default. */
-   uint32_t def_joyaxis;
+   uint32_t def_joyaxis;   /* unused */
 
-   enum msg_hash_enums enum_idx;
+   /* The label, the keyboard key and whether the bind is usable, in
+    * one word: RETRO_KEYBIND_PACK(). */
+   uint32_t attr;
 
-   enum retro_key key;
-
+   /* The bind's number: its place in a user's set. */
    uint16_t id;
    /* What mouse button ID has been mapped to this control. */
    uint16_t mbutton;
    /* Joypad key. Joypad POV (hats) are embedded into this key as well. */
    uint16_t joykey;
-   /* Default key binding value (for resetting bind). */
-   uint16_t def_joykey;
-   /* Determines whether or not the binding is valid. */
-   bool valid;
+   uint16_t def_joykey;    /* unused */
 };
+
+#define RETRO_KEYBIND_ENUM_IDX_MASK  0x0000ffffu
+#define RETRO_KEYBIND_KEY_SHIFT      16
+#define RETRO_KEYBIND_KEY_MASK       0x7fff0000u
+#define RETRO_KEYBIND_VALID_BIT      0x80000000u
+
+#define RETRO_KEYBIND_PACK(enum_idx, key, valid) \
+   (  ((uint32_t)(enum_idx) & RETRO_KEYBIND_ENUM_IDX_MASK) \
+    | ((((uint32_t)(key)) << RETRO_KEYBIND_KEY_SHIFT) & RETRO_KEYBIND_KEY_MASK) \
+    | ((valid) ? RETRO_KEYBIND_VALID_BIT : 0u))
+
+#define RETRO_KEYBIND_DEF_ENUM_IDX(d) \
+   ((enum msg_hash_enums)((d)->attr & RETRO_KEYBIND_ENUM_IDX_MASK))
+#define RETRO_KEYBIND_DEF_KEY(d) \
+   ((enum retro_key)(((d)->attr & RETRO_KEYBIND_KEY_MASK) >> RETRO_KEYBIND_KEY_SHIFT))
+#define RETRO_KEYBIND_DEF_VALID(d) (((d)->attr & RETRO_KEYBIND_VALID_BIT) != 0)
+
+/* A bind as it is used: what was chosen for it, and nothing else.
+ * Eight bytes. Its label and its number are its place's, the same for
+ * every user, and are asked of the place (input_config_bind_label());
+ * whoever has a bind knows whose it is and which. Two tables hold a
+ * set for each of sixteen
+ * users, and whole sets are copied on every remap and autoconfig
+ * apply, so what a record does not carry is carried by none of 3,072.
+ *
+ * The keyboard key, the mouse button and whether the bind is usable
+ * share sixteen bits: nine for the key (retro_key tops out at
+ * RETROK_LAST, 342), six for the mouse button (the ids end at 10; all
+ * six set is none), one for the flag. Reach them through the accessors
+ * below. */
+struct retro_keybind
+{
+   /* Joypad axis. Negative and positive axes are both represented by
+    * this variable. */
+   uint32_t joyaxis;
+   /* Joypad key. Joypad POV (hats) are embedded into this key as well. */
+   uint16_t joykey;
+   uint16_t attr;
+};
+
+#define RETRO_KEYBIND_ATTR_KEY_MASK      0x01ffu
+#define RETRO_KEYBIND_ATTR_MBUTTON_SHIFT 9
+#define RETRO_KEYBIND_ATTR_MBUTTON_MASK  0x7e00u
+#define RETRO_KEYBIND_ATTR_VALID_BIT     0x8000u
+/* The mouse button of a bind that has none. Past every button there
+ * is, so a reader that looks a button up finds nothing, as it did for
+ * NO_BTN. */
+#define RETRO_KEYBIND_MBUTTON_NONE       0x3fu
+
+#define RETRO_KEYBIND_ATTR(key, mbutton, valid) \
+   ((uint16_t)(  ((unsigned)(key) & RETRO_KEYBIND_ATTR_KEY_MASK) \
+    | ((((unsigned)(mbutton) < RETRO_KEYBIND_MBUTTON_NONE \
+          ? (unsigned)(mbutton) : RETRO_KEYBIND_MBUTTON_NONE) \
+         << RETRO_KEYBIND_ATTR_MBUTTON_SHIFT)) \
+    | ((valid) ? RETRO_KEYBIND_ATTR_VALID_BIT : 0u)))
+
+#define RETRO_KEYBIND_KEY(b) \
+   ((enum retro_key)((b)->attr & RETRO_KEYBIND_ATTR_KEY_MASK))
+/* A button's id, or RETRO_KEYBIND_MBUTTON_NONE */
+#define RETRO_KEYBIND_MBUTTON(b) \
+   ((unsigned)(((b)->attr & RETRO_KEYBIND_ATTR_MBUTTON_MASK) \
+      >> RETRO_KEYBIND_ATTR_MBUTTON_SHIFT))
+#define RETRO_KEYBIND_HAS_MBUTTON(b) \
+   (((b)->attr & RETRO_KEYBIND_ATTR_MBUTTON_MASK) != RETRO_KEYBIND_ATTR_MBUTTON_MASK)
+/* Determines whether or not the binding is usable. */
+#define RETRO_KEYBIND_VALID(b)    (((b)->attr & RETRO_KEYBIND_ATTR_VALID_BIT) != 0)
+
+#define RETRO_KEYBIND_SET_KEY(b, v) \
+   ((b)->attr = (uint16_t)(((b)->attr & ~RETRO_KEYBIND_ATTR_KEY_MASK) \
+              | ((unsigned)(v) & RETRO_KEYBIND_ATTR_KEY_MASK)))
+/* Any id past the buttons there are, NO_BTN among them, is none */
+#define RETRO_KEYBIND_SET_MBUTTON(b, v) \
+   ((b)->attr = (uint16_t)(((b)->attr & ~RETRO_KEYBIND_ATTR_MBUTTON_MASK) \
+              | (((unsigned)(v) < RETRO_KEYBIND_MBUTTON_NONE \
+                    ? (unsigned)(v) : RETRO_KEYBIND_MBUTTON_NONE) \
+                 << RETRO_KEYBIND_ATTR_MBUTTON_SHIFT)))
+#define RETRO_KEYBIND_SET_VALID(b, v) \
+   ((b)->attr = (uint16_t)((v) ? ((b)->attr |  RETRO_KEYBIND_ATTR_VALID_BIT) \
+                    : ((b)->attr & ~RETRO_KEYBIND_ATTR_VALID_BIT)))
 
 typedef struct retro_keybind retro_keybind_set[RARCH_BIND_LIST_END];
 
@@ -139,6 +233,7 @@ typedef struct rarch_joypad_info rarch_joypad_info_t;
 typedef struct input_driver input_driver_t;
 typedef struct input_keyboard_ctx_wait input_keyboard_ctx_wait_t;
 typedef struct turbo_buttons turbo_buttons_t;
+typedef struct hold_buttons hold_buttons_t;
 typedef struct joypad_connection joypad_connection_t;
 
 #endif /* __INPUT_TYPES__H */

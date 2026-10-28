@@ -24,6 +24,9 @@
 #include <string/stdstring.h>
 #include <streams/file_stream.h>
 #include <formats/rjson.h>
+#include <formats/rjson_stream.h>
+
+#include <compat/strl.h>
 
 #include "../input_driver.h"
 #include "../input_keymaps.h"
@@ -43,7 +46,9 @@
 #define INPUT_TEST_COMMAND_SET_SENSOR_LUX    16
 
 /* TODO/FIXME - static globals */
-static uint16_t test_key_state[DEFAULT_MAX_PADS+1][RETROK_LAST];
+/* Allocated with the step array when the test driver starts; see
+ * the note there. Indexed as [DEFAULT_MAX_PADS+1][RETROK_LAST]. */
+static uint16_t (*test_key_state)[RETROK_LAST];
 
 typedef struct
 {
@@ -70,15 +75,13 @@ typedef struct
    bool handled;
 } input_test_step_t;
 
-static input_test_step_t input_test_steps[MAX_TEST_STEPS];
+/* Allocated when the test driver or core actually starts; a static
+ * array here is load-resident forever on platforms without demand
+ * paging, for a feature almost no session activates. */
+static input_test_step_t *input_test_steps;
 
-static unsigned current_frame         = 0;
-static unsigned next_teststep_frame   = 0;
 static unsigned current_test_step     = 0;
 static unsigned last_test_step        = MAX_TEST_STEPS + 1;
-static uint32_t input_state_validated = 0;
-static uint32_t combo_state_validated = 0;
-static bool     dump_state_blocked    = false;
 
 /************************************/
 /* JSON Helpers for test input file */
@@ -112,7 +115,7 @@ static bool KTifJSONObjectEndHandler(void* context)
    input_test_steps[current_test_step].param_num = pCtx->param_num;
    input_test_steps[current_test_step].handled   = false;
 
-   if (!string_is_empty(pCtx->param_str))
+   if (pCtx->param_str && *pCtx->param_str)
       strlcpy(
             input_test_steps[current_test_step].param_str, pCtx->param_str,
             sizeof(input_test_steps[current_test_step].param_str));
@@ -153,7 +156,7 @@ static bool KTifJSONNumberHandler(void* context, const char *pValue, size_t len)
 {
    KTifJSONContext *pCtx = (KTifJSONContext*)context;
 
-   if (pCtx->current_entry_uint_val && len && !string_is_empty(pValue))
+   if (pCtx->current_entry_uint_val && len && pValue && *pValue)
       *pCtx->current_entry_uint_val = string_to_unsigned(pValue);
    /* ignore unknown members */
 
@@ -166,7 +169,7 @@ static bool KTifJSONStringHandler(void* context, const char *pValue, size_t len)
 {
    KTifJSONContext *pCtx = (KTifJSONContext*)context;
 
-   if (pCtx->current_entry_str_val && len && !string_is_empty(pValue))
+   if (pCtx->current_entry_str_val && len && pValue && *pValue)
    {
       if (*pCtx->current_entry_str_val)
          free(*pCtx->current_entry_str_val);
@@ -186,35 +189,37 @@ static bool input_test_file_read(const char* file_path)
 {
    bool success            = false;
    KTifJSONContext context = {0};
-   RFILE *file             = NULL;
+   uint8_t *file_buf       = NULL;
+   int64_t file_len        = 0;
    rjson_t* parser;
 
    /* Sanity check */
-   if (    string_is_empty(file_path)
-       || !path_is_valid(file_path)
-      )
+   if (!file_path || !*file_path)
    {
-      RARCH_DBG("[Test input driver]: No test input file supplied.\n");
+      RARCH_DBG("[Test input] No test input file supplied.\n");
       return false;
    }
 
-   /* Attempt to open test input file */
-   file = filestream_open(
-         file_path,
-         RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
-
-   if (!file)
+   /* Read the whole file in one operation: it is tiny and always
+    * parsed in full, so a single open/size/read/close beats a
+    * pre-open stat plus the chunked callback path (which itself
+    * sizes the stream with an extra fstat).  The stat below runs
+    * only to classify a failure. */
+   if (!filestream_read_file(file_path,
+         (void**)&file_buf, &file_len))
    {
-      RARCH_ERR("[Test input driver]: Failed to open test input file: \"%s\".\n",
-            file_path);
+      if (!path_is_valid(file_path))
+         RARCH_DBG("[Test input] No test input file supplied.\n");
+      else
+         RARCH_ERR("[Test input] Failed to open test input file: \"%s\".\n",
+               file_path);
       return false;
    }
 
    /* Initialise JSON parser */
-   if (!(parser = rjson_open_rfile(file)))
+   if (!(parser = rjson_open_buffer(file_buf, (size_t)file_len)))
    {
-      RARCH_ERR("[Test input driver]: Failed to create JSON parser.\n");
+      RARCH_ERR("[Test input] Failed to create JSON parser.\n");
       goto end;
    }
 
@@ -233,16 +238,16 @@ static bool input_test_file_read(const char* file_path)
       if (rjson_get_source_context_len(parser))
       {
          RARCH_ERR(
-               "[Test input driver]: Error parsing chunk of test input file: %s\n---snip---\n%.*s\n---snip---\n",
+               "[Test input] Error parsing chunk of test input file: %s\n---snip---\n%.*s\n---snip---\n",
                file_path,
                rjson_get_source_context_len(parser),
                rjson_get_source_context_buf(parser));
       }
       RARCH_WARN(
-            "[Test input driver]: Error parsing test input file: %s\n",
+            "[Test input] Error parsing test input file: \"%s\".\n",
             file_path);
       RARCH_ERR(
-            "[Test input driver]: Error: Invalid JSON at line %d, column %d - %s.\n",
+            "[Test input] Error: Invalid JSON at line %d, column %d - %s.\n",
             (int)rjson_get_source_line(parser),
             (int)rjson_get_source_column(parser),
             (*rjson_get_error(parser) ? rjson_get_error(parser) : "format error"));
@@ -257,17 +262,17 @@ end:
    if (context.param_str)
       free(context.param_str);
 
-   /* Close log file */
-   filestream_close(file);
+   /* Release file contents */
+   free(file_buf);
 
    if (last_test_step >= MAX_TEST_STEPS)
    {
-      RARCH_WARN("[Test input driver]: too long test input json, maximum size: %d\n",MAX_TEST_STEPS);
+      RARCH_WARN("[Test input] Too long test input json, maximum size: %d.\n",MAX_TEST_STEPS);
    }
    for (current_test_step = 0; current_test_step < last_test_step; current_test_step++)
    {
       RARCH_DBG(
-         "[Test input driver]: test step %02d read from file: frame %d, action %x, num %x, str %s\n",
+         "[Test input] test step %02d read from file: frame %d, action %x, num %x, str %s\n",
          current_test_step,
          input_test_steps[current_test_step].frame,
          input_test_steps[current_test_step].action,
@@ -292,69 +297,50 @@ static void test_keyboard_free(void)
 {
    unsigned i, j;
 
+   if (!test_key_state)
+      return;
    for (i = 0; i < DEFAULT_MAX_PADS; i++)
       for (j = 0; j < RETROK_LAST; j++)
          test_key_state[i][j] = 0;
 }
 
+/* Which of @keys are down: bit n of @down for keys[n]. The first
+ * port's only, as this driver has always answered. */
+static void test_keys_down(void *data, unsigned port,
+      const uint16_t *keys, const uint8_t *bind, unsigned count,
+      uint32_t *down)
+{
+   unsigned i;
+   (void)data;
+   (void)bind;
+   if (port || !test_key_state)
+      return;
+   for (i = 0; i < count; i++)
+      if (     keys[i] && keys[i] < RETROK_LAST
+            && test_key_state[DEFAULT_MAX_PADS][keys[i]])
+         down[i >> 5] |= (1u << (i & 31));
+}
+
 static int16_t test_input_state(
       void *data,
       const input_device_driver_t *joypad,
-      const input_device_driver_t *sec_joypad,
       rarch_joypad_info_t *joypad_info,
       const retro_keybind_set *binds,
-      bool keyboard_mapping_blocked,
       unsigned port,
       unsigned device,
       unsigned idx,
       unsigned id)
 {
-   if (port <= 0)
-   {
-      switch (device)
-      {
-/* TODO: something clear here */
-         case RETRO_DEVICE_JOYPAD:
-            if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
-            {
-               unsigned i;
-               int16_t ret = 0;
-
-               if (!keyboard_mapping_blocked && id < RARCH_BIND_LIST_END)
-               {
-                  for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
-                  {
-                     if (binds[port][i].valid)
-                     {
-                        if (     (binds[port][i].key && binds[port][i].key < RETROK_LAST)
-                              && test_key_state[DEFAULT_MAX_PADS][binds[port][id].key])
-                           ret |= (1 << i);
-                     }
-                  }
-               }
-               return ret;
-            }
-
-            if (id < RARCH_BIND_LIST_END)
-            {
-               if (binds[port][id].valid)
-               {
-                  if (     (binds[port][id].key && binds[port][id].key < RETROK_LAST)
-                        && test_key_state[DEFAULT_MAX_PADS][binds[port][id].key]
-                        && (id == RARCH_GAME_FOCUS_TOGGLE || !keyboard_mapping_blocked)
-                     )
-                     return 1;
-
-               }
-            }
-            break;
-
-         case RETRO_DEVICE_KEYBOARD:
-            if (id && id < RETROK_LAST)
-               return (test_key_state[DEFAULT_MAX_PADS][id]);
-            break;
-      }
-   }
+   /* The RetroPad's buttons and the hotkeys, where they are bound to
+    * keys, are the frontend's to answer: it asks test_keys_down() for
+    * the keys once a poll. This worked them out from the binds it was
+    * handed - and for the whole pad read the set at the number that
+    * asks for the whole pad, far past its end. */
+   if (     port <= 0
+         && device == RETRO_DEVICE_KEYBOARD
+         && test_key_state
+         && id && id < RETROK_LAST)
+      return (test_key_state[DEFAULT_MAX_PADS][id]);
 
    return 0;
 }
@@ -362,16 +348,28 @@ static int16_t test_input_state(
 static void test_input_free_input(void *data)
 {
    test_keyboard_free();
+   if (input_test_steps)
+      free(input_test_steps);
+   input_test_steps = NULL;
+   if (test_key_state)
+      free(test_key_state);
+   test_key_state = NULL;
 }
 
 static void* test_input_init(const char *joypad_driver)
 {
-   settings_t *settings = config_get_ptr();
-   unsigned i;
+   if (!input_test_steps)
+      input_test_steps = (input_test_step_t*)
+            calloc(MAX_TEST_STEPS, sizeof(*input_test_steps));
+   if (!test_key_state)
+      test_key_state = (uint16_t(*)[RETROK_LAST])
+            calloc(DEFAULT_MAX_PADS + 1, sizeof(*test_key_state));
+   if (!input_test_steps || !test_key_state)
+      return NULL;
 
-   RARCH_DBG("[Test input driver]: start\n");
+   RARCH_DBG("[Test input] Start.\n");
 
-   input_test_file_read(settings->paths.test_input_file_general);
+   input_test_file_read(input_config_get_test_input_file(false));
    if (last_test_step > MAX_TEST_STEPS)
       last_test_step = 0;
 
@@ -404,8 +402,7 @@ static float test_input_unsigned_to_float_lux(unsigned i)
 
 static void test_input_poll(void *data)
 {
-   video_driver_state_t *video_st = video_state_get_ptr();
-   uint64_t curr_frame            = video_st->frame_count;
+   uint64_t curr_frame            = video_driver_get_frame_count();
    unsigned i;
 
    for (i=0; i<last_test_step; i++)
@@ -421,7 +418,7 @@ static void test_input_poll(void *data)
             }
             input_test_steps[i].handled = true;
             RARCH_DBG(
-               "[Test input driver]: Pressing keyboard button %d at frame %d\n",
+               "[Test input] Pressing keyboard button %d at frame %d.\n",
                input_test_steps[i].param_num, curr_frame);
          }
          else if (input_test_steps[i].action == INPUT_TEST_COMMAND_RELEASE_KEY)
@@ -433,7 +430,7 @@ static void test_input_poll(void *data)
             }
             input_test_steps[i].handled = true;
             RARCH_DBG(
-               "[Test input driver]: Releasing keyboard button %d at frame %d\n",
+               "[Test input] Releasing keyboard button %d at frame %d.\n",
                input_test_steps[i].param_num, curr_frame);
          }
          else if (  input_test_steps[i].action == INPUT_TEST_COMMAND_SET_SENSOR_ACC_X
@@ -455,7 +452,7 @@ static void test_input_poll(void *data)
             }
             input_test_steps[i].handled = true;
             RARCH_DBG(
-               "[Test input driver]: Setting accelerometer axis %d to %f at frame %d\n",
+               "[Test input] Setting accelerometer axis %d to %f at frame %d.\n",
                input_test_steps[i].action - INPUT_TEST_COMMAND_SET_SENSOR_ACC_X, setval, curr_frame);
          }
          else if (  input_test_steps[i].action == INPUT_TEST_COMMAND_SET_SENSOR_GYR_X
@@ -477,7 +474,7 @@ static void test_input_poll(void *data)
             }
             input_test_steps[i].handled = true;
             RARCH_DBG(
-               "[Test input driver]: Setting gyroscope axis %d to %f at frame %d\n",
+               "[Test input] Setting gyroscope axis %d to %f at frame %d.\n",
                input_test_steps[i].action - INPUT_TEST_COMMAND_SET_SENSOR_GYR_X, setval, curr_frame);
          }
          else if (input_test_steps[i].action == INPUT_TEST_COMMAND_SET_SENSOR_LUX)
@@ -486,14 +483,14 @@ static void test_input_poll(void *data)
             test_input_values.lux_sensor_state = setval;
             input_test_steps[i].handled = true;
             RARCH_DBG(
-               "[Test input driver]: Setting lux sensor to %f at frame %d\n",
+               "[Test input] Setting lux sensor to %f at frame %d.\n",
                setval, curr_frame);
          }
          else
          {
             input_test_steps[i].handled = true;
             RARCH_WARN(
-               "[Test input driver]: Unrecognized action %d in step %d, skipping\n",
+               "[Test input] Unrecognized action %d in step %d, skipping...\n",
                input_test_steps[i].action,i);
          }
       }
@@ -503,7 +500,7 @@ static void test_input_poll(void *data)
 static bool test_input_set_sensor_state(void *data, unsigned port,
       enum retro_sensor_action action, unsigned event_rate)
 {
-   RARCH_DBG("[Test input driver]: Setting sensor action %d rate %d\n",action, event_rate);
+   RARCH_DBG("[Test input] Setting sensor action %d rate %d.\n", action, event_rate);
    return true;
 }
 
@@ -553,5 +550,7 @@ input_driver_t input_test = {
    "test",
    NULL,                         /* grab_mouse */
    NULL,
-   NULL
+   NULL,
+   NULL,                         /* survives_video */
+   test_keys_down
 };

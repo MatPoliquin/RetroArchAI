@@ -1,0 +1,3019 @@
+name: CI Linux samples/gfx
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  metal-frame-lease:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APT_PKGS: clang libgnustep-base-dev libblocksruntime-dev ffmpeg
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Strict C89 geometry with Clang
+        run: CC=clang python3 samples/gfx/metal_frame/run.py
+      - name: VideoToolbox HEVC parameter ownership and session setup
+        run: |
+          python3 samples/gfx/videotoolbox_hevc/codec_fixtures.py --verify
+          python3 samples/gfx/videotoolbox_hevc/hdr_codec_fixtures.py --verify
+          python3 samples/gfx/videotoolbox_hevc/sequence_fixtures.py --verify
+          CC=clang python3 samples/gfx/videotoolbox_hevc/run.py --apple-limits
+          python3 samples/gfx/videotoolbox_hevc/run.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/videotoolbox_hevc/run.py
+          python3 samples/gfx/videotoolbox_hevc/run.py --threadless
+          CFLAGS='-DRETRO_ATOMIC_FORCE_VOLATILE -DRETRO_ATOMIC_SUPPRESS_WARNING' python3 samples/gfx/videotoolbox_hevc/run.py
+          TSAN_OPTIONS=halt_on_error=1 CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' RUNNER="setarch $(uname -m) -R" python3 samples/gfx/videotoolbox_hevc/run.py
+      - name: VideoToolbox VP9 lifecycle and retained renderer snapshots
+        run: |
+          for compiler in gcc clang; do
+            CC="$compiler" make -C samples/gfx/videotoolbox_vp9 clean check SANITIZER=address,undefined
+          done
+          TSAN_OPTIONS=halt_on_error=1 CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' RUNNER="setarch $(uname -m) -R" python3 samples/gfx/videotoolbox_vp9/run.py
+
+      - name: Native recording reinit ownership
+        run: |
+          make -C samples/record/gpu_reinit check CC=gcc SANITIZER=address,undefined
+          make -C samples/record/gpu_reinit clean
+          make -C samples/record/gpu_reinit check CC=clang SANITIZER=address,undefined
+      - name: HEVC software and hardware sequencing regression
+        working-directory: libretro-common/samples/formats/h265
+        run: |
+          make -j2 all SANITIZER=address,undefined
+          ./rh265_malformed_test
+          ./rh265_weight_test
+          ./rh265_lossless_test
+          ./rh265_lossless_test_nothreads
+          ./rh265_lossless_test_volatile
+      - name: Retained Metal lease ownership and completion
+        run: python3 samples/gfx/metal_frame/run.py --mock
+
+  video-thread-state:
+    name: The video thread reads its snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Tree check
+        shell: bash
+        run: |
+          set -eu
+          # The main thread builds a video_frame_info_t and hands it
+          # over; a driver that reaches back into config_get_ptr() from
+          # frame() or present_last() reads settings the main thread
+          # may be writing. TSan found one of those in the null driver
+          # rather than anyone noticing it by reading, so this looks
+          # for the rest: it walks what those two entry points call
+          # and fails on live-state access it can reach. The drivers
+          # for platforms with no video thread are listed in the
+          # checker with that reason, and the list has to shrink when
+          # one of them stops doing it.
+          tools/check.sh tools/video_thread_state_check.c
+
+  drm-vkms-live:
+    name: The DRM driver on a real kernel (vkms)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APT_PKGS: libdrm-dev qemu-system-x86 busybox-static zstd cpio
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      # The kernel the VM boots: Ubuntu's current HWE kernel, fetched
+      # once per version rather than every run
+      - name: Kernel version
+        id: kernel
+        run: echo "kver=$(sh samples/gfx/drm_vkms_live/run_vm.sh --kernel-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore kernel
+        id: kernel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: samples/gfx/drm_vkms_live/.kernel
+          key: vkms-kernel-${{ steps.kernel.outputs.kver }}
+
+      - name: Build and run drm_vkms_live_test in a VM
+        shell: bash
+        working-directory: samples/gfx/drm_vkms_live
+        run: |
+          set -eu
+          # gfx/drivers/drm_gfx.c against the kernel itself: Ubuntu's
+          # current HWE kernel boots in qemu with vkms, its overlay
+          # planes and its writeback connector, and what the CRTC
+          # composes is read back and compared with the frame - as it
+          # is, turned each way, scanned out of the threaded wrapper's
+          # frame memory, flipped without vsync, under the input overlay
+          # on a plane of its own, at a CRT modeline, and in RGB565 -
+          # and with the screenshot readback. The fake kernel in
+          # drm_surface_lifetime cannot say what a kernel refuses: a
+          # turn set on its own, outside the commit that places the
+          # plane, was refused here.
+          make SANITIZER=address,undefined
+          make check SANITIZER=address,undefined
+
+      - name: Save kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: samples/gfx/drm_vkms_live/.kernel
+          key: vkms-kernel-${{ steps.kernel.outputs.kver }}
+
+  surface-requirements:
+    name: Producers ask the surface layer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Self-test
+        shell: bash
+        run: |
+          set -eu
+          # A producer outside the allowlist that reads the video flags
+          # directly must be caught, and so must an entry whose file has
+          # stopped reading them - the second is what makes the list
+          # shrink as producers migrate instead of sitting there.
+          tools/check.sh tools/surface_requirements_check.c --selftest
+
+      - name: Tree check
+        shell: bash
+        run: |
+          set -eu
+          # What a producer should emit is the surface layer's answer
+          # (gfx_surface_query_requirements), so a decoder has one place
+          # to ask rather than three unrelated flags to know about. The
+          # files still asking directly are listed in the checker and
+          # are migrated one at a time; a new one may not join them.
+          tools/check.sh tools/surface_requirements_check.c
+
+      - name: texture_image request check
+        shell: bash
+        run: |
+          set -eu
+          # image_texture_load reads pix10 as the caller's request for a
+          # 10-bit decode, so a stack image filled field by field asks for
+          # whatever the stack held and a 16-bit PNG comes back as packed
+          # 10-bit words now and then. Every loaded image has its request
+          # set first; the self-test proves an unset one is caught.
+          tools/check.sh tools/texture_image_init_check.c --selftest
+          tools/check.sh tools/texture_image_init_check.c
+
+  vulkan-swapchain-extent:
+    name: Android Vulkan orientation extents
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Regression test
+        run: make -C samples/gfx/vulkan_swapchain_extent check
+
+  vulkan-driver-pacing:
+    name: Vulkan driver pacing backend (fake VK_NV_low_latency2 and NVAPI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APT_PKGS: gcc-mingw-w64-x86-64 wine64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Regression test
+        run: |
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The mode and sleep state machine of the Driver Pacing
+          # backend, on fake entry points: one sleep and one bounded
+          # wait a content frame, markers on the released frame only,
+          # a replaced swapchain starting over, errors falling back.
+          make -C samples/gfx/vulkan_driver_pacing check
+          make -C samples/gfx/vulkan_driver_pacing clean
+          make -C samples/gfx/vulkan_driver_pacing SANITIZER=address,undefined check
+          make -C samples/gfx/vulkan_driver_pacing clean
+          # Windows: presenting through DXGI, the mode, sleep and
+          # markers go through NVAPI (a stand-in nvapi64.dll)
+          make -C samples/gfx/vulkan_driver_pacing CC=x86_64-w64-mingw32-gcc RUNNER=wine check
+          make -C samples/gfx/vulkan_driver_pacing clean
+
+  vulkan-upscaler:
+    name: Vulkan temporal upscaler glue (lavapipe, stand-in NGX, FSR and XeSS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APT_PKGS: libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers gcc-mingw-w64-x86-64 wine64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Regression test
+        run: |
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # gfx/common/vulkan_ngx.c, vulkan_ffx.c, vulkan_xess.c, the
+          # dispatch of vulkan_upscaler.c and gfx/video_upscaler.c on
+          # lavapipe under the validation layer, against stand-in NGX,
+          # FidelityFX API and XeSS libraries: the session, the core's
+          # request, a frame's feature and dispatch parameters, resizes
+          # retiring the old output, refused frames, teardown.
+          make -C samples/gfx/vulkan_upscaler check
+          make -C samples/gfx/vulkan_upscaler clean
+          make -C samples/gfx/vulkan_upscaler SANITIZER=address,undefined check
+          make -C samples/gfx/vulkan_upscaler clean
+          # Windows: the same glue built with mingw; Wine has no Vulkan
+          # device here, so the run only proves the build and the skip
+          make -C samples/gfx/vulkan_upscaler CC=x86_64-w64-mingw32-gcc RUNNER=wine check
+          make -C samples/gfx/vulkan_upscaler clean
+
+  d3d12-upscaler:
+    name: Direct3D 12 temporal upscaler glue (Wine vkd3d on lavapipe, stand-in NGX, FSR and XeSS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APT_PKGS: gcc-mingw-w64-x86-64 wine64 xvfb xauth mesa-vulkan-drivers libvulkan1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Regression test
+        run: |
+          # gfx/common/d3d12_ngx.c, d3d12_ffx.c, d3d12_xess.c, the
+          # dispatch of d3d12_upscaler.c and gfx/video_upscaler.c,
+          # cross-built with mingw, on Wine's D3D12 (vkd3d over
+          # lavapipe, which wants a display) against stand-in NGX,
+          # FidelityFX API and XeSS libraries: the session, the core's
+          # request, a frame's feature and dispatch on the frame's list
+          # with the output read back, resizes retiring the old output,
+          # refused frames, teardown.
+          export WINEPREFIX="$RUNNER_TEMP/d3d12-upscaler-wine"
+          export WINEDEBUG=-all
+          make -C samples/gfx/d3d12_upscaler
+          timeout 180 xvfb-run -a bash -c '
+            set -eu
+            . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+            for pass in 1 2; do
+              make -C samples/gfx/d3d12_upscaler check
+            done
+          '
+          make -C samples/gfx/d3d12_upscaler clean
+
+  slang-rect:
+    name: Presets read frames where they lie
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      APT_PKGS: build-essential libegl-dev libgl-dev libegl-mesa0 libgl1-mesa-dri libspirv-cross-c-shared-dev gcc-mingw-w64-x86-64 wine64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Build and run slang_rect_test (ASan + UBSan, llvmpipe)
+        shell: bash
+        working-directory: samples/gfx/slang_rect
+        run: |
+          set -eu
+          # gfx/drivers_shader/slang_rect.c rewrites a preset's stage
+          # to read its frame inside a larger texture. Each test shader,
+          # sampled each way, comes back rewritten, left alone or
+          # refused as it should and cross-compiles; and drawn by Mesa,
+          # every rewritten stage reads the frame bit for bit as the
+          # stage it was reads a texture of its own.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 600 make check CHECK_ARGS=--require-gl
+          make clean
+
+      - name: Build and run rslc_remap_test (ASan + UBSan, llvmpipe)
+        shell: bash
+        working-directory: samples/gfx/rslc_remap
+        run: |
+          set -eu
+          # rslc's frame-rectangle remap, which rewrites a stage in the
+          # compiler for every destination: each test shader of
+          # ../slang_rect, sampled each way, comes back as slang_rect.c
+          # says of rslc's own module, prints as GLSL, GLSL ES, HLSL and
+          # MSL, places the rectangle past both stages' blocks, fails
+          # cleanly out of memory; and drawn by Mesa from rslc's GLSL,
+          # every rewritten stage reads the frame bit for bit as the
+          # stage it was reads a texture of its own.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 600 make check CHECK_ARGS=--require-gl
+          make clean
+
+      - name: Build and run rslc_remap_test (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/rslc_remap
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          WINEDEBUG=-all timeout 300 wine ./rslc_remap_test.exe
+          make clean
+
+  slang-last-pass-target:
+    name: Last shader pass renders to the backbuffer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      APT_PKGS: build-essential libgl-dev gcc-mingw-w64-x86-64 wine64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Build and run slang_hlsl_backend_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/slang_hlsl_backend
+        run: |
+          set -eu
+          # The real slang_process(): rslc hands a pass back as HLSL for
+          # the Direct3D 10/11/12 drivers, and a preset's simulated
+          # SourceSize reaches the first pass only, from
+          # storage that outlives the semantics the D3D drivers copy.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 300 make check SANITIZER=address,undefined
+          make clean
+
+      - name: Build and run slang_last_pass_target_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/slang_last_pass_target
+        run: |
+          set -eu
+          # The Vulkan and glcore slang chains give a preset's last pass
+          # a render target and a hidden copy to the backbuffer only when
+          # scale/format or compiled feedback requires it: viewport at 1.0
+          # renders direct; other scales, a preset or shader format, and
+          # a read of the last pass's feedback keep the target.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 60 make check
+          make clean
+
+      - name: Build and run slang_last_pass_target_test (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/slang_last_pass_target
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -Wl,--gc-sections"
+          WINEDEBUG=-all timeout 300 wine ./slang_last_pass_target_test.exe
+          make clean
+
+      - name: Build and run shader_chain_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/shader_chain
+        run: |
+          set -eu
+          # The blob table: a .slang two passes name compiles once, and
+          # a chain built while the one it replaces is alive compiles
+          # only the passes the live chain does not have.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 120 make check
+          make clean
+
+      - name: Build and run shader_chain_test (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/shader_chain
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS="-static"
+          WINEDEBUG=-all timeout 300 wine ./shader_chain_test.exe
+          make clean
+
+      - name: Build and run gl2/gl3 last_pass_fbo tests (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/gl_last_pass_fbo
+        run: |
+          set -eu
+          # The GLSL/Cg render chains of gfx/drivers/gl2.c and gl3.c
+          # against a scripted GL and shader backend: the last pass gets
+          # an FBO only for a scale other than viewport at 1.0, an FBO
+          # format, or the feedback the preset asks of it; a one-pass
+          # preset that needs none is drawn with none.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 60 make check
+          make clean
+
+      - name: Build and run gl2/gl3 last_pass_fbo tests (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/gl_last_pass_fbo
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          WINEDEBUG=-all timeout 300 wine ./gl2_last_pass_fbo_test.exe
+          WINEDEBUG=-all timeout 300 wine ./gl3_last_pass_fbo_test.exe
+          make clean
+
+      - name: GLES texture loan capability and ownership (mingw-w64, Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CC=x86_64-w64-mingw32-gcc RUNNER="wine" WINEDEBUG=-all \
+             python3 samples/gfx/gles_texture_lend/run.py
+
+      - name: Build and run gl2_pbo_readback_test (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/gl2_pbo_readback
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The Linux runs are in the samples-gfx job; this is the
+          # Windows build, the GL 1.1 entry points through import
+          # pointers (gl11_fakes.h).
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          WINEDEBUG=-all timeout 300 wine ./gl2_pbo_readback_test.exe
+          make clean
+
+      - name: Build and run d3d9 last_pass tests (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/d3d9_last_pass
+        run: |
+          set -eu
+          # The preset setup of gfx/drivers/d3d9hlsl.c and d3d9cg.c: a
+          # stock pass is appended after the last pass only for a scale
+          # other than viewport at 1.0 or a floating-point target.
+          # Direct3D 9 is Windows-only, so these run under Wine alone.
+          make clean && make -j$(nproc) all
+          timeout 300 make check
+          make clean
+
+      - name: Build and run the d3d9 software framebuffer loan test (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/d3d9_sw_fb
+        run: |
+          set -eu
+          # GET_CURRENT_SOFTWARE_FRAMEBUFFER on the D3D9 drivers: the frame
+          # texture lent locked, read out of without a copy, a cropped
+          # window moved to its corner, and the texture holding the cached
+          # frame kept alive until it is retired.
+          make clean && make all
+          timeout 300 make check
+          make clean
+
+      - name: Build and run d3d9 menu vertex ring tests (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/d3d9_menu_ring
+        run: |
+          set -eu
+          # Each D3D9 driver's display draw against a stand-in device: the
+          # menu's vertex ring is dynamic, starts over with DISCARD and
+          # never rewrites a vertex a pending draw reads (d3d9_cg's did,
+          # and drew whole-screen triangles while a notification was up).
+          make clean && make -j$(nproc) all
+          timeout 300 make check
+          make clean
+
+  samples-gfx:
+    name: Build and run samples/gfx
+    runs-on: ubuntu-latest
+    # gfx_thumbnail_preview runs as its own job (thumbnail-preview):
+    # at 5-9 min it was the longest step here, and with package
+    # installation on a slow runner it took the job past 30 min.
+    timeout-minutes: 30
+    env:
+      APT_PKGS: build-essential libx11-dev libxrandr-dev libdrm-dev xserver-xorg-core xserver-xorg-video-dummy x11-xserver-utils libsdl2-dev libxinerama-dev libwayland-dev libegl-dev libgles-dev libgbm-dev gcc-mingw-w64-x86-64 wine64 openbox cmake ninja-build ccache libgl-dev xvfb libdbus-1-dev dbus python3-dbus python3-gi weston xwayland mutter libvkd3d1 mesa-vulkan-drivers fonts-dejavu-core fonts-dejavu-mono
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Video modeline engine goldens and C89 lane
+        shell: bash
+        run: |
+          set -eu
+          # The engine in gfx/modeline/ replaced the SwitchRes 2.2.1
+          # library; tools/modeline_gold.ref is the reference output of
+          # the same matrix run through that library. The scoring and
+          # timing arithmetic are compared bit-for-bit: any drift in
+          # modeline_create/compare/adjust, the presets or the list
+          # logic shows up here as a diff rather than as a CRT that
+          # loses sync in the field.
+          C89="-std=c89 -ansi -pedantic -Werror=pedantic -Wno-long-long"
+          C89="$C89 -Werror=declaration-after-statement -Wno-variadic-macros"
+          C89="$C89 -D_GNU_SOURCE"
+          INC="-Ilibretro-common/include -I. -Ideps"
+          # Binaries and outputs go to a scratch dir, never the tree.
+          T=$(mktemp -d)
+          gcc $C89 $INC tools/modeline_gold.c \
+             libretro-common/compat/compat_strl.c -lm -o "$T/modeline_gold"
+          "$T/modeline_gold" > "$T/modeline_gold.out"
+          diff -u tools/modeline_gold.ref "$T/modeline_gold.out"
+          echo "[pass] modeline goldens (C89)"
+          gcc -g1 -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+             -std=gnu89 -D_GNU_SOURCE $INC tools/modeline_gold.c \
+             libretro-common/compat/compat_strl.c -lm -o "$T/modeline_gold_san"
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             "$T/modeline_gold_san" > "$T/modeline_gold_san.out"
+          diff -u tools/modeline_gold.ref "$T/modeline_gold_san.out"
+          echo "[pass] modeline goldens (ASan/UBSan)"
+          rm -rf "$T"
+          # The consumer and the X11 apply path are C89 too; the
+          # full C89_BUILD covers them only after a complete build.
+          DEF="-DRARCH_INTERNAL -DHAVE_THREADS -DHAVE_MENU -DHAVE_MODELINE"
+          DEF="$DEF -DHAVE_X11 -DHAVE_XRANDR -DHAVE_CONFIGFILE -DHAVE_DYNAMIC"
+          for f in gfx/modeline/modeline_core.c \
+                   gfx/modeline/modeline_monitor.c \
+                   gfx/modeline/modeline_list.c \
+                   gfx/modeline/modeline_ini.c \
+                   gfx/video_crt_switch.c \
+                   gfx/display_servers/dispserv_x11.c; do
+             gcc $C89 $INC $DEF -c "$f" -o /dev/null
+          done
+          echo "[pass] modeline C89 syntax check"
+
+      - name: Atomic backend portability of the gfx sources
+        shell: bash
+        run: |
+          set -eu
+          # The gfx sources that use retro_atomic.h have to build on
+          # every backend, not just the one this host selects.  The
+          # extended operations (exchange, CAS, the pointer ops) are
+          # offered only where a backend can express them, so a caller
+          # that uses one without gating on it builds here and breaks
+          # on whichever console lands elsewhere; the counters have to
+          # stay warning-clean as statements, which an expression-form
+          # fetch_add is not.  Both have reached a console lane before
+          # this one, hence -Werror.
+          INC="-Ilibretro-common/include -I. -Ideps"
+          DEF="-DRARCH_INTERNAL -DHAVE_THREADS -DHAVE_MENU -DHAVE_RGUI"
+          DEF="$DEF -DHAVE_CONFIGFILE -DHAVE_CHEATS -D_GNU_SOURCE"
+          DEF="$DEF -DRETRO_ATOMIC_SUPPRESS_WARNING"
+          # The PS2 backend needs ps2sdk's <kernel.h>; the sample under
+          # libretro-common/samples/atomic carries a stand-in for it.
+          PS2STUB="libretro-common/samples/atomic/retro_atomic_ps2_backend"
+          for backend in C11 GCC_NEW SYNC PS2 VOLATILE; do
+             EXTRA=""
+             if [ "$backend" = "PS2" ]; then EXTRA="-I$PS2STUB/ps2stub"; fi
+             for f in gfx/video_thread_wrapper.c \
+                      gfx/font_driver.c \
+                      gfx/gfx_thumbnail.c \
+                      libretro-common/formats/video_player.c \
+                      libretro-common/queues/task_queue.c; do
+                gcc -std=gnu99 -O2 -Wall -Werror $INC $EXTRA $DEF \
+                   "-DRETRO_ATOMIC_FORCE_$backend" -c "$f" -o /dev/null
+             done
+             gcc -std=gnu99 -O2 -Wall -Werror $INC $EXTRA $DEF \
+                -DHAVE_GFX_WIDGETS "-DRETRO_ATOMIC_FORCE_$backend" \
+                -c gfx/gfx_widgets.c -o /dev/null
+             # The Vulkan driver, from the Khronos headers the tree carries
+             gcc -std=gnu99 -O2 -Wall -Werror $INC -Igfx/include $EXTRA $DEF \
+                -DHAVE_VULKAN "-DRETRO_ATOMIC_FORCE_$backend" \
+                -c gfx/drivers/vulkan.c -o /dev/null
+             echo "[pass] RETRO_ATOMIC_FORCE_$backend"
+          done
+          echo "[pass] atomic backend portability"
+
+      - name: Build and run vulkan_extension_count_test (ASan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_extension_count
+        run: |
+          set -eu
+          # Regression test for the heap-overflow fix in
+          # gfx/common/vulkan_common.c::vulkan_find_device_extensions.
+          # Pre-fix the function appended the required-extension list
+          # twice -- once via memcpy at the top of the body, then
+          # again in a per-element loop -- consuming
+          # (count_initial + 2*num_required + num_optional) slots in
+          # the caller's buffer.  vulkan_context_create_device_wrapper
+          # sized its malloc for (count_initial + num_required +
+          # num_optional) entries, so a libretro core using the Vulkan
+          # HW context-negotiation interface against a GPU exposing at
+          # least one optional extension hit a one-element heap-buffer-
+          # overflow (8 bytes on 64-bit) at the end of the malloc'd
+          # block.  Build under AddressSanitizer so any reintroduction
+          # of the duplicate write is caught at the bounds level.  If
+          # vulkan_common.c amends the append-to-enabled[] block, the
+          # verbatim copy in vulkan_extension_count_test.c must follow.
+          make clean SANITIZER=address && make -j$(nproc) all SANITIZER=address
+          test -x vulkan_extension_count_test
+          timeout 60 ./vulkan_extension_count_test
+          echo "[pass] vulkan_extension_count_test"
+
+      - name: Build and run video_views_test (ASan+UBSan)
+        shell: bash
+        working-directory: samples/gfx/video_views
+        run: |
+          set -eu
+          # gfx/video_views.c decides which rectangle of the core's
+          # frame lands where, and maps touch back through that layout.
+          # Pure logic, so every mode and edge case runs here.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x video_views_test
+          timeout 60 ./video_views_test
+          echo "[pass] video_views_test"
+
+      - name: Build and run video_windows_test (ASan+UBSan)
+        shell: bash
+        working-directory: samples/gfx/video_windows
+        run: |
+          set -eu
+          make clean all SANITIZER=address,undefined
+          timeout 60 ./video_windows_test
+          echo "[pass] video_windows_test"
+
+      - name: Build and run video_xr_test (ASan+UBSan)
+        shell: bash
+        working-directory: samples/gfx/video_xr
+        run: |
+          set -eu
+          # gfx/video_xr.c places a core's screens in a headset, sizes
+          # their images and maps a pointer on them back to the frame.
+          # Pure maths, so every layout and edge runs here.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x video_xr_test
+          timeout 60 ./video_xr_test
+          echo "[pass] video_xr_test"
+
+      - name: Build and run vulkan_swapchain_clamp_test (ASan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_swapchain_clamp
+        run: |
+          set -eu
+          # Regression test for the unclamped-swapchain-image-count
+          # fix in gfx/common/vulkan_common.c::vulkan_create_swapchain.
+          # Pre-fix the two vkGetSwapchainImagesKHR calls (count
+          # query + image fill) had no clamp between them, so a driver
+          # returning more than VULKAN_MAX_SWAPCHAIN_IMAGES (16) images
+          # on the second call wrote past context.swapchain_images[16]
+          # and every loop bounded by num_swapchain_images walked past
+          # its compile-time-sized companion array (~12 such loops
+          # across init/deinit/textures/buffers/descriptor pools/
+          # command buffers/readback and direct vk->swapchain[i]
+          # uses).  Build under AddressSanitizer so any reintroduction
+          # of either the request-side or the post-create clamp is
+          # caught at the bounds level.  If vulkan_common.c amends
+          # the cap or the post-create clamp, the verbatim copies in
+          # vulkan_swapchain_clamp_test.c must follow.
+          make clean SANITIZER=address && make -j$(nproc) all SANITIZER=address
+          test -x vulkan_swapchain_clamp_test
+          timeout 60 ./vulkan_swapchain_clamp_test
+          echo "[pass] vulkan_swapchain_clamp_test"
+
+      - name: Build and run vulkan_output_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_output
+        run: |
+          set -eu
+          # The second output's swapchain (vulkan_output_* in
+          # gfx/common/vulkan_common.c), the real code against a fake
+          # device: nothing it does in a frame waits, and nothing is
+          # destroyed before the fence that covers it.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x vulkan_output_test
+          timeout 60 ./vulkan_output_test
+          echo "[pass] vulkan_output_test"
+
+      - name: Build and run vulkan_chain_alloc_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_chain_alloc
+        run: |
+          set -eu
+          # gfx/drivers_shader/shader_vulkan.c's filter chain creation,
+          # Vulkan through the symbol wrapper pointed at mocks, with
+          # each allocation it makes failed in turn: a chain comes back
+          # with every pass and every deferred-disposal queue, or not
+          # at all, and nothing is left behind.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./vulkan_chain_alloc_test
+          make clean
+          echo "[pass] vulkan_chain_alloc_test"
+
+      - name: Build and run vulkan_texture_size_test (ASan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_texture_size
+        run: |
+          set -eu
+          # Regression test for the 32-bit-overflow fix in
+          # gfx/drivers/vulkan.c::vulkan_create_texture's staging-
+          # buffer sizing.  Pre-fix the buffer_info.size calculation
+          # (buffer_width * height) was unsigned*unsigned in 32-bit
+          # before being widened to VkDeviceSize on assignment.  With
+          # dimensions large enough to wrap (e.g. 65536x16385x4 ->
+          # 0x1_0004_0000 truncates to 0x40000), the staging buffer
+          # was malloc'd at the wrapped (small) size while the per-row
+          # upload memcpy loop walked the full width x height,
+          # writing past the mapped region into adjacent heap memory.
+          # Reachable from libretro cores supplying oversized
+          # retro_framebuffer dimensions and from vulkan_load_texture
+          # / vulkan_set_texture_frame.  Build under AddressSanitizer
+          # so any reintroduction of the 32-bit arithmetic is caught
+          # at the bounds level.  If vulkan.c amends the size
+          # calculation or upload-loop strides, the verbatim copies
+          # in vulkan_texture_size_test.c must follow.
+          make clean SANITIZER=address && make -j$(nproc) all SANITIZER=address
+          test -x vulkan_texture_size_test
+          timeout 60 ./vulkan_texture_size_test
+          echo "[pass] vulkan_texture_size_test"
+
+      - name: GLES persistent loan pixel oracle (Mesa EGL)
+        shell: bash
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          cc -std=gnu89 -O1 -g1 -Wall -Werror=implicit-function-declaration \
+             -DHAVE_OPENGLES -DHAVE_OPENGLES3 -DHAVE_EGL \
+             -Ilibretro-common/include -Igfx/include \
+             samples/gfx/gles_texture_lend/gpu_test.c gfx/common/gl_common.c \
+             libretro-common/glsym/glsym_es3.c libretro-common/glsym/rglgen.c \
+             -lEGL -lGLESv2 -o "$T/gles_lend"
+          EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 "$T/gles_lend"
+          rm -rf "$T"
+
+      - name: GLES texture loan capability and ownership (ASan + UBSan)
+        shell: bash
+        run: |
+          set -eu
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+             ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+             python3 samples/gfx/gles_texture_lend/run.py
+
+      - name: Build and run gl2_pbo_readback_test (plain, ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/gl2_pbo_readback
+        run: |
+          set -eu
+          # gfx/drivers/gl2.c's PBO readback ring against a scripted
+          # GL: a slot is read only once the fence placed after its
+          # readback has signalled, and never waited on in the map. A
+          # read that maps a pending slot, waits in glClientWaitSync
+          # or calls glFinish fails the run; teardown must delete
+          # every fence it issued.
+          make clean check
+          echo "[pass] gl2_pbo_readback_test"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./gl2_pbo_readback_test
+          echo "[pass] gl2_pbo_readback_test (ASan)"
+
+      - name: HDR display metadata contract (ASan/UBSan)
+        shell: bash
+        working-directory: samples/gfx/hdr_metadata
+        run: |
+          set -eu
+          make clean
+          make check SANITIZER=address,undefined
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 run.py
+          CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' python3 run.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 ownership.py
+
+      - name: Menu framebuffer loans (ASan/UBSan, TSan)
+        shell: bash
+        run: |
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/menu_framebuffer.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/vulkan_menu.py
+          CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/menu_framebuffer.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/lend_refresh.py
+          CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/lend_refresh.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/lend_refresh.py
+
+      - name: D3D Slang HDR and SwapCount bindings (ASan/UBSan)
+        shell: bash
+        working-directory: samples/gfx/slang_hdr_bindings
+        run: |
+          set -eu
+          # Compile both loaders' actual uniform maps from
+          # gfx/drivers/d3d10.c, gfx/drivers/d3d11.c and gfx/drivers/d3d12.c.
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 run.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 output_state.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 peak.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 min_nits.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 tonemap_operator.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 source_hdr.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 passthrough.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 ../hdr_metadata/framebuffer_format.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 metal.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 metal_constants.py
+
+      - name: Build and run slang_texture_index_bounds_test (ASan)
+        shell: bash
+        working-directory: samples/gfx/slang_texture_index_bounds
+        run: |
+          set -eu
+          # Regression test for the texture-semantic index-bounds
+          # fix in gfx/drivers_shader/slang_process.cpp::
+          # validate_texture_semantic_index().  Pre-fix only
+          # SLANG_TEXTURE_SEMANTIC_PASS_OUTPUT was bounded against
+          # reflection->pass_number; ORIGINAL_HISTORY, PASS_FEEDBACK
+          # and USER had no upper bound on their array index.  The
+          # index suffix in arrayed semantic names like
+          # `OriginalHistory42` is parsed via strtoul in
+          # slang_name_to_texture_semantic_array() and propagates
+          # into the downstream resize_minimum() calls in
+          # set_ubo_texture_offset() and the direct sampler-binding
+          # loop.  A malicious slang shader declaring
+          # `OriginalHistory4294967294` makes std::vector::resize
+          # request ~128 GiB, throwing std::bad_alloc which
+          # propagates unhandled out of the filter-chain create
+          # path, terminating the process.  Reachable from any
+          # malicious slang preset (downloaded via Online Updater
+          # or shipped third-party).  Build under AddressSanitizer
+          # so any reintroduction is caught at the bounds level.
+          # If slang_process.cpp amends the cap table or the
+          # dispatch structure, the verbatim copy in
+          # slang_texture_index_bounds_test.c must follow.
+          make clean SANITIZER=address && make -j$(nproc) all SANITIZER=address
+          test -x slang_texture_index_bounds_test
+          timeout 60 ./slang_texture_index_bounds_test
+          echo "[pass] slang_texture_index_bounds_test"
+
+      - name: Build and run shader_dir_cycle_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/shader_dir_cycle
+        run: |
+          set -eu
+          # Which folder the Next/Previous Shader hotkeys cycle, over a
+          # shader tree built on disk, with gfx/video_shader_parse.c
+          # compiled for real and only the frontend stubbed.
+          #
+          # The folder is chosen from the loaded preset, and the cases
+          # that decide it are all shapes the menu itself writes:
+          # retroarch.slangp and the core auto preset are simple
+          # presets (#reference), so they stand in for what they point
+          # at, while a preset the user loaded as itself anchors where
+          # it sits however it is written - "Save Preset As" emits a
+          # #reference too, and following those would cycle a preset's
+          # source folder instead of the folder it was saved into.
+          #
+          # Two orderings are what this pins.  Following a reference
+          # one hop further than the wrapper puts the cycling in a
+          # folder the user never loaded from; and re-deriving the
+          # anchor from a preset the hotkey itself just applied walks
+          # back to whatever that preset references, so an entry that
+          # is a simple preset traps the cycling on the pair forever.
+          # The setting is also toggled mid-run: the list is built
+          # under one value and must be dropped when it changes, or
+          # turning it on never leaves the root it was cycling.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x shader_dir_cycle_test
+          # The tree is built under a scratch dir, never in the repo.
+          T=$(mktemp -d)
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./shader_dir_cycle_test "$T"
+          rm -rf "${T:?}"
+          echo "[pass] shader_dir_cycle_test"
+
+      - name: Build and run vulkan_mailbox_init_leak_test (ASan + LSan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_mailbox_init_leak
+        run: |
+          set -eu
+          # Regression test for the partial-init leak fix in
+          # gfx/common/vulkan_common.c::vulkan_emulated_mailbox_init.
+          # The function brings up three things in sequence (two
+          # eventcounts and the acquire thread; a condition variable,
+          # a mutex and the thread when this was written) and used to
+          # return `false` directly when the second or third failed,
+          # leaking what the earlier ones had allocated.  Both
+          # production call sites in vulkan_create_swapchain ignore
+          # the return value, so an init failure also left the
+          # mailbox half built while VK_DATA_FLAG_EMULATING_MAILBOX
+          # was still set, setting up a crash the next time
+          # vulkan_acquire_next_image routed into the emulated path.
+          # Fix routes every early failure through `goto error` to a
+          # single deinit call, which is safe on a partly built
+          # mailbox and ends with a memset, leaving the struct in the
+          # same shape the deinit-on-shutdown path produces and
+          # tripping the existing `mailbox.swapchain == VK_NULL_
+          # HANDLE` guard at vulkan_acquire_next_image.  Build under
+          # AddressSanitizer with leak detection so any
+          # reintroduction is caught at the leak level.  If
+          # vulkan_common.c amends the init or deinit, the verbatim
+          # copies in vulkan_mailbox_init_leak_test.c must follow.
+          make clean SANITIZER=address && make -j$(nproc) all SANITIZER=address
+          test -x vulkan_mailbox_init_leak_test
+          ASAN_OPTIONS=detect_leaks=1 timeout 60 \
+             ./vulkan_mailbox_init_leak_test
+          echo "[pass] vulkan_mailbox_init_leak_test"
+
+      - name: Build and run vulkan_ctx_double_free_test (ASan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_ctx_double_free
+        run: |
+          set -eu
+          # Regression test for the double-free / use-after-free
+          # fix in the Vulkan context drivers' set_video_mode error
+          # paths: gfx/drivers_context/wayland_vk_ctx.c,
+          # w_vk_ctx.c, x_vk_ctx.c.  Pre-fix each set_video_mode
+          # called its own destroy()/destroy_resources()+free() on
+          # ctx_data before returning false; the caller in
+          # gfx/drivers/vulkan.c::vulkan_init then ran
+          # vulkan_free()->ctx_driver->destroy(ctx_data) on the
+          # already-freed pointer (UAF read of struct fields, then
+          # a second free of the same allocation).  Reachable from
+          # vulkan_surface_create() failure (missing extension /
+          # driver issue), Wayland's set_video_mode_common_*
+          # helpers failing, X11's XGetVisualInfo returning NULL,
+          # or win32_set_video_mode failing.  Cocoa (cocoa_vk_ctx)
+          # and Android (android_vk_ctx) already handle this
+          # correctly by returning false without freeing -- the
+          # fix makes Wayland/Win32/X11 match.  Build under
+          # AddressSanitizer so any reintroduction is caught at
+          # the bounds level (UAF + double-free both fire).  If
+          # any of the three context drivers amends the
+          # set_video_mode error path to once again destroy
+          # ctx_data, the verbatim copy in
+          # vulkan_ctx_double_free_test.c must follow.
+          make clean SANITIZER=address && make -j$(nproc) all SANITIZER=address
+          test -x vulkan_ctx_double_free_test
+          timeout 60 ./vulkan_ctx_double_free_test
+          echo "[pass] vulkan_ctx_double_free_test"
+
+      - name: Build and run gfx_thumbnail_status_atomic_test (TSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_thumbnail_status_atomic
+        run: |
+          set -eu
+          # Regression test for the cross-thread thumbnail status
+          # synchronisation in gfx/gfx_thumbnail.c.  The .status
+          # field is read by the video thread (gfx_thumbnail_draw)
+          # and written by the upload-callback thread
+          # (gfx_thumbnail_handle_upload), with a release-store /
+          # acquire-load pairing that guards the texture / width /
+          # height fields published alongside the AVAILABLE
+          # status.  Pre-port the file used a hand-rolled
+          # __atomic_* / _Interlocked / volatile shim.  Post-port
+          # the .status field is retro_atomic_int_t and the
+          # accesses route through retro_atomic_*_int macros.
+          #
+          # ThreadSanitizer is the right validator for this test:
+          # it instruments every atomic load and store and would
+          # flag a missing-barrier regression as a data race, even
+          # on x86 TSO where the hardware otherwise hides the bug.
+          # ASan/UBSan would not catch barrier removal at all
+          # (no out-of-bounds access, no UB).  The test also
+          # carries static-assertion checks that validate the
+          # struct layout invariant (.status size == sizeof(int))
+          # so the field's atomic type does not change the
+          # gfx_thumbnail_t ABI.  If gfx_thumbnail.c amends
+          # GFX_THUMB_STATUS_STORE / GFX_THUMB_STATUS_LOAD or the
+          # .status field type, the verbatim copies in
+          # gfx_thumbnail_status_atomic_test.c must follow.
+          #
+          # STRESS_ITERS is bounded here because the default of
+          # 1000000 measures ~145 s on a single core before TSan
+          # multiplies it, and this step allows 60 s.  20000 runs
+          # in ~2.4 s under TSan on one core and still routes every
+          # round trip through the instrumented release/acquire
+          # pair; the default stays at 1000000 for local soak runs.
+          make clean SANITIZER=thread EXTRA_CFLAGS="-DSTRESS_ITERS=20000" && make -j$(nproc) all SANITIZER=thread EXTRA_CFLAGS="-DSTRESS_ITERS=20000"
+          test -x gfx_thumbnail_status_atomic_test
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 \
+             ./gfx_thumbnail_status_atomic_test
+          echo "[pass] gfx_thumbnail_status_atomic_test"
+
+      - name: Build and run gfx_widgets_msg_queue_race_test (TSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_widgets_msg_queue_race
+        run: |
+          set -eu
+          # The widget message ring in gfx/gfx_widgets.c is a lock-free
+          # single-producer / single-consumer queue: the main thread
+          # publishes through msg_queue_tail, the widgets' owner pops
+          # through msg_queue_head, each cursor released by its writer
+          # and acquired by the other side, and the slot pointer rides
+          # that pairing.  The test builds the production push and pop
+          # out of gfx_widgets.c itself and drives them from one producer
+          # thread and one consumer thread, checking order, loss, and the
+          # full-ring refusal.  ThreadSanitizer is the validator that
+          # matters: a store to the slot array outside the release /
+          # acquire pairing, or a cursor published before its slot is
+          # written, is a race it reports and the value checks may not.
+          # halt_on_error=1 fails the run on the first race.
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          test -x gfx_widgets_msg_queue_race_test
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 \
+             ./gfx_widgets_msg_queue_race_test
+          echo "[pass] gfx_widgets_msg_queue_race_test"
+
+      - name: Build and run gfx_animation_sanitize_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_animation_sanitize
+        run: |
+          set -eu
+          # Regression test for the stack overflow in
+          # gfx/gfx_animation.c::gfx_animation_ticker().  Pre-fix it
+          # passed PATH_MAX_LENGTH to utf8cpy() as the destination
+          # size, in all five places it copies, regardless of what the
+          # caller had provided.  utf8cpy()'s second argument is a
+          # size in BYTES; ticker->len, which the surrounding logic
+          # uses, is a width in GLYPHS -- so the guard
+          # `str_len <= ticker->len` compared glyph counts and then
+          # copied bytes, and one glyph of CJK or emoji is three or
+          # four of them.  PATH_MAX_LENGTH is 512 and not one of the
+          # 27 call sites in tree provides that much (mostly
+          # NAME_MAX_LENGTH, 64 bytes in one RGUI case), so the
+          # function was licensed to write 511 bytes plus a
+          # terminator into any of them.  Reachable from content: RGUI
+          # sets ticker.len from term_layout.width and ticker.s to a
+          # NAME_MAX_LENGTH stack buffer, so a playlist entry with a
+          # long enough Japanese, Cyrillic or emoji title overran it.
+          # Fixed by giving the struct an s_len field carrying the
+          # destination size in bytes, mirroring the dst_str_len that
+          # gfx_animation_ticker_smooth() had all along.
+          #
+          # AddressSanitizer is the validator: the test allocates
+          # every ticker destination at exactly the length it hands
+          # over, so a single byte past the end is a report rather
+          # than a stomp on whatever followed.  It also sweeps every
+          # easing type through push/update/expire, frees animation
+          # subjects while their animation is in flight, and deinits
+          # with animations still running.  If gfx_animation.c amends
+          # the destination sizing, this goes red.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x gfx_animation_sanitize_test
+          ASAN_OPTIONS=detect_leaks=1 timeout 120 \
+             ./gfx_animation_sanitize_test
+          echo "[pass] gfx_animation_sanitize_test"
+
+
+      - name: Build and run gfx_widgets_sanitize_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_widgets_sanitize
+        run: |
+          set -eu
+          # Sanitizer sweep of gfx/gfx_widgets.c, focused on the
+          # message queue: it has the same shape as the
+          # gfx_animation ticker overflow -- a caller-supplied
+          # string, internal fixed buffers, and arithmetic that has
+          # to keep glyphs and bytes apart.  Multi-byte text,
+          # over-long text, text with no break opportunity, embedded
+          # newlines and empty strings across every message/title
+          # pairing, a 256-message overflow to drive eviction and
+          # free, and eight init/deinit cycles with messages still
+          # outstanding at teardown.
+          #
+          # Like the thumbnail sweep this pins no historical defect
+          # and is a tripwire.  Two things decide whether it sweeps
+          # anything: the font metric stubs return a non-zero
+          # proportional width (a zero-width font makes every "does
+          # this fit" test succeed and the layout paths are never
+          # entered), and gfx_widgets_init() returning false makes
+          # the whole run vacuous -- hence the asserted push and
+          # frame counters.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x gfx_widgets_sanitize_test
+          ASAN_OPTIONS=detect_leaks=1 timeout 120 \
+             ./gfx_widgets_sanitize_test
+          echo "[pass] gfx_widgets_sanitize_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 \
+             ./gfx_widgets_sanitize_test
+          echo "[pass] gfx_widgets_sanitize_test (TSan)"
+      - name: Build and run widget snapshot ownership test
+        shell: bash
+        working-directory: tests-other
+        run: |
+          set -eu
+          make -f Makefile.widget_snapshot clean
+          make -f Makefile.widget_snapshot
+          timeout 60 ./widget_snapshot_ownership_test
+          make -f Makefile.widget_snapshot clean
+
+      - name: Build and run gfx_widgets_task_bar_stack_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_widgets_task_bar_stack
+        run: |
+          set -eu
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x gfx_widgets_task_bar_stack_test
+          ASAN_OPTIONS=detect_leaks=1 timeout 120 \
+             ./gfx_widgets_task_bar_stack_test
+          echo "[pass] gfx_widgets_task_bar_stack_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 \
+             ./gfx_widgets_task_bar_stack_test
+          echo "[pass] gfx_widgets_task_bar_stack_test (TSan)"
+      - name: Build and run gfx_widgets_task_gate_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_widgets_task_gate
+        run: |
+          set -eu
+          # A finished task retires through the widgets' push while
+          # the video thread frees the widget bound to it: the task
+          # queue must not read the link the widgets clear, and a
+          # muted task's empty retirement puts nothing up.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 timeout 120 ./gfx_widgets_task_gate_test
+          echo "[pass] gfx_widgets_task_gate_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./gfx_widgets_task_gate_test
+          echo "[pass] gfx_widgets_task_gate_test (TSan)"
+      - name: Build and run load_content_icon_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_widget_load_content_animation
+        run: |
+          set -eu
+          # The load content animation started off the widgets' thread
+          # still finds and loads its icon.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 timeout 120 ./load_content_icon_test
+          echo "[pass] load_content_icon_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./load_content_icon_test
+          echo "[pass] load_content_icon_test (TSan)"
+      - name: Build and run win32_msg_route_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/win32_msg_route
+        run: |
+          set -eu
+          # What the Win32 window procedure does with a message.
+          # gfx/common/win32_common.c had twelve window procedures, one
+          # for each video family times each kind of input driver,
+          # built on three copies of one long switch. They are one
+          # procedure now, which asks win32_msg_route() what to do with
+          # a message. The three switches are written out in the test
+          # as they stood, and for every message - with and without the
+          # hotplug timer's id, on the desktop and on the Xbox, with
+          # and without threads - the route must be the steps the
+          # switch for that kind of input driver took. Raw input's
+          # keys made into keyboard events a second time, which is
+          # what routing them like another driver's would do, is put
+          # back and asserted to be caught.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./win32_msg_route_test
+          make clean
+          echo "[pass] win32_msg_route_test (ASan)"
+      - name: Build and run win32_screensaver_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/win32_screensaver
+        run: |
+          set -eu
+          # win32_suspend_screensaver() from gfx/common/win32_common.c,
+          # compiled from the shipping text against a fake kernel32
+          # that counts power requests the way Windows does.  Every
+          # video driver init asks to hold the screensaver off, so the
+          # one request must be created once and set once however
+          # often it is asked, and turning the setting off must free
+          # the display.  Before Windows 7 the thread execution state
+          # must be continuous to hold anything.
+          make clean
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             make SANITIZER=address,undefined check
+          make clean
+          echo "[pass] win32_screensaver_test (ASan)"
+      - name: Build and run win32_drag_drop_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/win32_drag_drop
+        run: |
+          set -eu
+          # Drag and drop from Windows 95 to current releases, through
+          # the setup in frontend/drivers/platform_win32.c and the drop
+          # handler in ui/drivers/ui_win32.c, compiled from the
+          # shipping text against a fake shell32, user32 and dwmapi.
+          # Drops must be switched on with or without dwmapi, DWM setup
+          # must run once, an elevated window must let the drop
+          # messages through where Windows filters them, and the files
+          # must arrive through DragQueryFileW or, where that is
+          # missing or reads nothing, DragQueryFileA.
+          make clean
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             make SANITIZER=address,undefined check
+          make clean
+          echo "[pass] win32_drag_drop_test (ASan)"
+      - name: Build and run display_servers_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/display_servers
+        run: |
+          set -eu
+          # Regression test for the XRandR query handling in
+          # gfx/display_servers/dispserv_x11.c.  Pre-fix every query
+          # was treated as infallible: XRRGetOutputInfo() returns NULL
+          # for an output the server cannot describe and
+          # info->connection was read straight off it; likewise
+          # XRRGetCrtcInfo() and crtc->width, XRRGetScreenResources(),
+          # and XRRGetScreenInfo() feeding a XRRFreeScreenConfigInfo()
+          # that is not NULL-tolerant.  On any X server advertising
+          # RandR without a usable output -- Xvfb, a headless box, a
+          # display with everything disconnected -- RetroArch died
+          # inside video_display_server_init() before drawing
+          # anything.  Both orientation walks also indexed
+          # screen->crtcs with the output's ncrtc, reading past the
+          # end and then configuring a crtc other than the one whose
+          # geometry had just been read.
+          #
+          # The test stubs libXrandr and the handful of Xlib entry
+          # points the driver reaches, so it needs the headers but no
+          # X server, no display and no RandR extension: what is under
+          # test is what happens when the queries FAIL, and a working
+          # display is exactly the environment that cannot produce
+          # that.  The stub numbers screen crtcs from 100 and output
+          # crtcs from 200 so which array was walked is read off the
+          # call log, and tracks every pointer it hands out so a
+          # double free or leak is attributed to the case that caused
+          # it.  If dispserv_x11.c amends the query handling, this
+          # goes red.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x display_servers_test
+          timeout 60 ./display_servers_test
+          echo "[pass] display_servers_test"
+
+      - name: Build and run dispserv_gx_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/dispserv_gx
+        run: |
+          set -eu
+          # The GameCube/Wii display server (dispserv_gx.c and the mode
+          # rules in dispserv_gx_modes.c), linked as they ship against
+          # stubbed libogc queries, on every TV standard: the list holds
+          # only modes the standard shows, one of them current, and each
+          # entry - through the label the menu prints and the parse the
+          # menu does - selects exactly that mode, stores its config id
+          # and reports the refresh rate it listed.
+          #
+          # The menu's parse used to run strtoul() inside
+          # VIDEO_SCALE_PUT_H, whose PACK evaluates its argument twice;
+          # the second call returned 0 and every pick from the list
+          # went out as Wx0. Guard the shape as well as the behaviour.
+          if grep -nE 'VIDEO_SCALE_(PUT_[WH]|PACK)\([^;]*strto' \
+                ../../../menu/cbs/menu_cbs_ok.c; then
+             echo "::error::strtoul inside a VIDEO_SCALE macro runs twice"
+             exit 1
+          fi
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./dispserv_gx_test
+          make clean
+
+      - name: Build and run dispserv_ps3_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/dispserv_ps3
+        run: |
+          set -eu
+          # The PS3 display server (dispserv_ps3.c and the mode rules in
+          # dispserv_ps3_modes.c), linked as they ship against stubbed
+          # PSL1GHT video output queries, for displays taking different
+          # sets of modes with the system menu in each: the list holds
+          # exactly what the display takes with the mode in use marked,
+          # each entry - through the menu's label and parse - selects
+          # that mode and reinitialises the driver once, and
+          # ps3_display_server_resolution(), which the RSX driver
+          # configures the output from, follows the choice (before, the
+          # RSX driver ignored the setting and kept the system menu's
+          # mode) and falls back to the system mode when the display
+          # does not take it.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./dispserv_ps3_test
+          make clean
+
+      - name: Build and run rsx_alloc_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/rsx_alloc
+        run: |
+          set -eu
+          # The PS3 RSX driver (gfx/drivers/rsx_gfx.c), compiled in
+          # whole against the tree's PSL1GHT stand-ins, with each RSX
+          # allocation it makes failed in turn: init, a font and an
+          # overlay come up whole or not at all, a texture with no
+          # memory is not handed out, a core frame whose texture got
+          # none is not drawn, and a frame bigger than its texture's
+          # buffer gets a new buffer.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./rsx_alloc_test
+          make clean
+
+      - name: X11 window poll sends no requests (Xvfb, ASan + UBSan)
+        shell: bash
+        run: |
+          set -eu
+          # x11_check_window() and x11_has_focus() run every frame; a
+          # reply-bearing request there waits behind whatever else is
+          # queued on the connection (a software Vulkan WSI's whole
+          # PutImage frame). Focus comes from FocusIn/FocusOut, so the
+          # X contexts must select FocusChangeMask.
+          for f in x_ctx.c x_vk_ctx.c xegl_ctx.c; do
+             grep -q FocusChangeMask gfx/drivers_context/$f \
+                || { echo "::error::$f does not select FocusChangeMask"; exit 1; }
+          done
+          Xvfb :97 -screen 0 1024x768x24 > /tmp/xvfb97.log 2>&1 &
+          XVFB_PID=$!
+          sleep 1
+          (cd samples/gfx/x11_frame_poll \
+             && make clean all SANITIZER=address,undefined \
+             && DISPLAY=:97 ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+                timeout 60 ./x11_frame_poll_test)
+          kill $XVFB_PID
+          echo "[pass] x11_frame_poll_test"
+
+      - name: Live mode switching on an Xorg dummy server (X11 + SDL)
+        shell: bash
+        run: |
+          set -eu
+          # The stubbed display_servers_test proves the driver issues
+          # the right RandR calls; this proves a real X server accepts
+          # them.  Xorg's 'dummy' driver honours XRRCreateMode /
+          # XRRAddOutputMode / XRRSetCrtcConfig with arbitrary timings
+          # (Xvfb's RandR shim returns success and lists nothing, so it
+          # cannot stand in).  The X11 sample runs the modeline engine
+          # end to end - generate a 15 kHz timing, put it on the wire
+          # through dispserv_x11, read the crtc back and compare every
+          # field, switch again, restore - then the Screen Resolution
+          # callbacks: the listed modes, a smaller, a larger and a
+          # rate-only switch with the framebuffer following, an
+          # unlisted size refused, and back.  The SDL sample switches
+          # a real SDL2 window among the listed modes through
+          # dispserv_sdl2 (and dispserv_sdl3 on an SDL3 build), for the
+          # modeline path and the menu picker.
+          # The Win32 build runs after them under Wine.
+          sudo Xorg :99 -config samples/gfx/display_servers_x11_live/xorg-dummy.conf \
+             -logfile /tmp/xorg-dummy.log -noreset -nolisten tcp -ac \
+             > /tmp/xorg-dummy.out 2>&1 &
+          XORG_PID=$!
+          for i in $(seq 1 30); do
+             DISPLAY=:99 xrandr >/dev/null 2>&1 && break
+             sleep 0.5
+          done
+          DISPLAY=:99 xrandr | head -3
+          export DISPLAY=:99
+          # SDL3's X11 backend makes a window fullscreen through the
+          # window manager and reverts the mode switch when none
+          # answers; a light one runs for the SDL samples.
+          openbox > /tmp/openbox.out 2>&1 &
+          sleep 1
+          (cd samples/gfx/display_servers_x11_live \
+             && make clean all SANITIZER=address,undefined \
+             && ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+                timeout 120 ./display_servers_x11_live_test)
+          echo "[pass] display_servers_x11_live_test"
+          # The refresh rate a core polls every frame: answered from
+          # memory once the X event pump drains the connection, with no
+          # request to the server, and changed by the next pump after
+          # another client switches the mode - under a reader on a
+          # second thread, once under ASan+UBSan and once under TSan.
+          (cd samples/gfx/x11_refresh_rate \
+             && make clean all SANITIZER=address,undefined \
+             && ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+                timeout 120 ./x11_refresh_rate_test \
+             && make clean all SANITIZER=thread \
+             && TSAN_OPTIONS=halt_on_error=1 timeout 120 ./x11_refresh_rate_test)
+          echo "[pass] x11_refresh_rate_test"
+          (cd samples/gfx/display_servers_sdl2_live \
+             && make clean all SANITIZER=address,undefined \
+             && ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+                LSAN_OPTIONS=suppressions=lsan.supp \
+                timeout 120 ./display_servers_sdl2_live_test)
+          echo "[pass] display_servers_sdl2_live_test"
+          # The SDL3 server, audio driver and keyboard against an SDL3
+          # built from a pinned release (the runner image ships no
+          # libsdl3-dev): video, events and the dummy audio device, X11
+          # backend.
+          SDL3_VER=3.2.20
+          if [ ! -f /opt/sdl3/lib/pkgconfig/sdl3.pc ]; then
+             curl -sL -o /tmp/sdl3.tar.gz \
+                "https://github.com/libsdl-org/SDL/releases/download/release-$SDL3_VER/SDL3-$SDL3_VER.tar.gz"
+             tar -C /tmp -xzf /tmp/sdl3.tar.gz
+             cmake -S "/tmp/SDL3-$SDL3_VER" -B /tmp/sdl3-build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+                -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_AUDIO=ON -DSDL_CAMERA=OFF \
+                -DSDL_WAYLAND=OFF -DSDL_X11=ON -DSDL_OPENGL=OFF -DSDL_OPENGLES=OFF \
+                -DSDL_VULKAN=OFF -DSDL_RENDER=OFF -DCMAKE_INSTALL_PREFIX=/opt/sdl3 \
+                > /tmp/sdl3-cmake.log
+             ninja -C /tmp/sdl3-build > /tmp/sdl3-build.log
+             sudo ninja -C /tmp/sdl3-build install > /tmp/sdl3-install.log
+          fi
+          # A 59.94 mode beside the desktop's 60, which rounds alike
+          xrandr --newmode "1280x720_59.94" 74.176 1280 1390 1430 1650 720 725 730 750 +hsync +vsync
+          xrandr --addmode DUMMY0 1280x720_59.94
+          (cd samples/gfx/display_servers_sdl3_live \
+             && PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make clean all SANITIZER=address,undefined \
+             && LD_LIBRARY_PATH=/opt/sdl3/lib \
+                ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+                LSAN_OPTIONS=suppressions=lsan.supp \
+                timeout 120 ./display_servers_sdl3_live_test)
+          echo "[pass] display_servers_sdl3_live_test"
+          (cd samples/audio/sdl3_counters \
+             && PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make clean all SANITIZER=address,undefined \
+             && LD_LIBRARY_PATH=/opt/sdl3/lib SDL_AUDIO_DRIVER=dummy \
+                ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+                LSAN_OPTIONS=suppressions=../../gfx/display_servers_sdl3_live/lsan.supp \
+                timeout 120 ./sdl3_counters_test \
+             && make clean)
+          echo "[pass] sdl3_counters_test"
+          (cd samples/input/sdl3_keyboard \
+             && PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make clean all SANITIZER=address,undefined \
+             && LD_LIBRARY_PATH=/opt/sdl3/lib \
+                ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+                LSAN_OPTIONS=suppressions=../../gfx/display_servers_sdl3_live/lsan.supp \
+                timeout 120 ./sdl3_keyboard_test \
+             && make clean)
+          echo "[pass] sdl3_keyboard_test"
+          # The Win32 server, its vendor timing paths and the engine
+          # cross-built with mingw-w64 and run under Wine on the same
+          # display: Wine backs EnumDisplaySettingsExA and
+          # ChangeDisplaySettingsExA with the server's RandR modes, so
+          # the CDS listed-mode switch is real; ADL, ATI legacy and
+          # PowerStrip are linked and must decline.
+          # Its own Wine prefix: one a Wine program started before the
+          # display was up keeps that display's single mode, and Wine
+          # lists only it.
+          WINE_LIVE_PREFIX=$(mktemp -d)
+          (cd samples/gfx/display_servers_win32_live \
+             && make clean all \
+             && WINEPREFIX=$WINE_LIVE_PREFIX WINEDEBUG=-all timeout 300 \
+                wine ./display_servers_win32_live_test.exe)
+          WINEPREFIX=$WINE_LIVE_PREFIX wineserver -k || true
+          rm -rf "$WINE_LIVE_PREFIX"
+          echo "[pass] display_servers_win32_live_test (Wine)"
+          # The vendor timing paths against stand-ins: a mock
+          # atiadlxx.dll that re-plugs the monitor after a forced set,
+          # a scratch HKLM key for the ATI legacy registry layout, a
+          # TPShidden window answering PowerStrip's messages.
+          (cd samples/gfx/display_servers_win32_vendor \
+             && make clean all \
+             && WINEDEBUG=-all timeout 300 wine ./display_servers_win32_vendor_test.exe)
+          echo "[pass] display_servers_win32_vendor_test (Wine)"
+          # The server must be back on its desktop mode with nothing
+          # generated left behind.
+          xrandr | head -3
+          if xrandr | grep -q 'RA-'; then
+             echo "generated modes left on the server"; exit 1
+          fi
+          pkill openbox || true
+          sudo kill "$XORG_PID" || true
+
+      - name: Screen Resolution through Mutter's DisplayConfig (ASan + UBSan, TSan)
+        shell: bash
+        run: |
+          set -eu
+          # Under GNOME's Wayland session the X11 driver runs on
+          # XWayland, which lists every mode at the desktop's current
+          # rate and only scales the window when "switched", and the
+          # Wayland driver had no resolution list at all; Mutter's
+          # org.gnome.Mutter.DisplayConfig D-Bus interface is the only
+          # way to the monitor's real modes.  mock_mutter.py carries
+          # Mutter's signatures and its ApplyMonitorsConfig checks; the
+          # test drives gfx/common/mutter_displayconfig.c directly and
+          # through dispserv_x11 (real Xorg dummy server, and Xwayland
+          # under a headless Weston) and dispserv_wl, with and without
+          # Mutter on the bus.  Without it every path must behave
+          # exactly as before: no session bus, a bus without Mutter, a
+          # real X server (Mutter is never asked), XWayland's own list,
+          # and no Wayland resolution list.  Last, a real headless Mutter
+          # and its XWayland: Mutter names XWayland's outputs after its
+          # connectors (DP-1, Meta-0), so only the XWAYLAND extension
+          # says what the server is.
+          (cd samples/gfx/mutter_displayconfig \
+             && make clean all SANITIZER=address,undefined \
+             && ASAN_OPTIONS=detect_leaks=1 \
+                UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+                XORG="sudo Xorg" timeout 300 ./run.sh)
+          # The worker publishes its state by swapping a pointer and
+          # frees the one it replaced once no reader is inside it, with
+          # no lock.  The threads case reads the list from four threads
+          # while the rate is switched back and forth; freeing the old
+          # state without waiting for the readers is a TSan data race.
+          # The bus cases alone: they need no display server.
+          (cd samples/gfx/mutter_displayconfig \
+             && make clean all SANITIZER=thread \
+             && TSAN_OPTIONS=halt_on_error=1 BUS_ONLY=1 \
+                setarch "$(uname -m)" -R timeout 120 ./run.sh)
+          echo "[pass] mutter_displayconfig_test"
+
+      - name: Build and run dbus_screensaver_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/dbus_screensaver
+        run: |
+          set -eu
+          # gfx/common/dbus_common.c's screensaver inhibit against a
+          # private session bus and a fake org.freedesktop.ScreenSaver:
+          # each request answered as itself and never with an older
+          # one's answer, three threads toggling leave what the last one
+          # asked, close and reopen release the old inhibit, and no
+          # service answers FAILED.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 300 ./run.sh
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 300 ./run.sh
+          echo "[pass] dbus_screensaver_test"
+
+      - name: Single GL context initialization ownership
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CC=gcc CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_init.py
+          CC=clang CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_init.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/gl_context_init.py
+          CC=gcc CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_drain.py
+          CC=clang CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_drain.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/gl_context_drain.py
+
+      - name: D3D menu source formats (Linux and mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/d3d_menu_format.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/d3d_menu_format.py
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/d3d12_menu.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/d3d12_menu.py
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/hdr_view_crop.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/hdr_view_crop.py
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/d3d12_raw_frame.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/d3d12_raw_frame.py
+          python3 samples/gfx/d3d12_menu_mapping/run.py
+
+      - name: D3D8 resource cleanup (Linux and mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -C samples/gfx/d3d8_cleanup clean check SANITIZER=address,undefined
+          make -C samples/gfx/d3d8_cleanup clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/d3d8_cleanup clean
+
+      - name: D3D11/12 shader feedback lifecycle (Linux and mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -C samples/gfx/d3d_feedback clean check SANITIZER=address,undefined
+          make -C samples/gfx/d3d_feedback clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/d3d_feedback clean
+
+      - name: D3D12 mipmap generation (Linux and mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -C samples/gfx/d3d12_mipmaps clean check SANITIZER=address,undefined
+          make -C samples/gfx/d3d12_mipmaps clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/d3d12_mipmaps clean
+
+      - name: D3D11 video decode backend (Linux and mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # H.264, HEVC and VP9 submission buffers, byte by byte
+          # and against dxva.h, and the backend itself on a D3D11 that
+          # records what it is told. The GPU oracle builds here and
+          # skips; it runs on a Windows machine with a video decoder.
+          make -C samples/gfx/d3d11_video_decode clean check SANITIZER=address,undefined
+          make -C samples/gfx/d3d11_video_decode clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/d3d11_video_decode clean
+
+      - name: Movie GPU handoff (Linux and mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/movie_gpu_handoff/run.py
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=thread -fno-omit-frame-pointer" python3 samples/gfx/movie_gpu_handoff/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/movie_gpu_handoff/run.py
+
+      - name: D3D12 descriptor cache resource lifetime (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_descriptor_cache/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_descriptor_cache/run.py
+
+      - name: D3D12 pass descriptor tables on their own slots (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_pass_tables/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_pass_tables/run.py
+
+      - name: D3D12 repeated screenshots and recording slots (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_readback_slot/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_readback_slot/run.py
+
+      - name: D3D12 frame ring, one frame in flight or two (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_frame_ring/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_frame_ring/run.py
+
+      - name: D3D10/11 failed maps and swapchain recovery (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d_failure_paths/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d_failure_paths/run.py
+            CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d_failure_paths/upload.py
+            CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d_failure_paths/upload.py
+            python3 samples/gfx/d3d_failure_paths/gpu.py
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d_failure_paths/lend.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d_failure_paths/lend.py
+          python3 samples/gfx/d3d_failure_paths/lend_gpu.py
+
+      - name: D3D9 HLSL failed locks (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d9_failed_lock/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d9_failed_lock/run.py
+
+      - name: Vulkan video negotiation and HEVC parameters (Linux and mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -C samples/gfx/vulkan_video_caps clean check SANITIZER=address,undefined
+          make -C samples/gfx/vulkan_video_caps clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/vulkan_video_caps clean
+          make -C samples/gfx/vulkan_video_caps av1-session-check
+          make -C samples/gfx/vulkan_video_caps av1-session-check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/vulkan_video_caps session-check
+          make -C samples/gfx/vulkan_video_caps session-check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/vulkan_video_caps decode-check
+          make -C samples/gfx/vulkan_video_caps decode-check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/vulkan_video_caps import-check
+          make -C samples/gfx/vulkan_video_caps import-check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/vulkan_video_caps render-check
+          make -C samples/gfx/vulkan_video_caps render-check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/vulkan_video_caps direct-check
+          make -C samples/gfx/vulkan_video_caps direct-check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/gfx/vulkan_video_caps clean
+
+      - name: GPU recording slot ownership (Linux, mingw and sanitizers)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -C samples/gfx/record_gpu_queue clean check
+          make -C samples/gfx/record_gpu_queue clean check THREADS=1 SANITIZE=-fsanitize=address,undefined
+          make -C samples/gfx/record_gpu_queue clean check THREADS=1 SANITIZE=-fsanitize=thread
+          make -C samples/gfx/record_gpu_queue clean check THREADS=1 TEST_FRAMES=20000 CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+
+      - name: Native NVENC D3D12 encoder (portable fallback and hardware gate)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -C samples/gfx/nvenc_d3d12 check
+          make -C samples/gfx/nvenc_d3d12 check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+
+      - name: D3D11 hardware ring under threaded video (mingw + Wine, headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          # The threaded wrapper hands a D3D11 hardware core a deferred
+          # context and replays its frames on the video thread. Nothing
+          # on Linux exercises that, and it shipped showing one frame
+          # and then black. The real proxy and the driver's own
+          # FinishCommandList argument, run under Wine, where wined3d
+          # implements deferred contexts over OpenGL. Requires the ring
+          # and the immediate context to show every frame, and the ring
+          # as it used to be to fail.
+          samples/gfx/d3d11_hw_ring/run.sh
+
+      - name: libretro_d3d11.h version 2, the contract run (mingw + Wine, headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          # Version 2 of the D3D11 hardware render interface lets a core
+          # and a frontend that presents from another thread share the
+          # device's one immediate context by taking turns, so the core
+          # keeps everything a deferred context cannot do - reading back
+          # above all. This runs the two against each other on a real
+          # D3D11 device (wined3d), and requires every frame and every
+          # readback to be right, and a core that ignores what
+          # lock_context tells it to be caught.
+          REQUIRE_D3D11=1 samples/gfx/d3d11_hw_interface_v2/run.sh
+
+      - name: libretro_d3d12.h version 2, the contract run (mingw + Wine + vkd3d, headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          # Version 2 of the D3D12 hardware render interface lets a core
+          # hand a frame to a frontend that presents from another thread
+          # without the copy version 1 forces. This runs a core and such a
+          # frontend against each other on a real D3D12 device - vkd3d
+          # over Mesa's software Vulkan driver - and requires every frame
+          # to arrive intact, and a core that ignores wait_sync_index to
+          # be caught.
+          REQUIRE_D3D12=1 samples/gfx/d3d12_hw_interface_v2/run.sh
+
+      - name: D3D texture pokes marshal onto the video thread (mingw, object check)
+        shell: bash
+        run: |
+          set -eu
+          # Every texture poke a caller reaches with threaded=true that
+          # touches a device's queue or descriptor heaps goes through
+          # video_thread_texture_handle(); read off the compiled object's
+          # relocations, D3D12's compressed load included.
+          make -C samples/gfx/d3d_texture_marshal check
+
+      - name: Win32 window procedure on a real window (mingw + Wine, headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          # gfx/common/win32_common.c had twelve window procedures and
+          # has one. This links the real file with stand-ins for what
+          # it calls, has it create its window for every video family
+          # and kind of input driver, sends each a script of messages,
+          # and compares every answer and every call made on the way
+          # with the trace the twelve old procedures gave on the same
+          # script - then makes and destroys the window through twenty
+          # fullscreen toggles. Any difference from the recorded trace
+          # fails.
+          samples/gfx/win32_window_proc/run.sh
+          python3 samples/gfx/win32_window_proc/modal_frame_run.py
+
+      - name: Build and run window_driver_test for Windows (Wine)
+        shell: bash
+        working-directory: samples/input/window_driver
+        run: |
+          set -eu
+          # Which input driver a Windows window gets
+          # (input_driver_init_windows() in
+          # input/input_driver_choice.c): raw input when it is the
+          # setting and it starts, DirectInput otherwise, including
+          # when raw input fails to start. Built with mingw-w64 and
+          # run under Wine, with stand-in drivers. The X11 and
+          # no-window-system choices run on the host in the input
+          # samples workflow.
+          make clean check-windows
+          make clean
+
+      - name: Build and run display_servers_kms_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/display_servers_kms
+        run: |
+          set -eu
+          # Regression test for two defects in
+          # gfx/display_servers/dispserv_kms.c::
+          # kms_display_server_get_resolution_list().  g_drm_connector
+          # is owned by gfx/common/drm_common.c and set to NULL by
+          # drm_free(), which runs on every context teardown -- a
+          # resolution change, a fullscreen toggle, a driver reinit --
+          # while the display server object outlives it, so the menu
+          # could ask for the list with no connector to describe and
+          # the function read straight through NULL.  g_drm_mode, the
+          # sibling global, was already tested for exactly this a few
+          # lines earlier.  Separately the qsort() at the end was
+          # passed `count`, which was declared zero and never
+          # assigned; `j` is the element count.  So the sort ran over
+          # zero elements and the resolution list came back in
+          # whatever order the connector reported its modes -- no
+          # crash, no diagnostic, just an unsorted list that looks
+          # plausible.
+          #
+          # The test fabricates the drmModeConnector the driver reads,
+          # so it needs the libdrm headers but links nothing from
+          # libdrm: presenting a connector that is absent, empty, or
+          # reporting modes in an awkward order is the whole exercise
+          # and a real one will not do it on request.  The ordering
+          # check feeds modes in descending size, which a working sort
+          # must reverse and a broken one leaves untouched.  If
+          # dispserv_kms.c amends either, this goes red.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x display_servers_kms_test
+          timeout 60 ./display_servers_kms_test
+          echo "[pass] display_servers_kms_test"
+
+      - name: Build and run drm_hdr_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/drm_hdr
+        run: |
+          set -eu
+          # gfx/common/drm_hdr.c: which EDIDs take HDR10 and what they
+          # declare, malformed ones refused without an overread, and the
+          # HDR_OUTPUT_METADATA blob, whose layout must be the kernel's.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./drm_hdr_test
+          echo "[pass] drm_hdr_test"
+
+      - name: Build and run drm_surface_lifetime_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/drm_surface_lifetime
+        run: |
+          set -eu
+          # gfx/drivers/drm_gfx.c's surfaces against a fake kernel: a
+          # core's resolution changes and the menu's sessions leave only
+          # the live surface's dumb buffers, framebuffers and mappings,
+          # the framebuffer the plane scans out is never removed from
+          # under it, and the driver's free leaves nothing - LeakSanitizer
+          # holds the plane queries' libdrm objects to the same. Rows the
+          # kernel pads are written at its stride, each frame read at its
+          # own pitch, the next page lent to the core and flipped without
+          # a copy, a dupe survived, and no allocation made per flip. The
+          # menu scans out RGUI's RGBA4444 as it is where the plane takes
+          # it, is lent to RGUI, follows the frame's size, and asks the
+          # plane once rather than every menu frame. Every framebuffer is
+          # made in its surface's own format, which no legacy depth names
+          # for RGBX4444. The input overlay goes on a plane of its own,
+          # raised above the frame's and blending premultiplied, covering
+          # only its images, composed when something changes and flipped
+          # in the frame's own commit; where no plane can take it, it is
+          # blended into the frame. Init passes over a card with no
+          # display, keeps the console's mode or a fullscreen size's,
+          # switches mode with the planes, flips without atomic commits
+          # where the card has none, fails cleanly with no plane for
+          # frames, and the free turns the plane off and gives the
+          # console back its framebuffer and mode. A core's rotation is
+          # made by the plane where its rotation property takes it, and
+          # the frame still lent; otherwise, or under a blended overlay,
+          # the copy turns it and nothing is lent. The menu is shown
+          # unturned, the plane is left unturned, and a screenshot reads
+          # the frame back as it is shown. Without vsync, commits do not
+          # wait: one per vblank, none refused, a frame that comes before
+          # the last is on screen written over, the page written next
+          # never the one on screen or on its way; a resize, the menu, a
+          # mode switch and the free wait for the flip first, and vsync
+          # turned back on waits again. The threaded wrapper's frame
+          # memory is scanned out where a frame lies, from inside a
+          # buffer too, never written while shown or on its way, freed
+          # only once the plane has left it, and copied where the display
+          # refuses the pitch or the copy turns the frame. The CRT
+          # switch's modeline is set at init and on a mode switch, HDMI
+          # timings from the config, malformed ones passed over, and the
+          # aspect the switch puts taken up with the next frame; content
+          # running under the menu is never flipped over it, and its last
+          # frame goes up when the menu closes. On-screen messages are
+          # drawn into the frame where they are seen, at the size the
+          # screen shows, upright on a frame the plane turns, and a frame
+          # in the wrapper's memory is copied to be drawn on. A blended
+          # overlay is blended into a core's views as into a frame. The
+          # driver is built with sign-compare as an error and linked
+          # without rthreads, so it stays clean of both. A turn goes in
+          # the commit that places the plane, never on its own, and a
+          # frame placed otherwise in a frame memory buffer still shown
+          # is copied rather than its framebuffer removed.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./drm_surface_lifetime_test
+          make clean
+          echo "[pass] drm_surface_lifetime_test"
+
+      - name: Build and run drm_crtc_pick_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/drm_crtc_pick
+        run: |
+          set -eu
+          # gfx/common/drm_common.c against a fake kernel: a connector
+          # nothing drives yet (a display plugged in after boot) gets an
+          # encoder and a CRTC that is off, a CRTC that was off is
+          # switched off again on restore, a size the display lacks falls
+          # back to mode 0, only a display in use going away (or
+          # coming back) restarts the video driver on a hotplug, and the
+          # flip wait notes a hotplug in its own poll without spinning on
+          # the unread socket.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./drm_crtc_pick_test
+          make clean
+          echo "[pass] drm_crtc_pick_test"
+
+      - name: Build and run exynos_g2d_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/exynos_g2d
+        run: |
+          set -eu
+          # gfx/drivers/exynos_gfx.c against a fake kernel and a G2D that
+          # draws into the GEM buffers: the frame at its aspect ratio, a
+          # core rendering into the buffer the G2D reads, vsync off
+          # neither waiting nor queueing flips, messages and statistics
+          # cleared and blended over only what they cover, the menu's
+          # alpha, screenshots, mode switches and CRT modelines, and a
+          # free and a failed init that leave nothing behind. Behind an
+          # IOMMU, frames read from the core's own memory - the kernel
+          # reuses a mapping unsynced, so a frame must never come
+          # through one - and the input overlay blended by the G2D,
+          # mirrored where its quad is; a core's rotation, turned as
+          # the frame is copied.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./exynos_g2d_test
+          make clean
+          echo "[pass] exynos_g2d_test"
+
+      - name: Build and run egl_gbm_frames_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/egl_gbm_frames
+        run: |
+          set -eu
+          # gfx/common/egl_gbm_frames.c against a fake GBM, EGL and GPU:
+          # a format the GPU samples where the CPU writes it is taken, one
+          # mapped through staging memory refused for the rest of the run;
+          # a buffer a texture holds, one a draw may still read and the
+          # last frame's are never lent; the check puts the GL state back,
+          # and the free leaves no buffer, map, image, fence or fd.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./egl_gbm_frames_test
+          make clean
+          echo "[pass] egl_gbm_frames_test"
+
+      - name: egl_gbm_frames check on a real GL (Mesa EGL, GLES 2 and desktop GL)
+        shell: bash
+        run: |
+          set -eu
+          # The check gfx/common/egl_gbm_frames.c runs before a format is
+          # first used, on llvmpipe: GBM and the dma-buf import are
+          # stand-ins, the shader, target, draw and readback the GL's own.
+          # A buffer sampled as written passes in both formats; one whose
+          # writes are never seen fails, and is not tried again.
+          T=$(mktemp -d)
+          for api in es2 gl; do
+             if [ $api = es2 ]; then
+                D="-DHAVE_OPENGLES -DHAVE_OPENGLES2"
+                L="libretro-common/glsym/glsym_es2.c -lEGL -lGLESv2"
+             else
+                D="-DHAVE_OPENGL"
+                L="libretro-common/glsym/glsym_gl.c -lEGL -lGL"
+             fi
+             cc -std=gnu89 -O1 -g1 -Wall -Werror=implicit-function-declaration \
+                -fsanitize=address,undefined -fno-omit-frame-pointer \
+                -DHAVE_KMS -DHAVE_EGL $D -I. -Ilibretro-common/include \
+                -Igfx/include $(pkg-config --cflags libdrm) \
+                samples/gfx/egl_gbm_frames/mesa_check.c gfx/common/egl_gbm_frames.c \
+                libretro-common/glsym/rglgen.c $L \
+                -Wl,--wrap=eglGetProcAddress,--wrap=eglQueryString,--wrap=glDrawArrays \
+                -o "$T/check_$api"
+             for mode in seen blind; do
+                EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 \
+                   ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+                   "$T/check_$api" $mode
+             done
+          done
+          rm -rf "$T"
+
+      - name: Build and run gl2_kms_frames_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/gl2_kms_frames
+        run: |
+          set -eu
+          # gfx/drivers/gl2.c's frames in scanout memory against a
+          # scripted egl_gbm_frames: on KMS a plain software frame is lent
+          # from the buffers, never to a core that reads it back, a
+          # hardware core, mipmaps or a 10-bit source; a lent frame becomes
+          # the frame texture's storage with no upload, and any other gets
+          # the texture's own storage back before it goes up.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./gl2_kms_frames_test
+          make clean
+          echo "[pass] gl2_kms_frames_test"
+
+      - name: Build and run wayland_wlr_output_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/wayland_wlr_output
+        run: |
+          set -eu
+          # gfx/common/wayland_wlr_output.c, the Wayland display server's
+          # resolution list and mode switch on wlroots compositors, against
+          # an in-process compositor that checks every configuration names
+          # each head exactly once, as the protocol requires.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./wayland_wlr_output_test
+          echo "[pass] wayland_wlr_output_test"
+
+      - name: Build and run wayland_cursor_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/wayland_cursor
+        run: |
+          set -eu
+          # input/common/wayland_cursor.h: the size and scale the Wayland
+          # context loads its cursor theme at when the compositor has no
+          # cursor-shape-v1 - XCURSOR_SIZE honoured, fractional scales
+          # rounded up to a whole buffer scale.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./wayland_cursor_test
+          echo "[pass] wayland_cursor_test"
+
+      - name: Build and run wayland_resize_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/wayland_resize
+        run: |
+          set -eu
+          # gfx/common/wayland_resize.h, what the Wayland GL and Vulkan
+          # contexts do once their buffers are resized, against an
+          # in-process compositor: configures count again whatever the
+          # scaling, and the buffer scale goes only to a surface on the
+          # whole-scale path that is new enough to take it.
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./wayland_resize_test
+          echo "[pass] wayland_resize_test"
+
+      - name: Build and run video_mode_select_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/video_mode_select
+        run: |
+          set -eu
+          # gfx/common/video_mode_select.c: which listed mode a size and
+          # rate name, and the order a resolution list is shown in - the
+          # code every display server's mode switch goes through.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./video_mode_select_test
+          echo "[pass] video_mode_select_test"
+
+      - name: Build and run wayland_kwin_output_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/wayland_kwin_output
+        run: |
+          set -eu
+          # gfx/common/wayland_kwin_output.c, the Wayland display server's
+          # resolution list and mode switch on KWin, against an in-process
+          # compositor speaking KWin's output protocols in both the
+          # registry form and the older per-output globals.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./wayland_kwin_output_test
+          echo "[pass] wayland_kwin_output_test"
+
+      - name: Build and run wayland_color_management_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/wayland_color_management
+        run: |
+          set -eu
+          # gfx/common/wayland_color.c, which tags an HDR GL surface as
+          # Windows-scRGB, against an in-process compositor that records
+          # every fatal wp_color_manager_v1 rule the client could break.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./wayland_color_management_test
+          echo "[pass] wayland_color_management_test"
+
+      - name: Build and run wayland_present_test (TSan, ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/wayland_present
+        run: |
+          set -eu
+          # gfx/common/wayland_present.c against an in-process
+          # compositor: presentation feedback and the GL frame callback
+          # live on their own event queues, so the main thread
+          # dispatching input never runs them while the video thread
+          # requests, waits on and frees them.
+          # TSan catches a feedback event dispatched off that thread;
+          # ASan the feedback left behind at teardown.
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 ./wayland_present_test
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./wayland_present_test
+          echo "[pass] wayland_present_test"
+
+      - name: Build and run wayland_drm_lease_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/wayland_drm_lease
+        run: |
+          set -eu
+          # The DRM lease path in gfx/common/wayland_drm_lease.c and
+          # gfx/display_servers/dispserv_wl.c, driven by a test
+          # compositor on libwayland-server: what is offered, which
+          # connector an index picks, an index past the offer, a
+          # refusal, a revoke arriving while the client is idle, and
+          # no Wayland session at all. The leased descriptor and the
+          # device's non-master fd are the ones a mistake leaks, so
+          # the lane runs under ASan. Both protocol halves are
+          # generated here from deps/wayland-protocols, which needs
+          # wayland-scanner and the client and server libraries -
+          # libwayland-dev carries all three.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x wayland_drm_lease_test
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./wayland_drm_lease_test
+          echo "[pass] wayland_drm_lease_test"
+
+      - name: Build and run modeline_edid_parse_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/modeline_edid_parse
+        run: |
+          set -eu
+          # The EDID reader in gfx/modeline/modeline_edid.c, fed the
+          # block the writer produces (round trip), a hand-built EDID
+          # 1.4 with CTA-861 and DisplayID 2.0 extensions checked
+          # field by field, the defect cases (short, wrong header, bad
+          # checksums, a declared but missing extension, data block
+          # and section lengths running past their block), and a
+          # deterministic byte-noise sweep. The parser is handed
+          # whatever an OS reader returns, so every length and offset
+          # in the data is hostile; under ASan a read past the buffer
+          # is the failure this lane exists to catch.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x modeline_edid_parse_test
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./modeline_edid_parse_test
+
+      - name: Build and run integer_scale_axis_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/integer_scale_axis
+        run: |
+          set -eu
+          # video_viewport_get_scaled_integer(), pulled out of
+          # gfx/video_driver.c by extract_integer.awk, swept over
+          # viewport sizes, frame sizes, every axis mode that touches
+          # X and every scaling mode. Y+X has to be integer on both
+          # axes: the X axis was once multiplied from the
+          # aspect-corrected width (256x224 at 64:49 is 293), giving
+          # 1172x896 at 1080p - a 4.58x horizontal scale and uneven
+          # pixel columns - on every video driver.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x integer_scale_axis_test
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./integer_scale_axis_test
+          make clean
+
+      - name: Build and run coord_array_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/coord_array
+        run: |
+          set -eu
+          # The coordinate array, pulled out of gfx/video_driver.c by
+          # extract_coord_array.awk: appends hold what was appended,
+          # and an append onto an empty array or one that has to grow,
+          # with each of its allocations failed in turn, reports the
+          # failure, keeps what the array held, and frees clean.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./coord_array_test
+          make clean
+
+      - name: Build and run slang_cache_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/slang_cache
+        run: |
+          set -eu
+          # The SPIR-V cache: slang_cache.c serialises entries in
+          # memory and video_shader_parse.c stores them - mapped or read
+          # in one go, written whole by rename. The test round-trips an
+          # entry, checks the bytes are the layout caches have always
+          # had, turns away every truncated prefix and a set of corrupt
+          # entries, and keeps keys from naming anything outside the
+          # cache. Built mapped (HAVE_MMAP) and reading.
+          make clean SAN=address,undefined && make -j$(nproc) all SAN=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 300 make check
+          make clean
+
+      - name: Build and run gfx_display_mesh_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_display_mesh
+        run: |
+          set -eu
+          # The menu mesh facility in gfx_display.c against a display
+          # driver that records what it is handed: mesh creation and
+          # its refusals, the CPU path a plain program takes on drivers
+          # that do not draw meshes (the transform, the perspective
+          # divide, triangles joined into one strip, triangles behind
+          # the eye dropped, the tint), each effect program reaching the
+          # driver's pipeline under its id, and nothing handed to a
+          # driver that takes no strips.
+          make clean && make -j$(nproc) all
+          timeout 120 make check
+          make clean
+
+      - name: Build and run font_lifecycle_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/font_lifecycle
+        run: |
+          set -eu
+          # Where a font is created follows the threading hint; where
+          # it is REBUILT does not - a rebuild marshals whenever the
+          # wrapper is up, because a GL backend making its context
+          # current on the main thread while the video thread holds it
+          # is an X BadAccess. Nothing ran this sample, and it had the
+          # older rule written into it.
+          # The fallback tests read DejaVu in place of the assets'
+          # fallback fonts: Sans for fallback-font.ttf, and Sans Mono
+          # and Sans as a general and a second face for the chain test.
+          # vg and sdl2 draw on-screen messages through the shipping
+          # OpenVG and SDL2 drivers - OpenVG onto a software OpenVG in
+          # the test, SDL2 through its own software renderer - and check
+          # every glyph texel lands where it should.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 120 make check SANITIZER=address,undefined
+          make clean
+          # A fallback font is read on a thread of its own while two
+          # fonts on two threads ask for it, and a second face behind
+          # the first.
+          make fallback chain SAN=thread
+          TSAN_OPTIONS=halt_on_error=1 setarch "$(uname -m)" -R \
+             timeout 120 ./fallback
+          TSAN_OPTIONS=halt_on_error=1 setarch "$(uname -m)" -R \
+             timeout 120 ./chain
+          make clean
+
+      - name: Build and run overlay_apng_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/overlay_apng
+        run: |
+          set -eu
+          # An animated overlay image is a surface with slots whose
+          # texture is updated in place, so the pages' handles stand
+          # while its frames advance. The sample builds its own APNG
+          # fixture and holds that contract: distinct frames, a pass
+          # that ends and replays, one texture across the submits, and
+          # a free with a frame still in flight.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 120 ./overlay_apng_test fixtures/anim.png
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./overlay_apng_test fixtures/anim.png
+          make clean
+
+      - name: Build and run gfx_thumbnail_anim_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_thumbnail_anim
+        run: |
+          set -eu
+          # Regression test for the two faults that froze animated
+          # thumbnails in the file browser, in gfx/gfx_thumbnail.c.
+          #
+          # gfx_thumbnail_request_file malloc'd its tag and never set
+          # tag->path, so gfx_thumbnail_anim_open - which
+          # gfx_thumbnail_handle_upload feeds that field for every
+          # load with no video stream to adopt - read uninitialised
+          # heap and returned without touching the file.  Undefined
+          # behaviour rather than a stable failure: a freed tag is
+          # the size of the next one, so the allocator commonly
+          # handed back a block still holding the previous entry's
+          # path, which opened an animation and looked like the
+          # feature working.  gfx_thumbnail_request fills the field
+          # for playlist entries, which is why playlists animated and
+          # the browser did not.
+          #
+          # Separately, anim_install marked windowed animations
+          # 'read pending' via !data_transfer_complete().  A window
+          # never completes - done stays clear for its whole life -
+          # and the pump animate() uses (iterate_while) declines
+          # windows by design, so pending forced the pump branch, the
+          # pump was a no-op, and animate() returned before ever
+          # advancing a frame, every vsync, forever.  That is every
+          # path-based open: animated WEBP, APNG, and any WEBM/MP4
+          # with no still stream to adopt.
+          #
+          # The oracle links the real gfx_thumbnail.c and measures
+          # animation as DISTINCT FRAMES REACHING THE TEXTURE - the
+          # video-driver stub CRCs every upload - not as internal
+          # flags, which is what every earlier test in this area got
+          # wrong and why neither fault was caught.  A 188-byte
+          # 3-frame lossless WEBP is embedded, so there are no
+          # fixtures.  One lane drives anim_open with a garbage path
+          # and requires no stream; one opens the real animation and
+          # requires multiple distinct uploads within bounded paced
+          # vsyncs, naming the windowed+pending deadlock explicitly
+          # before the timeout would.  Both pre-fix trees score zero
+          # uploads in 240 vsyncs.  If gfx_thumbnail.c amends the
+          # pending decision or the request plumbing, this goes red.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x gfx_thumbnail_anim_test
+          ASAN_OPTIONS=detect_leaks=1 timeout 120 \
+             ./gfx_thumbnail_anim_test
+          echo "[pass] gfx_thumbnail_anim_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 \
+             ./gfx_thumbnail_anim_test
+          echo "[pass] gfx_thumbnail_anim_test (TSan)"
+
+      - name: Build gfx_thumbnail_anim_test with mingw-w64
+        shell: bash
+        working-directory: samples/gfx/gfx_thumbnail_anim
+        run: |
+          set -eu
+          # Regression tests build for Windows too.
+          make clean
+          make CC=x86_64-w64-mingw32-gcc TARGET=gfx_thumbnail_anim_test.exe
+          test -f gfx_thumbnail_anim_test.exe
+          make clean TARGET=gfx_thumbnail_anim_test.exe
+
+      - name: Build and run gfx_surface_still_test (ASan + UBSan, mingw-w64)
+        shell: bash
+        working-directory: samples/gfx/gfx_surface_still
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # A still keeps the texture up until the new one has landed,
+          # updates a same-size image in place, and is freed by the
+          # completion of an upload or decode still out when it goes.
+          make clean
+          make EXTRA_CFLAGS="-fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined"
+          make check
+          make clean
+          make CC=x86_64-w64-mingw32-gcc TARGET=gfx_surface_still_test.exe
+          test -f gfx_surface_still_test.exe
+          make clean TARGET=gfx_surface_still_test.exe
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 two_frame.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 two_frame.py
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 remap.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 remap.py
+
+      - name: Build and run badge_cache_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/cheevos/badge_cache
+        run: |
+          set -eu
+          # rcheevos_get_badge_texture() never reads, decodes or
+          # uploads on the calling thread, so the achievement widgets
+          # can ask from the video thread. The test links the real
+          # cheevos/cheevos_badge.c with the task and upload stubbed
+          # as steppable queues and checks: nothing synchronous on
+          # the first ask, one decode per badge, the upload posted
+          # only from the decode's completion, the handle handed out
+          # exactly once and owned by the taker, locked and unlocked
+          # as separate keys, a missing file requesting a download
+          # only when asked and loading when the download lands, a
+          # failed load not retried per ask, a reset unloading ready
+          # handles and orphaning in-flight ones (their late delivery
+          # unloaded, never handed to whatever reused the slot), an
+          # off-main-thread ask only recorded until the main thread's
+          # service starts it, the default badge lent rather than
+          # given, a 0 reported as a short wait only while a file on
+          # disk is loading, and a refused async upload treated as a
+          # failure.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x badge_cache_test
+          ASAN_OPTIONS=detect_leaks=1 timeout 60 ./badge_cache_test
+          echo "[pass] badge_cache_test (ASan)"
+          make clean
+
+      - name: Build and run progress_bounds_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/cheevos/progress_bounds
+        run: |
+          set -eu
+          # Achievement progress comes back from a save state or a
+          # netplay host, so its bytes are not the runtime's own. The
+          # bundled rcheevos reader gets blobs in heap buffers of
+          # exactly their size: every truncation of a real one, a chunk
+          # length that wraps the offset back before itself, and a
+          # digest cut short. A read past a blob fails under ASan; the
+          # wrap would loop forever, which the timeout ends.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 timeout 60 ./progress_bounds_test
+          make clean
+          make CC=x86_64-w64-mingw32-gcc TARGET=progress_bounds_test.exe
+          test -f progress_bounds_test.exe
+          make clean TARGET=progress_bounds_test.exe
+          echo "[pass] progress_bounds_test (ASan + UBSan, and a mingw-w64 build)"
+
+      - name: Build and run psp1_gfx_contracts_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/psp1_gfx_contracts
+        run: |
+          set -eu
+          # gfx/drivers/psp1_gfx.c is reached only by the griffin unity
+          # build for PSP, so nothing else here compiles it, let alone
+          # runs it. This links the real driver against a stand-in for
+          # the parts of the machine its correctness turns on: main RAM
+          # and VRAM each mapped twice so the cached and uncached
+          # aliases genuinely alias, a no-access page after VRAM so a
+          # blit off the end faults, display lists that stay the GE's
+          # until they are waited on, and a vblank sub-interrupt that
+          # can be fired from inside free().
+          #
+          # What it holds: the 24bpp BGR byte order video_driver.h
+          # specifies for read_viewport, filling the whole buffer the
+          # screenshot task hands over, releasing the interrupt handler
+          # before the driver struct it writes through, keeping the GE
+          # off a display list or framebuffer that is in use, both blits
+          # staying inside the buffers they target, cache-line ownership
+          # of everything the GE writes, and init failing cleanly when
+          # an allocation does.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          rc=0
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 120 ./psp1_gfx_contracts_test || rc=$?
+          # 77: the runner would not hand over the PSP address windows.
+          if [ "$rc" = 77 ]; then
+             echo "[skip] PSP address windows unavailable"
+             exit 0
+          fi
+          [ "$rc" = 0 ]
+          make clean
+
+      - name: Shared media transport controls (C89, ASan, UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/media_controls
+        run: |
+          set -eu
+          make -B check THREADS=0
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 make -B check SANITIZER=address,undefined
+          TSAN_OPTIONS=halt_on_error=1 make -B check SANITIZER=thread
+
+      - name: MinGW strict C89 float math
+        run: CC=x86_64-w64-mingw32-gcc WINEDEBUG=-all python3 samples/gfx/mingw_c89_math/run.py
+
+      - name: Vulkan synchronous readback slot
+        run: python3 samples/gfx/vulkan_readback_slot/run.py
+
+      - name: D3D11 resized readback destination guard
+        run: python3 samples/gfx/d3d11_readback_resize/run.py
+
+      - name: Build and run hw_ring_fence_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/hw_ring_fence
+        run: |
+          set -u
+          set -o pipefail
+          # The hardware ring's fence handoff between the video thread
+          # and the core's thread (gfx/video_thread_hw_fence.h), the
+          # tree's own header, with two threads at one slot: a fence is
+          # signalled only while idle, waited only once signalled, and
+          # never inside two calls at once - with no lock. The single
+          # re-signalled fence it replaced is built too and must fail.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 120 make check SANITIZER=address,undefined
+          echo "[pass] hw_ring_fence_test (ASan + UBSan)"
+          # The two threads share nothing but atomics, and TSan is
+          # what says so.
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 make check SANITIZER=thread
+          echo "[pass] hw_ring_fence_test (TSan)"
+          make clean
+
+      - name: Build and run hw_ring_queue_test (ASan + UBSan, TSan)
+        working-directory: samples/gfx/hw_ring_queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make check SANITIZER=address,undefined
+          make clean
+          make check SANITIZER=thread
+          make clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+  thumbnail-preview:
+    name: The file browser's video preview (gfx_thumbnail_preview)
+    runs-on: ubuntu-latest
+    # Two sanitizer builds, the video harness under each, and the
+    # windowed-animation harness under ASan over ~70 MB of lossless
+    # frames: 5 to 9 minutes, in parallel with samples-gfx rather than
+    # inside its budget.
+    timeout-minutes: 20
+    env:
+      APT_PKGS: ffmpeg ccache zlib1g-dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Build and run gfx_thumbnail_preview_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/gfx_thumbnail_preview
+        run: |
+          set -eu
+          # Regression test for the file-browser video preview in
+          # gfx/gfx_thumbnail.c, covering the windowed open, the
+          # anim-first status/alpha handshake, and the preview-audio
+          # hand-off to libretro-common/audio/audio_mixer.c.
+          #
+          # Every fault this pins was invisible to a decode-level
+          # test, which is why they shipped one after another:
+          #
+          #  - the windowed open produced a texture and reached
+          #    AVAILABLE but nothing raised alpha, so every video
+          #    decoded perfectly and drew at zero opacity;
+          #  - a LEADING moov left the demuxer's avail below the
+          #    media floor, so the first sample was unreachable, and
+          #    since the feeder anchors at tell==0 nothing ever
+          #    raised the bound - a standstill with no way out;
+          #  - a TRAILING moov cannot be reached by a resident head
+          #    at all, so preview audio was silent on every such
+          #    file until the moov island was committed instead;
+          #  - the mixer hand-off copied the whole container out of
+          #    a partially-committed window (SIGSEGV), took an
+          #    int32_t length that truncated a 7 GB container to
+          #    3.5 GB, dropped every feeder raise for want of an
+          #    M4A arm in audio_mixer_voice_set_avail (the same
+          #    second of audio on a loop), and applied the resident
+          #    bound only under HAVE_ROPUS.
+          #
+          # So this links the REAL gfx_thumbnail.c AND the REAL
+          # audio_mixer.c.  The earlier harness stubbed the mixer and
+          # was therefore modelling the two functions three of those
+          # defects lived in.  The stubbed audio thread consumes at a
+          # settable rate and TOUCHES every byte it is told is
+          # resident, so an over-claimed avail faults under ASan
+          # rather than passing quietly, and it counts feeder stalls
+          # (excluding the file end, where hitting the wall is the
+          # loop point rather than a starved feeder).
+          #
+          # The fixtures are container LAYOUTS, not clips - where the
+          # moov sits, whether media starts past 4 GiB, whether the
+          # moov outgrows the head - because layout is what every one
+          # of these faults turned on.  The multi-gigabyte ones are
+          # sparse: two 7.28 GB files cost ~400 KB of disk.
+          #
+          # The windowed-animation harness below decodes its two
+          # lossless fixtures three times each; they are sized just past
+          # what the feeder may keep resident (~43 MB and ~39 MB), and
+          # mkfixtures.py reuses an existing set, so the second
+          # "make fixtures" (TSan pass) costs nothing.  ~55 s under
+          # ASan on one core.
+          # Frame counts are set from measurement, not taste.  At 300
+          # ASan / 200 TSan frames this step took ~5.6 min on one
+          # core, against a job budget shared with a dozen others;
+          # 120 / 60 brings it to ~1.5 min and still crosses every
+          # window boundary the assertions rest on (the feeder moves
+          # at AUDIO_BYTES_PER_TICK, not per frame).  The job timeout
+          # goes to 20 min to leave headroom for the slowest runner.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          make fixtures
+          test -x gfx_thumbnail_preview_test
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 \
+          AUDIO_BYTES_PER_TICK=65536 FRAMES=120 timeout 300 \
+             ./gfx_thumbnail_preview_test fixtures/*.mp4 fixtures/anim_lossless.webp
+          echo "[pass] gfx_thumbnail_preview_test (ASan)"
+          mkdir -p fixtures/packet_span
+          ffmpeg -v error -y -f lavfi \
+             -i 'testsrc2=size=1280x720:rate=1,noise=alls=100:allf=t+u:all_seed=10' \
+             -t 3 -c:v libx264 -preset ultrafast -qp 0 -pix_fmt yuv420p \
+             -moov_size 16777216 fixtures/packet_span/large.mp4
+          for bin in gfx_thumbnail_preview_test gfx_thumbnail_preview_test_threaded; do
+             ASAN_OPTIONS=detect_leaks=1 MP4_PACKET_SPAN=1 timeout 120 \
+                ./$bin fixtures/packet_span/large.mp4
+          done
+          # HDR previews: with HDR_OUTPUT the stub driver keeps half
+          # floats and shows them as linear scRGB, and the PQ-tagged
+          # fixture must animate as them on the PQ EOTF of its grey; its
+          # SDR twin, and the HDR one without HDR output, must not upload
+          # a single half-float frame. Both decode paths: the poll's own
+          # here, the worker's jobs in the threaded build below.
+          HDRFX=../../formats/video_hdr_fp16/fixtures
+          for bin in gfx_thumbnail_preview_test gfx_thumbnail_preview_test_threaded; do
+             ASAN_OPTIONS=detect_leaks=1 NOAUDIO=1 THREADS=4 FRAMES=60 \
+             HDR_OUTPUT=1 HDR_EXPECT=1 timeout 120 ./$bin $HDRFX/hdr_hevc.mp4
+             ASAN_OPTIONS=detect_leaks=1 NOAUDIO=1 THREADS=4 FRAMES=60 \
+             HDR_OUTPUT=1 timeout 120 ./$bin $HDRFX/sdr_hevc.mp4
+             ASAN_OPTIONS=detect_leaks=1 NOAUDIO=1 THREADS=4 FRAMES=60 \
+             timeout 120 ./$bin $HDRFX/hdr_hevc.mp4
+          done
+          echo "[pass] gfx_thumbnail_preview HDR lanes"
+          # The same session with HAVE_THREADS: the thumbnail decodes on
+          # its worker and the pool, the app's own path, paced at a
+          # display's rate with a bound on the longest stall.
+          test -x gfx_thumbnail_preview_test_threaded
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 \
+          THREADS=4 FRAMES=180 PACE_HZ=60 PACE_MAX_STALL_MS=800 NOAUDIO=1 timeout 300 \
+             ./gfx_thumbnail_preview_test_threaded fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
+          echo "[pass] gfx_thumbnail_preview_test_threaded (ASan, 4 threads)"
+          # The frame-indexed types (animated WEBP, APNG) through the
+          # same session, windowed: animated WEBP had no progressive
+          # open, so the session read the whole file into the
+          # reservation (for every still WEBP thumbnail too) and
+          # charged one window for it; APNG had the open but no byte
+          # cursor, so the feeder never moved past the 12 MB primed at
+          # open and a longer animation looped early forever.  Mapping
+          # residency is measured with mincore, so the bound holds
+          # under the sanitizers.  ASan+UBSan only: the harness is
+          # single-threaded (no TSan target), and the lossless decode
+          # of ~900 720p frames takes it past the job budget under
+          # TSan (>5 min) for no coverage.
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./preview_av1_hw_test
+          test -x preview_anim_window_test
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          # V1 in this run plays long_video.mp4 (60 s at 4 Mbit/s,
+          # 29 MB, generated by mkfixtures) end to end through the
+          # session and requires the resident bytes to stay inside
+          # the bitrate-sized window: measured 5.25 MiB peak against
+          # the 20 MiB the fixed 4+8+8 MiB constants held before.
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 600 \
+             ./preview_anim_window_test fixtures
+          echo "[pass] preview_anim_window_test (ASan)"
+          # The decode test is the missing half of the harness above:
+          # the REAL mixer -> audio_transfer -> rmp4 -> raac chain over
+          # a budget-fed window, at budgets small enough that the
+          # decoder reaches the resident frontier.  The stubbed audio
+          # thread above models exactly the layer these faults lived
+          # in: no wall over the packets on the trailing-moov path
+          # (SIGSEGV inside raac_decode_frame the moment the decoder
+          # outran the feeder), demuxer bounds that refused to lower,
+          # a wall stall taken for end of stream (mid-file rewinds,
+          # then the voice released), and set_avail compiling to a
+          # no-op without HAVE_RWEBM - the _norwebm build exists for
+          # that last one.
+          test -x preview_audio_decode_test
+          test -x preview_audio_decode_test_norwebm
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 600 bash -c '
+             ./preview_audio_decode_test fixtures/trailing_large.mp4 1024 island
+             ./preview_audio_decode_test fixtures/trailing_large.mp4 262144 island
+             ./preview_audio_decode_test_norwebm fixtures/trailing_large.mp4 1024 island
+             ./preview_audio_decode_test_norwebm fixtures/trailing_large.mp4 262144 island'
+          echo "[pass] preview_audio_decode_test (ASan)"
+          # The threaded decode against the single-threaded one, frame
+          # for frame: the colour conversion in row bands on a pool,
+          # for the VP9 fixture (four tile columns) the columns decoded
+          # side by side, for the HEVC fixture (WPP) the CTB rows on a
+          # wavefront. Every frame must be byte-identical.
+          test -x preview_blit_bands_test
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 300 bash -c '
+             ./preview_blit_bands_test fixtures/long_video.mp4
+             ./preview_blit_bands_test fixtures/vp9_tiles.webm
+             ./preview_blit_bands_test fixtures/hevc_wpp.mp4
+             ./preview_blit_bands_test fixtures/bframes_hevc.mp4
+             ./preview_blit_bands_test fixtures/hevc_nowpp.mp4 fixtures/mbaff_h264.mp4
+             RH265_PUBLISH_DELAY=200 ./preview_blit_bands_test fixtures/hevc_wpp.mp4 fixtures/bframes_hevc.mp4 fixtures/hevc_nowpp.mp4'
+          echo "[pass] preview_blit_bands_test (ASan)"
+          # Catching up: behind the clock the stream drops only what
+          # nothing references, and every picture still shown is the
+          # full decode's; the threaded build does the same with four
+          # pictures in flight, the drops taken at submit.
+          test -x preview_catchup_test && test -x preview_catchup_test_threaded
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 300 bash -c '
+             ./preview_catchup_test fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
+             ./preview_catchup_test_threaded fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4'
+          echo "[pass] preview_catchup_test (ASan, one picture at a time and four in flight)"
+          # The audio chain against ffmpeg: the track's rate exact, the
+          # resampled one within a fraction of a percent, from the first
+          # half second.
+          test -x preview_audio_oracle_test
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 300 \
+             ./preview_audio_oracle_test fixtures/trailing_small.mp4 fixtures/trailing_large.mp4
+          echo "[pass] preview_audio_oracle_test (ASan)"
+          ./preview_audio_feed_test fixtures/audio_large_packet.m4a
+          ./preview_audio_feed_test --prepared-only fixtures/audio_seek_gap.m4a
+          make audio-timeline-check SANITIZER=address,undefined
+          ./preview_audio_feed_test --prepared-webm fixtures/audio-movie-timeline/timeline-aac-0.mkv fixtures/audio-movie-timeline/timeline-aac-1.mkv
+          ./preview_audio_feed_test --prepared-webm fixtures/audio_seek_opus.weba fixtures/audio_seek_vorbis.weba fixtures/audio_seek_opus_window.webm fixtures/audio_seek_vorbis_window.webm
+          CPU_GAP=1 ./gfx_thumbnail_preview_test fixtures/video_gap_head.webm
+          CPU_GAP=1 ./gfx_thumbnail_preview_test_threaded fixtures/video_gap_head.webm
+          CPU_GAP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test fixtures/video_gap_pin.webm
+          CPU_GAP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test_threaded fixtures/video_gap_pin.webm
+          CPU_GAP=1 CPU_GROUP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test fixtures/video_group.webm
+          CPU_GAP=1 CPU_GROUP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test_threaded fixtures/video_group.webm
+          GROUP_SEEK=1 ./gfx_thumbnail_preview_test fixtures/video_group.webm
+          GROUP_SEEK=1 ./gfx_thumbnail_preview_test_threaded fixtures/video_group.webm
+          for codec in opus vorbis; do
+            python3 webm_audio_padding.py --audio-group-void fixtures/audio_group_"$codec".webm fixtures/audio_refill_"$codec".webm
+          done
+          python3 webm_audio_padding.py --audio-group-void fixtures/audio_group_aac.mkv fixtures/audio_refill_aac.mkv
+          ./preview_audio_feed_test --continuous-webm fixtures/audio_refill_opus.webm
+          ./preview_audio_feed_test --continuous-webm fixtures/audio_refill_vorbis.webm
+          AUDIO_MOVIE_LOOPS=1 ./preview_audio_feed_test --continuous-webm fixtures/audio_refill_aac.mkv
+          ./preview_audio_feed_test --prepared-webm fixtures/audio_group_aac.mkv
+          ./preview_audio_feed_test --prepared-webm fixtures/audio_group_opus.webm fixtures/audio_group_vorbis.webm
+          AUDIO_FEED_RACE=1 ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_opus.webm
+          AUDIO_FEED_RACE=1 ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_vorbis.webm
+          make -B -j2 preview_audio_feed_test preview_audio_feed_test_threaded COUNT_IO=1 SANITIZER=address,undefined
+          ./preview_audio_feed_test --seek-batch
+          ./preview_audio_feed_test_threaded --seek-batch
+          CPU_MEDIA=1 TRANSPORT_PAUSE=1 TRANSPORT_SEEK=1 ./gfx_thumbnail_preview_test fixtures/trailing_small.mp4
+          CPU_MEDIA=1 TRANSPORT_PAUSE=1 TRANSPORT_SEEK=1 ./gfx_thumbnail_preview_test_threaded fixtures/trailing_small.mp4
+          python3 movie_timeline_fixtures.py fixtures/movie-timeline
+          for fixture in video-timeline-1.mp4 video-timeline-libopus.webm video-timeline-libvorbis.webm; do
+            FRONTEND_TIMELINE=1 ./gfx_thumbnail_preview_test fixtures/movie-timeline/"$fixture"
+            FRONTEND_TIMELINE=1 ./gfx_thumbnail_preview_test_threaded fixtures/movie-timeline/"$fixture"
+          done
+          # clean keeps fixtures/ by design; regenerate anyway so the
+          # step cannot silently run against an empty glob.
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          make fixtures
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 ./preview_av1_hw_test
+          TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 FRAMES=60 timeout 300 \
+             ./gfx_thumbnail_preview_test fixtures/*.mp4 fixtures/anim_lossless.webp
+          echo "[pass] gfx_thumbnail_preview_test (TSan)"
+          # and threaded under TSan, which is the run that can see a
+          # race between the worker, the pool and the poll
+          THREADS=4 FRAMES=180 PACE_HZ=60 PACE_MAX_STALL_MS=1500 NOAUDIO=1 timeout 300 \
+             ./gfx_thumbnail_preview_test_threaded fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
+          echo "[pass] gfx_thumbnail_preview_test_threaded (TSan, 4 threads)"
+          CPU_MEDIA=1 TRANSPORT_PAUSE=1 TRANSPORT_SEEK=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 ./gfx_thumbnail_preview_test_threaded fixtures/trailing_small.mp4
+          for fixture in video-timeline-1.mp4 video-timeline-libopus.webm video-timeline-libvorbis.webm; do
+            FRONTEND_TIMELINE=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 ./gfx_thumbnail_preview_test_threaded fixtures/movie-timeline/"$fixture"
+          done
+          for codec in opus vorbis; do
+            AUDIO_MOVIE_LOOPS=1 AUDIO_FEED_RACE=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 \
+              ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_"$codec".webm
+          done
+          AUDIO_MOVIE_LOOPS=1 AUDIO_FEED_RACE=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 \
+            ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_aac.mkv
+          # The pool and the tile-column threads under TSan: the
+          # shared frame buffers and contexts are written in disjoint
+          # columns, the counts merged after the join.
+          TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 timeout 300 bash -c '
+             ./preview_blit_bands_test fixtures/long_video.mp4
+             ./preview_blit_bands_test fixtures/vp9_tiles.webm
+             ./preview_blit_bands_test fixtures/hevc_wpp.mp4
+             ./preview_blit_bands_test fixtures/bframes_hevc.mp4
+             ./preview_blit_bands_test fixtures/hevc_nowpp.mp4 fixtures/mbaff_h264.mp4
+             RH265_PUBLISH_DELAY=200 ./preview_blit_bands_test fixtures/hevc_wpp.mp4 fixtures/bframes_hevc.mp4 fixtures/hevc_nowpp.mp4'
+          echo "[pass] preview_blit_bands_test (TSan)"
+          TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 timeout 300 bash -c '
+             ./preview_catchup_test_threaded fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4'
+          echo "[pass] preview_catchup_test_threaded (TSan)"
+          TSAN_OPTIONS=halt_on_error=1 timeout 600 bash -c '
+             ./preview_audio_decode_test fixtures/trailing_large.mp4 1024 island
+             ./preview_audio_decode_test fixtures/trailing_large.mp4 262144 island'
+          echo "[pass] preview_audio_decode_test (TSan)"
+
+      - name: Save ccache
+        # Only master's pushes keep a cache, as in samples-gfx
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

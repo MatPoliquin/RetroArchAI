@@ -24,12 +24,23 @@ RETRO_BEGIN_DECLS
 typedef struct ALIGN(16)
 {
    math_matrix_4x4   mvp;
-   float             contrast;         /* 2.0f    */
-   float             paper_white_nits; /* 200.0f  */
-   float             max_nits;         /* 1000.0f */
-   float             expand_gamut;     /* 1.0f    */
-   float             inverse_tonemap;  /* 1.0f    */
-   float             hdr10;            /* 1.0f    */
+   struct
+   {
+      float width;
+      float height;
+   } source_size;
+   struct
+   {
+      float width;
+      float height;
+   } output_size;
+   float             paper_white_nits;    /* 200.0f  */
+   unsigned          subpixel_layout;     /* 0       */
+   float             scanlines;           /* 1.0f    */
+   unsigned          expand_gamut;        /* 0       */
+   float             inverse_tonemap;     /* 1.0f    */
+   float             hdr10;               /* 1.0f    */
+   unsigned          hdr_mode;            /* 0 = off, 1 = HDR10, 2 = scRGB, 3 = PQ->scRGB */
 } dxgi_hdr_uniform_t;
 
 enum dxgi_swapchain_bit_depth
@@ -274,7 +285,7 @@ enum dxgi_swapchain_bit_depth
 #endif
 
 #include <assert.h>
-#include <dxgi1_6.h>
+#include "../include/dxsdk/dxgi1_6.h"
 
 #ifndef countof
 #define countof(a) (sizeof(a) / sizeof(*a))
@@ -304,6 +315,32 @@ static INLINE ULONG Release(void* object)
 #if !defined(__cplusplus) || defined(CINTERFACE)
 #ifndef COM_ADDREF_DECLARED
 #define COM_ADDREF_DECLARED
+/* Keep a screenshot read window inside the source surface.
+ *
+ * read_viewport copies a (w x h) window starting at (x, y) out of a
+ * mapped copy of the backbuffer.  The viewport comes from user settings
+ * (custom aspect ratio) and can hang off the right or bottom edge, in
+ * which case the copy loops would read past the end of each row and,
+ * on the last rows, past the end of the mapping.
+ *
+ * w / h are also the stride and row count of the caller's output
+ * buffer, so they must not shrink here any further than the caller
+ * already expects (it clamps to the output size the same way).  The
+ * window is slid back inside the surface instead. */
+static INLINE void dxgi_readback_clamp_window(
+      unsigned src_w, unsigned src_h,
+      unsigned *x, unsigned *y, unsigned *w, unsigned *h)
+{
+   if (*w > src_w)
+      *w = src_w;
+   if (*h > src_h)
+      *h = src_h;
+   if (*x > src_w - *w)
+      *x = src_w - *w;
+   if (*y > src_h - *h)
+      *y = src_h - *h;
+}
+
 static INLINE ULONG AddRef(void* object)
 {
    if (object)
@@ -347,9 +384,41 @@ static INLINE HRESULT DXGIMakeWindowAssociation(DXGIFactory1 factory, HWND windo
    return factory->lpVtbl->MakeWindowAssociation(factory, window_handle, flags);
 }
 
+static const GUID libretro_IID_IDXGIFactory2 = { 0x50c83a1c,0xe072,0x4c48, { 0x87,0xb0,0x36,0x30,0xfa,0x36,0xa6,0xd0 } };
+
+/* Flip model: allows setting scaling to DXGI_SCALING_NONE, preventing the frame stretching
+ * that the legacy CreateSwapChain() causes when switching screen modes. */
 static INLINE HRESULT DXGICreateSwapChain(
       DXGIFactory1 factory, void* device, DXGI_SWAP_CHAIN_DESC* desc, DXGISwapChain* swap_chain)
 {
+   IDXGIFactory2 *factory2 = NULL;
+#ifdef __cplusplus
+   REFIID factory2_iid = libretro_IID_IDXGIFactory2;
+#else
+   REFIID factory2_iid = &libretro_IID_IDXGIFactory2;
+#endif
+   if (     desc->SwapEffect >= DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+         && SUCCEEDED(factory->lpVtbl->QueryInterface(factory,
+               factory2_iid, (void**)&factory2)))
+   {
+      HRESULT hr;
+      DXGI_SWAP_CHAIN_DESC1 desc1 = {0};
+      desc1.Width       = desc->BufferDesc.Width;
+      desc1.Height      = desc->BufferDesc.Height;
+      desc1.Format      = desc->BufferDesc.Format;
+      desc1.SampleDesc  = desc->SampleDesc;
+      desc1.BufferUsage = desc->BufferUsage;
+      desc1.BufferCount = desc->BufferCount;
+      desc1.Scaling     = DXGI_SCALING_NONE;
+      desc1.SwapEffect  = desc->SwapEffect;
+      desc1.Flags       = desc->Flags;
+      hr = factory2->lpVtbl->CreateSwapChainForHwnd(factory2,
+            (IUnknown*)device, desc->OutputWindow, &desc1, NULL, NULL,
+            (IDXGISwapChain1**)swap_chain);
+      factory2->lpVtbl->Release(factory2);
+      if (SUCCEEDED(hr))
+         return hr;
+   }
    return factory->lpVtbl->CreateSwapChain(
          factory, (IUnknown*)device, desc, (IDXGISwapChain**)swap_chain);
 }
@@ -447,9 +516,21 @@ void dxgi_copy(
       int         dst_pitch,
       void*       dst_data);
 
+/* Whether @chain has a frame latency waitable object to ask for: an
+ * IDXGISwapChain2, which Windows 7's and Wine's are not */
+bool dxgi_swapchain_waitable(DXGISwapChain chain);
+
 #ifdef HAVE_DXGI_HDR
 #ifdef __WINRT__
 bool dxgi_check_display_hdr_support(DXGIFactory2 factory, HWND hwnd);
+
+/* Applies, on the main thread, the HDR-setting disable the frame-path
+ * support check may have flagged; called from video_driver_frame. */
+void dxgi_hdr_process_deferred_disable(void);
+
+/* Self-contained probe: creates and releases its own factory, so the
+ * caller's TU needs no COM headers. See dxgi_common.c for details. */
+bool dxgi_display_hdr_active(HWND hwnd);
 #else
 bool dxgi_check_display_hdr_support(DXGIFactory1 factory, HWND hwnd);
 #endif
@@ -463,8 +544,65 @@ void dxgi_set_hdr_metadata(
       float                         max_output_nits,
       float                         min_output_nits,
       float                         max_cll,
-      float                         max_fall
+      float                         max_fall,
+      float                         display_peak
 );
+
+/* Convert an HDR swapchain-format pixel buffer into SDR BGR24 bottom-up,
+ * suitable for a screenshot.  src_format is the swapchain format:
+ *   - DXGI_FORMAT_R10G10B10A2_UNORM : HDR10 (ST.2084 PQ, BT.2020)
+ *   - DXGI_FORMAT_R16G16B16A16_FLOAT: scRGB (linear BT.709, 1.0 = 80 nits)
+ * paper_white_nits is the user's configured SDR paper-white (typically
+ * 200), used to scale the HDR encoding back down so SDR content in the
+ * original framebuffer maps back to SDR 1.0.  Source is top-down; the
+ * output is laid out bottom-up to match the read_viewport contract.
+ * Returns false if the format is not an HDR format we handle. */
+bool dxgi_hdr_readback_to_bgr24(
+      DXGI_FORMAT  src_format,
+      const void*  src_data,
+      unsigned     src_pitch,
+      unsigned     src_x,
+      unsigned     src_y,
+      unsigned     width,
+      unsigned     height,
+      float        paper_white_nits,
+      uint8_t*     dst_bgr24);
+
+struct rpng_hdr_metadata;
+
+/* Native (no tone-map) HDR read-back decode for HDR screenshots:
+ * converts the raw swapchain pixels to three uint16_t per pixel
+ * (R,G,B host order), PQ-coded and bottom-up, matching the
+ * read_viewport_hdr contract and the vulkan driver's output:
+ *   - R10G10B10A2_UNORM : channels widened 10->16 by bit replication
+ *   - R16G16B16A16_FLOAT: halves decoded, scaled to nits, PQ-encoded
+ *     (extended range clamps to [0,10000] nits)
+ * MaxCLL / MaxFALL (nits, from the brightest channel per pixel) are
+ * returned for the PNG cLLI chunk.  Returns false on formats it does
+ * not handle. */
+bool dxgi_hdr_readback_to_rgb16(
+      DXGI_FORMAT  src_format,
+      const void*  src_data,
+      unsigned     src_pitch,
+      unsigned     src_x,
+      unsigned     src_y,
+      unsigned     width,
+      unsigned     height,
+      uint16_t*    dst_rgb48,
+      float*       out_max_cll,
+      float*       out_max_fall);
+
+/* Fills PNG HDR metadata the same way the vulkan driver does: PQ
+ * transfer, BT.2100 primaries for HDR10 sources or BT.709 for scRGB,
+ * D65 white point, cLLI from the measured light levels and mDCV from
+ * the configured output luminance range. */
+void dxgi_hdr_meta_fill(
+      struct rpng_hdr_metadata *meta,
+      bool         is_scrgb,
+      float        max_cll,
+      float        max_fall,
+      float        max_luminance,
+      float        min_luminance);
 #endif
 
 DXGI_FORMAT glslang_format_to_dxgi(glslang_format fmt);

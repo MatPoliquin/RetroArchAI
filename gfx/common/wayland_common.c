@@ -22,19 +22,21 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <poll.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "wayland_common.h"
+#include "../gfx/video_driver.h"
 #include "../../frontend/frontend_driver.h"
 #include "../../verbosity.h"
+#include "../../runloop.h"
 
-#ifdef HAVE_DBUS
 #include "dbus_common.h"
-#endif
 
 #define SPLASH_SHM_NAME "retroarch-wayland-vk-splash"
 
-#define WINDOW_TITLE "RetroArch"
+#define DEFAULT_WINDOW_TITLE "RetroArch"
+#define MAIN_WINDOW_TAG "main window"
 
 #ifdef HAVE_LIBDECOR_H
 #include <libdecor.h>
@@ -82,87 +84,100 @@ static const unsigned long retroarch_icon_data[] = {
 0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000
 };
 
-void xdg_toplevel_handle_configure_common(gfx_ctx_wayland_data_t *wl,
-      void *toplevel,
-      int32_t width, int32_t height, struct wl_array *states)
+/* Detects a fullscreen sizing bug on some hardware and/or compositors */
+static bool gfx_ctx_wl_should_use_legacy_fullscreen_configure(
+      gfx_ctx_wayland_data_t *wl, int width, int height)
 {
-   const uint32_t *state;
-   bool floating              = true;
+   if (!wl)
+      return false;
 
-   wl->fullscreen             = false;
-   wl->maximized              = false;
+   if (width <= 0 || height <= 0)
+      return false;
 
-   WL_ARRAY_FOR_EACH(state, states, const uint32_t*)
-   {
-      switch (*state)
-      {
-         case XDG_TOPLEVEL_STATE_FULLSCREEN:
-            wl->fullscreen = true;
-            floating       = false;
-            break;
-         case XDG_TOPLEVEL_STATE_MAXIMIZED:
-            wl->maximized  = true;
-            /* fall-through */
-         case XDG_TOPLEVEL_STATE_TILED_LEFT:
-         case XDG_TOPLEVEL_STATE_TILED_RIGHT:
-         case XDG_TOPLEVEL_STATE_TILED_TOP:
-         case XDG_TOPLEVEL_STATE_TILED_BOTTOM:
-            floating       = false;
-            break;
-         case XDG_TOPLEVEL_STATE_RESIZING:
-            wl->resize     = true;
-            break;
-         case XDG_TOPLEVEL_STATE_ACTIVATED:
-            wl->activated  = true;
-            break;
-      }
-   }
+   /* If the fullscreen menu appears the same size as the SPLASH_WINDOW
+    * (240x256), then fall back to the legacy fullscreen configure path */
+   if (width <= SPLASH_WINDOW_WIDTH && height <= SPLASH_WINDOW_HEIGHT)
+      return true;
+
+   return false;
+}
+
+/* Apply a latched xdg_toplevel configuration.  Runs from the
+ * xdg_surface.configure handler: per xdg-shell, toplevel configure
+ * events describe pending state that only becomes current when the
+ * compositor sends xdg_surface.configure. */
+static void xdg_configure_apply(gfx_ctx_wayland_data_t *wl)
+{
+   int32_t width  = VIDEO_SCALE_W(wl->cfg_pending.dims);
+   int32_t height = VIDEO_SCALE_H(wl->cfg_pending.dims);
+   bool floating  = wl->cfg_pending.floating;
+
+   wl->fullscreen = wl->cfg_pending.fullscreen;
+   if (wl->fullscreen == wl->fullscreen_requested)
+      wl->fullscreen_pending = false;
+   wl->maximized  = wl->cfg_pending.maximized;
+   if (wl->cfg_pending.resizing)
+      wl->resize  = true;
+   if (wl->cfg_pending.activated)
+      wl->activated = true;
+   wl->suspended  = wl->cfg_pending.suspended;
 
    if (width == 0 || height == 0)
    {
-      width  = wl->floating_width;
-      height = wl->floating_height;
+      width  = VIDEO_SCALE_W(wl->floating_dims);
+      height = VIDEO_SCALE_H(wl->floating_dims);
+   }
+
+   if (wl->fullscreen
+         && gfx_ctx_wl_should_use_legacy_fullscreen_configure(
+            wl, width, height))
+   {
+      /* Fullscreen matches SPLASH_WINDOW size: fall back to legacy path */
+      wl->ignore_configuration = true;
+      width                    = 0;
+      height                   = 0;
    }
 
    if (     (width  > 0)
          && (height > 0))
    {
-      wl->width         = width;
-      wl->height        = height;
-      wl->buffer_width  = wl->fractional_scale ?
-         FRACTIONAL_SCALE_MULT(wl->width,  wl->fractional_scale_num) : wl->width  * wl->buffer_scale;
-      wl->buffer_height = wl->fractional_scale ?
-         FRACTIONAL_SCALE_MULT(wl->height, wl->fractional_scale_num) : wl->height * wl->buffer_scale;
+      wl->dims          = VIDEO_SCALE_PACK(width, height);
+      wl->buffer_dims   = VIDEO_SCALE_PACK(
+         wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(width,  wl->fractional_scale_num)
+            : width  * wl->buffer_scale,
+         wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(height, wl->fractional_scale_num)
+            : height * wl->buffer_scale);
       wl->resize        = true;
       if (wl->viewport)
       {
          /* Stretch old buffer to fill new size, commit/roundtrip to apply */
-         wp_viewport_set_destination(wl->viewport, wl->width, wl->height);
+         wp_viewport_set_destination(wl->viewport,
+               VIDEO_SCALE_W(wl->dims), VIDEO_SCALE_H(wl->dims));
          wl_surface_commit(wl->surface);
       }
    }
 
    if (floating)
-   {
-      wl->floating_width  = width;
-      wl->floating_height = height;
-   }
+      wl->floating_dims = VIDEO_SCALE_PACK(width, height);
 }
 
-void xdg_toplevel_handle_close(void *data,
+static void xdg_toplevel_handle_close(void *data,
       struct xdg_toplevel *xdg_toplevel)
 {
    frontend_driver_set_signal_handler_state(1);
 }
 
 #ifdef HAVE_LIBDECOR_H
-void libdecor_frame_handle_configure_common(struct libdecor_frame *frame,
+static void libdecor_frame_handle_configure_common(struct libdecor_frame *frame,
       struct libdecor_configuration *configuration,
       gfx_ctx_wayland_data_t *wl)
 {
    int width = 0, height = 0;
    struct libdecor_state *state = NULL;
    enum libdecor_window_state window_state;
+   bool fullscreen_pending = wl->fullscreen_pending;
 #if 0
    static const enum
       libdecor_window_state tiled_states = (
@@ -181,61 +196,219 @@ void libdecor_frame_handle_configure_common(struct libdecor_frame *frame,
    if (wl->libdecor_configuration_get_window_state(
          configuration, &window_state))
    {
+      /* LIBDECOR_WINDOW_STATE_SUSPENDED (libdecor >= 0.2.0); numeric
+       * value used so older libdecor headers still compile.  Older
+       * runtimes never set the bit. */
       wl->fullscreen = (window_state & LIBDECOR_WINDOW_STATE_FULLSCREEN) != 0;
       wl->maximized  = (window_state & LIBDECOR_WINDOW_STATE_MAXIMIZED) != 0;
+      wl->suspended  = (window_state & (1 << 7)) != 0;
 #if 0
       focused        = (window_state & LIBDECOR_WINDOW_STATE_ACTIVE) != 0;
       tiled          = (window_state & tiled_states) != 0;
 #endif
    }
 
+   if (wl->fullscreen == wl->fullscreen_requested)
+      wl->fullscreen_pending = false;
+
    if (!wl->libdecor_configuration_get_content_size(configuration, frame,
          &width, &height))
    {
-      width  = wl->floating_width;
-      height = wl->floating_height;
+      width  = VIDEO_SCALE_W(wl->floating_dims);
+      height = VIDEO_SCALE_H(wl->floating_dims);
+   }
+
+   if (wl->fullscreen
+         && gfx_ctx_wl_should_use_legacy_fullscreen_configure(
+            wl, width, height))
+   {
+      /* Fullscreen matches SPLASH_WINDOW size: fall back to legacy path */
+      wl->ignore_configuration = true;
+      width                    = 0;
+      height                   = 0;
    }
 
    if (     width  > 0
          && height > 0)
    {
-      wl->width         = width;
-      wl->height        = height;
-      wl->buffer_width  = wl->fractional_scale ?
-         FRACTIONAL_SCALE_MULT(width,  wl->fractional_scale_num) : width  * wl->buffer_scale;
-      wl->buffer_height = wl->fractional_scale ?
-         FRACTIONAL_SCALE_MULT(height, wl->fractional_scale_num) : height * wl->buffer_scale;
+      wl->dims          = VIDEO_SCALE_PACK(width, height);
+      wl->buffer_dims   = VIDEO_SCALE_PACK(
+         wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(width,  wl->fractional_scale_num)
+            : width  * wl->buffer_scale,
+         wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(height, wl->fractional_scale_num)
+            : height * wl->buffer_scale);
       wl->resize        = true;
       if (wl->viewport)
       {
          /* Stretch old buffer to fill new size, commit/roundtrip to apply */
-         wp_viewport_set_destination(wl->viewport, wl->width, wl->height);
-         wl_surface_commit(wl->surface);
+         wp_viewport_set_destination(wl->viewport,
+               VIDEO_SCALE_W(wl->dims), VIDEO_SCALE_H(wl->dims));
       }
    }
 
-   state = wl->libdecor_state_new(wl->width, wl->height);
+   state = wl->libdecor_state_new(VIDEO_SCALE_W(wl->dims),
+         VIDEO_SCALE_H(wl->dims));
    wl->libdecor_frame_commit(frame, state, configuration);
    wl->libdecor_state_free(state);
+   if (fullscreen_pending && !wl->fullscreen_pending)
+      wl->libdecor_frame_set_visibility(frame, !wl->fullscreen);
+   if (wl->viewport)
+      wl_surface_commit(wl->surface);
 
    if (wl->libdecor_frame_is_floating(frame))
-   {
-      wl->floating_width  = width;
-      wl->floating_height = height;
-   }
+      wl->floating_dims = VIDEO_SCALE_PACK(width, height);
 }
 
-void libdecor_frame_handle_close(struct libdecor_frame *frame,
+static void libdecor_frame_handle_close(struct libdecor_frame *frame,
       void *data)
 {
    frontend_driver_set_signal_handler_state(1);
 }
-void libdecor_frame_handle_commit(struct libdecor_frame *frame,
+static void libdecor_frame_handle_commit(struct libdecor_frame *frame,
       void *data) { }
+
+static void libdecor_frame_handle_configure(struct libdecor_frame *frame,
+      struct libdecor_configuration *configuration, void *data)
+{
+   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
+   if (wl->ignore_configuration)
+   {
+      /* Committing the configuration is what acknowledges it; an
+       * unacknowledged one leaves the frame's state stale and the
+       * compositor waiting. Keep the current size. */
+      struct libdecor_state *state = wl->libdecor_state_new(
+            VIDEO_SCALE_W(wl->dims), VIDEO_SCALE_H(wl->dims));
+      wl->libdecor_frame_commit(frame, state, configuration);
+      wl->libdecor_state_free(state);
+      return;
+   }
+   libdecor_frame_handle_configure_common(frame, configuration, wl);
+   if (wl->driver_configure_handler)
+      wl->driver_configure_handler(wl);
+   wl->configured = false;
+}
+
+static void libdecor_handle_err(struct libdecor *context,
+      enum libdecor_error err, const char *message)
+{
+   RARCH_ERR("[Wayland] libdecor Caught error (%d): %s.\n", err, message);
+}
+
+static const struct libdecor_interface libdecor_interface = {
+   .error = libdecor_handle_err,
+};
+
+static const struct libdecor_frame_interface wl_libdecor_frame_interface = {
+   libdecor_frame_handle_configure,
+   libdecor_frame_handle_close,
+   libdecor_frame_handle_commit,
+};
 #endif
 
-void gfx_ctx_wl_get_video_size_common(void *data,
-      unsigned *width, unsigned *height)
+static void xdg_toplevel_handle_configure(void *data,
+      struct xdg_toplevel *toplevel,
+      int32_t width, int32_t height, struct wl_array *states)
+{
+   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
+   const uint32_t *state;
+
+   /* Record only; the state is pending until xdg_surface.configure.
+    * A later toplevel.configure before the surface.configure
+    * supersedes this one (last-wins), matching the protocol. */
+   wl->cfg_pending.dims       = VIDEO_SCALE_PACK(width, height);
+   wl->cfg_pending.fullscreen = false;
+   wl->cfg_pending.maximized  = false;
+   wl->cfg_pending.resizing   = false;
+   wl->cfg_pending.activated  = false;
+   wl->cfg_pending.floating   = true;
+   wl->cfg_pending.suspended  = false;
+
+   WL_ARRAY_FOR_EACH(state, states, const uint32_t*)
+   {
+      switch (*state)
+      {
+         case XDG_TOPLEVEL_STATE_FULLSCREEN:
+            wl->cfg_pending.fullscreen = true;
+            wl->cfg_pending.floating   = false;
+            break;
+         case XDG_TOPLEVEL_STATE_MAXIMIZED:
+            wl->cfg_pending.maximized  = true;
+            /* fall-through */
+         case XDG_TOPLEVEL_STATE_TILED_LEFT:
+         case XDG_TOPLEVEL_STATE_TILED_RIGHT:
+         case XDG_TOPLEVEL_STATE_TILED_TOP:
+         case XDG_TOPLEVEL_STATE_TILED_BOTTOM:
+            wl->cfg_pending.floating   = false;
+            break;
+         case XDG_TOPLEVEL_STATE_RESIZING:
+            wl->cfg_pending.resizing   = true;
+            break;
+         case XDG_TOPLEVEL_STATE_ACTIVATED:
+            wl->cfg_pending.activated  = true;
+            break;
+         case XDG_TOPLEVEL_STATE_SUSPENDED:
+            wl->cfg_pending.suspended  = true;
+            break;
+      }
+   }
+
+   wl->cfg_pending.pending = true;
+}
+
+static void xdg_surface_handle_configure_latch(void *data,
+      struct xdg_surface *xdg_surface, uint32_t serial)
+{
+   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
+
+   /* Size-dependent commits below must acknowledge the new state first. */
+   xdg_surface_ack_configure(xdg_surface, serial);
+
+   if (wl->cfg_pending.pending)
+   {
+      wl->cfg_pending.pending = false;
+      /* ignore_configuration drops the configuration exactly as the
+       * pre-latching code dropped it at toplevel.configure time;
+       * evaluated here, at the atomic point. */
+      if (!wl->ignore_configuration)
+      {
+         xdg_configure_apply(wl);
+         if (wl->driver_configure_handler)
+            wl->driver_configure_handler(wl);
+         wl->configured = false;
+      }
+   }
+}
+
+static const struct xdg_surface_listener wl_xdg_surface_listener = {
+   xdg_surface_handle_configure_latch,
+};
+
+static void xdg_toplevel_handle_configure_bounds(void *data,
+      struct xdg_toplevel *xdg_toplevel,
+      int32_t width, int32_t height)
+{
+   /* Advisory maximum size (since v4); RetroArch sizes from the
+    * configure events themselves, so nothing to do. */
+}
+
+static void xdg_toplevel_handle_wm_capabilities(void *data,
+      struct xdg_toplevel *xdg_toplevel,
+      struct wl_array *capabilities)
+{
+   /* Advertised WM actions (since v5); RetroArch does not currently
+    * tailor its UI to them. */
+}
+
+static const struct xdg_toplevel_listener wl_xdg_toplevel_listener = {
+   xdg_toplevel_handle_configure,
+   xdg_toplevel_handle_close,
+   xdg_toplevel_handle_configure_bounds,
+   xdg_toplevel_handle_wm_capabilities,
+};
+
+void gfx_ctx_wl_get_video_size_common(void *data, unsigned *dims)
 {
    gfx_ctx_wayland_data_t *wl   = (gfx_ctx_wayland_data_t*)data;
    if (!wl)
@@ -255,16 +428,31 @@ void gfx_ctx_wl_get_video_size_common(void *data,
             break;
          };
 
-      *width  = oi->width;
-      *height = oi->height;
+      /* all_outputs may legitimately be empty (last monitor was hot-
+       * unplugged before frame size was queried); leave the caller's
+       * dims unchanged rather than NULL-deref oi. */
+      if (!oi)
+         return;
+
+      *dims = oi->dims;
    }
    else
-   {
-     *width  = wl->fractional_scale ?
-        FRACTIONAL_SCALE_MULT(wl->width,  wl->pending_fractional_scale_num) : wl->width  * wl->pending_buffer_scale;
-     *height = wl->fractional_scale ?
-        FRACTIONAL_SCALE_MULT(wl->height, wl->pending_fractional_scale_num) : wl->height * wl->pending_buffer_scale;
-   }
+      *dims = VIDEO_SCALE_PACK(
+            wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(VIDEO_SCALE_W(wl->dims),
+               wl->pending_fractional_scale_num)
+            : VIDEO_SCALE_W(wl->dims) * wl->pending_buffer_scale,
+            wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(VIDEO_SCALE_H(wl->dims),
+               wl->pending_fractional_scale_num)
+            : VIDEO_SCALE_H(wl->dims) * wl->pending_buffer_scale);
+}
+
+static void shm_buffer_free(shm_buffer_t *buffer)
+{
+   wl_buffer_destroy(buffer->wl_buffer);
+   munmap(buffer->data, buffer->data_size);
+   free(buffer);
 }
 
 void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
@@ -274,47 +462,67 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
 #endif
 
    if (wl->wl_keyboard)
-      wl_keyboard_destroy(wl->wl_keyboard);
+      wayland_keyboard_release(wl->wl_keyboard);
+   /* (this was never destroyed; it went with the connection) */
+   if (wl->wl_relative_pointer)
+      zwp_relative_pointer_v1_destroy(wl->wl_relative_pointer);
+   wl->wl_relative_pointer = NULL;
    if (wl->wl_pointer)
-      wl_pointer_destroy(wl->wl_pointer);
+      wayland_pointer_release(wl->wl_pointer);
    if (wl->wl_touch)
-      wl_touch_destroy(wl->wl_touch);
+      wayland_touch_release(wl->wl_touch);
 
-   if (wl->cursor.theme)
-      wl_cursor_theme_destroy(wl->cursor.theme);
    if (wl->cursor.surface)
       wl_surface_destroy(wl->cursor.surface);
+   if (wl->cursor.theme)
+      wl_cursor_theme_destroy(wl->cursor.theme);
 
    if (wl->viewport)
       wp_viewport_destroy(wl->viewport);
    if (wl->fractional_scale)
       wp_fractional_scale_v1_destroy(wl->fractional_scale);
+   if (wl->tearing_control)
+      wp_tearing_control_v1_destroy(wl->tearing_control);
    if (wl->idle_inhibitor)
       zwp_idle_inhibitor_v1_destroy(wl->idle_inhibitor);
    if (wl->deco)
       zxdg_toplevel_decoration_v1_destroy(wl->deco);
    if (wl->xdg_toplevel)
       xdg_toplevel_destroy(wl->xdg_toplevel);
-   if (wl->xdg_toplevel_icon_manager)
-      xdg_toplevel_icon_manager_v1_destroy(wl->xdg_toplevel_icon_manager);
-   if (wl->xdg_toplevel_icon)
-      xdg_toplevel_icon_v1_destroy(wl->xdg_toplevel_icon);
    if (wl->xdg_surface)
       xdg_surface_destroy(wl->xdg_surface);
+#ifdef HAVE_LIBDECOR_H
+   /* The frame owns xdg objects built on wl->surface and the context
+    * still talks to the display, so release before both go away. */
+   if (wl->libdecor_frame)
+      wl->libdecor_frame_unref(wl->libdecor_frame);
+   if (wl->libdecor_context)
+      wl->libdecor_unref(wl->libdecor_context);
+   if (wl->libdecor)
+      dylib_close(wl->libdecor);
+#endif
+   /* Colour management objects go before the surface they describe */
+   wl_color_destroy(&wl->color);
+   video_driver_set_display_peak_nits(0.0f);
    if (wl->surface)
       wl_surface_destroy(wl->surface);
 
    if (wl->deco_manager)
       zxdg_decoration_manager_v1_destroy(wl->deco_manager);
+   if (wl->xdg_toplevel_icon_manager)
+      xdg_toplevel_icon_manager_v1_destroy(wl->xdg_toplevel_icon_manager);
+   if (wl->xdg_toplevel_tag_manager)
+      xdg_toplevel_tag_manager_v1_destroy(wl->xdg_toplevel_tag_manager);
    if (wl->idle_inhibit_manager)
       zwp_idle_inhibit_manager_v1_destroy(wl->idle_inhibit_manager);
    else
    {
-#ifdef HAVE_DBUS
-      dbus_screensaver_uninhibit();
+#ifdef RARCH_HAVE_DBUS_SCREENSAVER
       dbus_close_connection();
 #endif
    }
+   if (wl->tearing_control_manager)
+      wp_tearing_control_manager_v1_destroy(wl->tearing_control_manager);
    if (wl->pointer_constraints)
       zwp_pointer_constraints_v1_destroy(wl->pointer_constraints);
    if (wl->relative_pointer_manager)
@@ -330,9 +538,18 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
    if (wl->single_pixel_manager)
       wp_single_pixel_buffer_manager_v1_destroy (wl->single_pixel_manager);
    if (wl->seat)
-      wl_seat_destroy(wl->seat);
+      wayland_seat_release(wl->seat);
    if (wl->xdg_shell)
       xdg_wm_base_destroy(wl->xdg_shell);
+   if (wl->data_device)
+   {
+      if (wl_data_device_get_version(wl->data_device)
+            >= WL_DATA_DEVICE_RELEASE_SINCE_VERSION)
+         wl_data_device_release(wl->data_device);
+      else
+         wl_data_device_destroy(wl->data_device);
+      wl->data_device = NULL;
+   }
    if (wl->data_device_manager)
       wl_data_device_manager_destroy (wl->data_device_manager);
    while (!wl_list_empty(&wl->current_outputs))
@@ -345,8 +562,10 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
    {
       display_output_t *od = wl_container_of(wl->all_outputs.next, od, link);
       output_info_t    *oi = od->output;
-      wl_output_destroy(oi->output);
+      wayland_output_release(oi->output);
       wl_list_remove(&od->link);
+      free(oi->make);
+      free(oi->model);
       free(oi);
       free(od);
    }
@@ -356,10 +575,25 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
       wp_viewporter_destroy(wl->viewporter);
    if (wl->fractional_scale_manager)
       wp_fractional_scale_manager_v1_destroy(wl->fractional_scale_manager);
+   wl_present_destroy(&wl->present);
+   wl_frame_destroy(&wl->frame);
    if (wl->compositor)
       wl_compositor_destroy(wl->compositor);
    if (wl->registry)
       wl_registry_destroy(wl->registry);
+
+   if (wl->input.events)
+      RARCH_DBG("[Wayland] Input events handled: %u, of them on a thread"
+            " other than the frontend's: %u.\n",
+            wl->input.events, wl->input.events_elsewhere);
+   wl->input.events              = 0;
+   wl->input.events_elsewhere    = 0;
+
+   /* after the seat and its devices, which were on it, and before the
+    * connection */
+   if (wl->input.queue)
+      wl_event_queue_destroy(wl->input.queue);
+   wl->input.queue               = NULL;
 
    if (wl->input.dpy)
    {
@@ -383,21 +617,26 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
    wl->idle_inhibit_manager      = NULL;
    wl->deco_manager              = NULL;
    wl->single_pixel_manager      = NULL;
+   wl->tearing_control_manager   = NULL;
+   wl->tearing_control           = NULL;
    wl->surface                   = NULL;
    wl->xdg_surface               = NULL;
    wl->xdg_toplevel              = NULL;
-   wl->xdg_toplevel_icon         = NULL;
    wl->xdg_toplevel_icon_manager = NULL;
+   wl->xdg_toplevel_tag_manager  = NULL;
    wl->deco                      = NULL;
+#ifdef HAVE_LIBDECOR_H
+   wl->libdecor_frame            = NULL;
+   wl->libdecor_context          = NULL;
+   wl->libdecor                  = NULL;
+#endif
    wl->idle_inhibitor            = NULL;
    wl->wl_touch                  = NULL;
    wl->wl_pointer                = NULL;
    wl->wl_keyboard               = NULL;
 
-   wl->width                    = 0;
-   wl->height                   = 0;
-   wl->buffer_width             = 0;
-   wl->buffer_height            = 0;
+   wl->dims                     = 0;
+   wl->buffer_dims              = 0;
 }
 
 void gfx_ctx_wl_update_title_common(void *data)
@@ -429,43 +668,6 @@ void gfx_ctx_wl_update_title_common(void *data)
          }
       }
    }
-}
-
-bool gfx_ctx_wl_get_metrics_common(void *data,
-      enum display_metric_types type, float *value)
-{
-   display_output_t *od;
-   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-   output_info_t *oi          = wl ? wl->current_output : NULL;
-
-   if (!oi)
-      wl_list_for_each(od, &wl->all_outputs, link)
-      {
-         oi = od->output;
-         break;
-      };
-
-   switch (type)
-   {
-      case DISPLAY_METRIC_MM_WIDTH:
-         *value = (float)oi->physical_width;
-         break;
-
-      case DISPLAY_METRIC_MM_HEIGHT:
-         *value = (float)oi->physical_height;
-         break;
-
-      case DISPLAY_METRIC_DPI:
-         *value =   (float)oi->width * 25.4f
-                  / (float)oi->physical_width;
-         break;
-
-      default:
-         *value = 0.0f;
-         return false;
-   }
-
-   return true;
 }
 
 static int create_shm_file(off_t size)
@@ -518,7 +720,7 @@ static shm_buffer_t *create_shm_buffer(gfx_ctx_wayland_data_t *wl, int width,
    int height,
    uint32_t format)
 {
-   int fd, ofd;
+   int fd;
    struct wl_shm_pool *pool = NULL;
    void *data               = NULL;
    shm_buffer_t *buffer     = NULL;
@@ -530,7 +732,7 @@ static shm_buffer_t *create_shm_buffer(gfx_ctx_wayland_data_t *wl, int width,
 
    if ((fd = create_shm_file(size)) < 0)
    {
-      RARCH_ERR("[Wayland] [SHM]: Creating a buffer file for %d B failed\n",
+      RARCH_ERR("[Wayland] [SHM] Creating a buffer file for %d B failed.\n",
          size);
       return NULL;
    }
@@ -538,12 +740,25 @@ static shm_buffer_t *create_shm_buffer(gfx_ctx_wayland_data_t *wl, int width,
    data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
    if (data == MAP_FAILED)
    {
-      RARCH_ERR("[Wayland] [SHM]: mmap failed\n");
+      RARCH_ERR("[Wayland] [SHM] mmap failed.\n");
       close(fd);
       return NULL;
    }
 
-   buffer            = calloc(1, sizeof *buffer);
+   /* Guard the calloc before dereferencing buffer below.  The
+    * previous form immediately wrote 'buffer->wl_buffer = ...' with
+    * no check; an OOM returning NULL from calloc would segfault.
+    * On OOM here we also have to munmap the region and close the
+    * fd so we do not leak them - they were both acquired above
+    * specifically to be owned by the shm_buffer_t we are about to
+    * return. */
+   if (!(buffer = calloc(1, sizeof *buffer)))
+   {
+      RARCH_ERR("[Wayland] [SHM] Out of memory allocating shm_buffer_t.\n");
+      munmap(data, size);
+      close(fd);
+      return NULL;
+   }
 
    pool              = wl_shm_create_pool(wl->shm, fd, size);
    buffer->wl_buffer = wl_shm_pool_create_buffer(pool, 0,
@@ -594,43 +809,37 @@ static void shm_buffer_paint_icon(
 
 static bool wl_create_toplevel_icon(gfx_ctx_wayland_data_t *wl, struct xdg_toplevel *toplevel)
 {
+   const int icon_size               = wl->buffer_scale > 1 ? 128 : 64;
    struct xdg_toplevel_icon_v1 *icon = xdg_toplevel_icon_manager_v1_create_icon(
       wl->xdg_toplevel_icon_manager);
+   shm_buffer_t *icon_buffer;
+
    xdg_toplevel_icon_v1_set_name(icon, WAYLAND_APP_ID);
 
-   const int icon_size = wl->buffer_scale > 1 ? 128 : 64;
-   shm_buffer_t *icon_buffer = create_shm_buffer(wl,
+   icon_buffer = create_shm_buffer(wl,
       icon_size, icon_size, WL_SHM_FORMAT_ARGB8888);
 
-   if (icon_buffer)
+   if (!icon_buffer)
    {
-      shm_buffer_paint_icon(icon_buffer, icon_size, icon_size, 1, icon_size / 16);
-      xdg_toplevel_icon_v1_add_buffer(
-         icon, icon_buffer->wl_buffer, 1);
-   }
-   else
-   {
-      RARCH_ERR("[Wayland] Failed to create toplevel icon buffer\n");
+      RARCH_ERR("[Wayland] Failed to create toplevel icon buffer.\n");
+      xdg_toplevel_icon_v1_destroy(icon);
       return false;
    }
 
+   shm_buffer_paint_icon(icon_buffer, icon_size, icon_size, 1, icon_size / 16);
+   xdg_toplevel_icon_v1_add_buffer(icon, icon_buffer->wl_buffer, 1);
    xdg_toplevel_icon_manager_v1_set_icon(
       wl->xdg_toplevel_icon_manager, toplevel, icon);
 
-#ifdef HAVE_LIBDECOR_H
-   if (wl->libdecor_frame)
-   {
-      wl->libdecor_icon = icon;
-   }
-   else
-#endif
-   {
-      wl->xdg_toplevel_icon = icon;
-   }
+   /* The toplevel keeps its icon once set_icon is sent, and the buffer
+    * only has to outlive the icon object, so neither is kept. */
+   xdg_toplevel_icon_v1_destroy(icon);
+   shm_buffer_free(icon_buffer);
 
    return true;
 }
 
+#ifndef HAVE_LIBDECOR_H
 static void shm_buffer_paint_checkerboard(
       shm_buffer_t *buffer,
       int width, int height, int scale,
@@ -676,18 +885,20 @@ static bool wl_draw_splash_screen(gfx_ctx_wayland_data_t *wl)
    else
    {
       shm_buffer_t *buffer = create_shm_buffer(wl,
-         wl->buffer_width,
-         wl->buffer_height,
+         VIDEO_SCALE_W(wl->buffer_dims),
+         VIDEO_SCALE_H(wl->buffer_dims),
          WL_SHM_FORMAT_XRGB8888);
 
       if (!buffer)
          return false;
 
-      shm_buffer_paint_checkerboard(buffer, wl->buffer_width,
-         wl->buffer_height, 1,
+      shm_buffer_paint_checkerboard(buffer,
+         VIDEO_SCALE_W(wl->buffer_dims),
+         VIDEO_SCALE_H(wl->buffer_dims), 1,
          8, 0xffbcbcbc, 0xff8e8e8e);
-      shm_buffer_paint_icon(buffer, wl->buffer_width,
-         wl->buffer_height, 1,
+      shm_buffer_paint_icon(buffer,
+         VIDEO_SCALE_W(wl->buffer_dims),
+         VIDEO_SCALE_H(wl->buffer_dims), 1,
          16);
 
       wl_surface_attach(wl->surface, buffer->wl_buffer, 0, 0);
@@ -695,24 +906,165 @@ static bool wl_draw_splash_screen(gfx_ctx_wayland_data_t *wl)
 
    if (wl_surface_get_version(wl->surface) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
       wl_surface_damage_buffer(wl->surface, 0, 0,
-         wl->buffer_width,
-         wl->buffer_height);
+         VIDEO_SCALE_W(wl->buffer_dims),
+         VIDEO_SCALE_H(wl->buffer_dims));
 
    if (wl->viewport)
-      wp_viewport_set_destination(wl->viewport, wl->width, wl->height);
+      wp_viewport_set_destination(wl->viewport,
+            VIDEO_SCALE_W(wl->dims), VIDEO_SCALE_H(wl->dims));
 
    wl_surface_commit(wl->surface);
 
    return true;
 }
+#endif
+
+/* A window kept across a video reinit. The whole context is kept, so
+ * every proxy still hands its listener a live context. */
+static gfx_ctx_wayland_data_t *wl_kept = NULL;
+
+static void gfx_ctx_wl_destroy(gfx_ctx_wayland_data_t *wl)
+{
+#ifdef WEBOS
+   gfx_ctx_wl_destroy_resources_webos(wl);
+#else
+   gfx_ctx_wl_destroy_resources_common(wl);
+#endif
+   free(wl);
+}
+
+void gfx_ctx_wl_release_kept(void)
+{
+   gfx_ctx_wayland_data_t *wl = wl_kept;
+   wl_kept                    = NULL;
+   if (wl)
+      gfx_ctx_wl_destroy(wl);
+}
+
+void gfx_ctx_wl_free_common(gfx_ctx_wayland_data_t *wl, bool may_keep)
+{
+   if (!wl)
+      return;
+
+   gfx_ctx_wl_release_kept();
+
+   /* A content load reinits video without shutting the runloop down */
+   if (     may_keep
+         && wl->surface
+         && !(runloop_get_flags() & RUNLOOP_FLAG_SHUTDOWN_INITIATED))
+   {
+      wl_frame_cancel(&wl->frame);
+      /* The next context puts its own on the surface */
+      if (wl->tearing_control)
+         wp_tearing_control_v1_destroy(wl->tearing_control);
+      wl->tearing_control = NULL;
+      wl_color_detach(&wl->color);
+      wl_display_flush(wl->input.dpy);
+      wl_kept = wl;
+      RARCH_LOG("[Wayland] Keeping the window across the video reinit.\n");
+      return;
+   }
+
+   gfx_ctx_wl_destroy(wl);
+}
+
+static void gfx_ctx_wl_adopt(gfx_ctx_wayland_data_t *wl,
+      driver_configure_handler_t driver_configure_handler)
+{
+#ifdef HAVE_EGL
+   static const egl_ctx_data_t egl_zero = {0};
+#endif
+#ifdef HAVE_VULKAN
+   static const gfx_ctx_vulkan_data_t vk_zero = {0};
+#endif
+
+#ifdef HAVE_EGL
+   wl->egl                      = egl_zero;
+#endif
+#ifdef HAVE_VULKAN
+   wl->vk                       = vk_zero;
+#endif
+   wl->gl_gpu_list              = NULL;
+   wl->driver_configure_handler = driver_configure_handler;
+   /* Unlike a cold init there is no splash to protect */
+   wl->ignore_configuration     = false;
+
+   frontend_driver_destroy_signal_handler_state();
+#ifndef WEBOS
+   video_driver_display_type_set(RARCH_DISPLAY_WAYLAND);
+#endif
+   frontend_driver_install_signal_handler();
+   /* Video uninit forgot which output the window is on */
+   if (wl->current_output && wl->current_output->refresh_rate > 0)
+      video_driver_set_window_refresh_rate(
+            (float)wl->current_output->refresh_rate / 1000.0f);
+}
+
+gfx_ctx_wayland_data_t *gfx_ctx_wl_take_kept(
+      driver_configure_handler_t driver_configure_handler)
+{
+   gfx_ctx_wayland_data_t *wl = wl_kept;
+   if (!wl)
+      return NULL;
+   wl_kept = NULL;
+   gfx_ctx_wl_adopt(wl, driver_configure_handler);
+   RARCH_LOG("[Wayland] Took back the kept window.\n");
+   return wl;
+}
+
+#ifdef HAVE_LIBDECOR_H
+/* The icon and the tag of a window libdecor decorates. Returns whether
+ * they could be set yet.
+ *
+ * libdecor makes the window's xdg_toplevel only once the compositor
+ * has answered its own start-up. A decoration plugin's start-up waits
+ * for that as a side effect, so with a plugin loaded the toplevel is
+ * there straight after libdecor_decorate(). With none it is not - and
+ * none is what there is when the only plugin installed is the GTK one
+ * and the context starts off the main thread, as it does with
+ * threaded video: that plugin refuses to start there ("Failed to load
+ * plugin 'libdecor-gtk.so'", "No plugins found, falling back on no
+ * decorations"). The toplevel then arrives with the first dispatch.
+ *
+ * Handing a request the NULL is an error libwayland does not recover
+ * from ("null value passed for arg 0"): the connection is dead and
+ * RetroArch exits. So this is called again once the window has been
+ * configured. */
+static bool gfx_ctx_wl_libdecor_identify(gfx_ctx_wayland_data_t *wl)
+{
+   struct xdg_toplevel *xdg_toplevel =
+      wl->libdecor_frame_get_xdg_toplevel(wl->libdecor_frame);
+
+   if (!xdg_toplevel)
+      return false;
+
+   if (wl->xdg_toplevel_icon_manager)
+      wl_create_toplevel_icon(wl, xdg_toplevel);
+
+   if (wl->xdg_toplevel_tag_manager)
+   {
+      xdg_toplevel_tag_manager_v1_set_toplevel_tag(
+         wl->xdg_toplevel_tag_manager, xdg_toplevel, MAIN_WINDOW_TAG);
+      xdg_toplevel_tag_manager_v1_set_toplevel_description(
+         wl->xdg_toplevel_tag_manager, xdg_toplevel, DEFAULT_WINDOW_TITLE " " MAIN_WINDOW_TAG);
+   }
+   return true;
+}
+#endif
 
 bool gfx_ctx_wl_init_common(
-      const toplevel_listener_t *toplevel_listener, gfx_ctx_wayland_data_t **wwl)
+      driver_configure_handler_t driver_configure_handler,
+      gfx_ctx_wayland_data_t **wwl)
 {
    int i;
    gfx_ctx_wayland_data_t *wl;
    settings_t *settings         = config_get_ptr();
    unsigned video_monitor_index = settings->uints.video_monitor_index;
+
+   /* Whichever Wayland context comes next takes back the kept window:
+    * the previous one took its EGL window or Vulkan surface with it. */
+   if ((*wwl = gfx_ctx_wl_take_kept(driver_configure_handler)))
+      return true;
 
    *wwl                         = calloc(1, sizeof(gfx_ctx_wayland_data_t));
    wl                           = *wwl;
@@ -722,7 +1074,7 @@ bool gfx_ctx_wl_init_common(
 
 #ifdef HAVE_LIBDECOR_H
 #ifdef HAVE_DYLIB
-   if ((wl->libdecor = dylib_load("libdecor-0.so")))
+   if ((wl->libdecor = dylib_load("libdecor-0.so.0")))
    {
 #define RA_WAYLAND_SYM(rc,fn,params) wl->fn = (rc (*) params)dylib_proc(wl->libdecor, #fn);
 #include "wayland/libdecor_sym.h"
@@ -730,102 +1082,168 @@ bool gfx_ctx_wl_init_common(
 #endif
 #endif
 
+   wl->driver_configure_handler = driver_configure_handler;
+
    wl_list_init(&wl->all_outputs);
    wl_list_init(&wl->current_outputs);
 
    frontend_driver_destroy_signal_handler_state();
 
    wl->input.dpy                    = wl_display_connect(NULL);
+   /* The seat's events get a queue of their own, which only the input
+    * driver's poll dispatches; see wayland_input_dispatch().
+    * RETROARCH_WAYLAND_INPUT_QUEUE=0 in the environment leaves them
+    * on the default queue, as they were. */
+   wl->input.queue                  = NULL;
+   wl->input.events                 = 0;
+   wl->input.events_elsewhere       = 0;
+#ifdef WAYLAND_HAVE_INPUT_QUEUE
+   if (wl->input.dpy)
+   {
+      const char *off = getenv("RETROARCH_WAYLAND_INPUT_QUEUE");
+      if (!off || off[0] != '0')
+         wl->input.queue            = wl_display_create_queue(wl->input.dpy);
+   }
+#endif
    wl->last_buffer_scale            = 1;
    wl->buffer_scale                 = 1;
    wl->pending_buffer_scale         = 1;
    wl->last_fractional_scale_num    = FRACTIONAL_SCALE_V1_DEN;
    wl->fractional_scale_num         = FRACTIONAL_SCALE_V1_DEN;
    wl->pending_fractional_scale_num = FRACTIONAL_SCALE_V1_DEN;
-   wl->floating_width               = SPLASH_WINDOW_WIDTH;
-   wl->floating_height              = SPLASH_WINDOW_HEIGHT;
+   wl->floating_dims                = VIDEO_SCALE_PACK(
+         SPLASH_WINDOW_WIDTH, SPLASH_WINDOW_HEIGHT);
 
    if (!wl->input.dpy)
    {
-      RARCH_ERR("[Wayland]: Failed to connect to Wayland server.\n");
-      goto error;
+      RARCH_ERR("[Wayland] Failed to connect to Wayland server.\n");
+      return false;
    }
+
+   /* The display server for this session is Wayland's, as X11's is set
+    * by its own contexts; it keeps a connection of its own and never
+    * waits on it. */
+   video_driver_display_type_set(RARCH_DISPLAY_WAYLAND);
 
    frontend_driver_install_signal_handler();
 
    wl->registry = wl_display_get_registry(wl->input.dpy);
    wl_registry_add_listener(wl->registry, &registry_listener, wl);
+   /* first roundtrip to bind compositor globals */
    wl_display_roundtrip(wl->input.dpy);
+   /* second roundtrip for listeners on bound globals (wl_output, wl_seat) */
+   wl_display_roundtrip(wl->input.dpy);
+   /* the seat's are on the input queue: its capabilities, and with
+    * them the keyboard and the pointer, are wanted before the window
+    * is set up, as they were when the roundtrip above brought them.
+    * The input driver is not polling yet, so nothing else dispatches
+    * this queue. */
+#ifdef WAYLAND_HAVE_INPUT_QUEUE
+   if (wl->input.queue)
+      wl_display_roundtrip_queue(wl->input.dpy, wl->input.queue);
+#endif
+
+   /* The display's peak luminance, as the compositor describes the
+    * output the surface is on or else the first it lists; it arrives
+    * with the events dispatched from here on. */
+   {
+      struct wl_output *output = NULL;
+      if (wl->current_output)
+         output = wl->current_output->output;
+      else if (!wl_list_empty(&wl->all_outputs))
+      {
+         display_output_t *d = wl_container_of(wl->all_outputs.next, d, link);
+         output = d->output->output;
+      }
+      wl->color.peak_cb = video_driver_set_display_peak_nits;
+      wl_color_query_output(&wl->color, output);
+   }
 
    if (!wl->compositor)
    {
-      RARCH_ERR("[Wayland]: Failed to create compositor.\n");
-      goto error;
+      RARCH_ERR("[Wayland] Failed to create compositor.\n");
+      return false;
    }
 
    if (!wl->shm)
    {
-      RARCH_ERR("[Wayland]: Failed to create shm.\n");
-      goto error;
+      RARCH_ERR("[Wayland] Failed to create shm.\n");
+      return false;
    }
 
    if (!wl->xdg_shell)
    {
-      RARCH_ERR("[Wayland]: Failed to create shell.\n");
-      goto error;
+      RARCH_ERR("[Wayland] Failed to create shell.\n");
+      return false;
    }
 
    if (!wl->idle_inhibit_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", zwp_idle_inhibit_manager_v1_interface.name);
-#ifdef HAVE_DBUS
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", zwp_idle_inhibit_manager_v1_interface.name);
+#ifdef RARCH_HAVE_DBUS_SCREENSAVER
       dbus_ensure_connection();
 #endif
    }
 
    if (!wl->deco_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", zxdg_decoration_manager_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", zxdg_decoration_manager_v1_interface.name);
    }
 
    if (!wl->viewporter)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", wp_viewporter_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", wp_viewporter_interface.name);
    }
 
    if (!wl->fractional_scale_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", wp_fractional_scale_manager_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", wp_fractional_scale_manager_v1_interface.name);
    }
 
    if (!wl->cursor_shape_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", wp_cursor_shape_manager_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", wp_cursor_shape_manager_v1_interface.name);
    }
 
    if (!wl->content_type_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", wp_content_type_manager_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", wp_content_type_manager_v1_interface.name);
    }
 
    if (!wl->pointer_constraints)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", zwp_pointer_constraints_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", zwp_pointer_constraints_v1_interface.name);
    }
 
    if (!wl->relative_pointer_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", zwp_relative_pointer_manager_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", zwp_relative_pointer_manager_v1_interface.name);
    }
 
    if (!wl->single_pixel_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", wp_single_pixel_buffer_manager_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", wp_single_pixel_buffer_manager_v1_interface.name);
    }
 
    if (!wl->xdg_toplevel_icon_manager)
    {
-      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol!\n", xdg_toplevel_icon_manager_v1_interface.name);
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", xdg_toplevel_icon_manager_v1_interface.name);
+   }
+
+   if (!wl->xdg_toplevel_tag_manager)
+   {
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", xdg_toplevel_tag_manager_v1_interface.name);
+   }
+
+   if (!wl->present.presentation)
+   {
+      RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol.\n", wp_presentation_interface.name);
+   }
+
+
+   if (!wl->tearing_control_manager)
+   {
+      RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", wp_tearing_control_manager_v1_interface.name);
    }
 
    wl->surface = wl_compositor_create_surface(wl->compositor);
@@ -849,24 +1267,38 @@ bool gfx_ctx_wl_init_common(
 
 #ifdef HAVE_LIBDECOR_H
    if (wl->libdecor)
-   {
       wl->libdecor_context = wl->libdecor_new(wl->input.dpy, &libdecor_interface);
 
-      wl->libdecor_frame = wl->libdecor_decorate(wl->libdecor_context, wl->surface, &toplevel_listener->libdecor_frame_interface, wl);
+   /* libdecor_new() can fail (e.g. no usable decoration plugin could be
+    * loaded). Treat that as libdecor being unavailable and fall back to
+    * plain xdg-shell, rather than passing a NULL context to
+    * libdecor_decorate(). Clearing wl->libdecor keeps every downstream
+    * "if (wl->libdecor)" branch (window setup and fullscreen toggling)
+    * consistently on the xdg-shell path. */
+   if (wl->libdecor && !wl->libdecor_context)
+   {
+      RARCH_WARN("[Wayland] libdecor failed to initialize, falling back to xdg-shell decorations.\n");
+      dylib_close(wl->libdecor);
+      wl->libdecor = NULL;
+   }
+
+   if (wl->libdecor)
+   {
+      bool identified;
+
+      wl->libdecor_frame = wl->libdecor_decorate(wl->libdecor_context, wl->surface, &wl_libdecor_frame_interface, wl);
       if (!wl->libdecor_frame)
       {
-         RARCH_ERR("[Wayland]: Failed to create libdecor frame\n");
-         goto error;
+         RARCH_ERR("[Wayland] Failed to create libdecor frame.\n");
+         return false;
       }
 
-      if (wl->xdg_toplevel_icon_manager)
-      {
-         struct xdg_toplevel *xdg_toplevel = wl->libdecor_frame_get_xdg_toplevel(wl->libdecor_frame);
-         wl_create_toplevel_icon(wl, xdg_toplevel);
-      }
+      /* The window's icon and tag, if libdecor has made the toplevel
+       * already; see gfx_ctx_wl_libdecor_identify(). */
+      identified = gfx_ctx_wl_libdecor_identify(wl);
 
       wl->libdecor_frame_set_app_id(wl->libdecor_frame, WAYLAND_APP_ID);
-      wl->libdecor_frame_set_title(wl->libdecor_frame, WINDOW_TITLE);
+      wl->libdecor_frame_set_title(wl->libdecor_frame, DEFAULT_WINDOW_TITLE);
       wl->libdecor_frame_map(wl->libdecor_frame);
 
       /* Waiting for libdecor to be configured before starting to draw */
@@ -877,22 +1309,27 @@ bool gfx_ctx_wl_init_common(
       {
          if (wl->libdecor_dispatch(wl->libdecor_context, 0) < 0)
          {
-            RARCH_ERR("[Wayland]: libdecor failed to dispatch\n");
-            goto error;
+            RARCH_ERR("[Wayland] libdecor failed to dispatch.\n");
+            return false;
          }
       }
+
+      /* Configured, so the toplevel is there now if it was not
+       * before; nothing has been drawn to it yet. */
+      if (!identified)
+         gfx_ctx_wl_libdecor_identify(wl);
    }
    else
 #endif
    {
       wl->xdg_surface = xdg_wm_base_get_xdg_surface(wl->xdg_shell, wl->surface);
-      xdg_surface_add_listener(wl->xdg_surface, &xdg_surface_listener, wl);
+      xdg_surface_add_listener(wl->xdg_surface, &wl_xdg_surface_listener, wl);
 
       wl->xdg_toplevel = xdg_surface_get_toplevel(wl->xdg_surface);
-      xdg_toplevel_add_listener(wl->xdg_toplevel, &toplevel_listener->xdg_toplevel_listener, wl);
+      xdg_toplevel_add_listener(wl->xdg_toplevel, &wl_xdg_toplevel_listener, wl);
 
       xdg_toplevel_set_app_id(wl->xdg_toplevel, WAYLAND_APP_ID);
-      xdg_toplevel_set_title(wl->xdg_toplevel, WINDOW_TITLE);
+      xdg_toplevel_set_title(wl->xdg_toplevel, DEFAULT_WINDOW_TITLE);
 
       if (wl->deco_manager)
          wl->deco = zxdg_decoration_manager_v1_get_toplevel_decoration(
@@ -900,6 +1337,14 @@ bool gfx_ctx_wl_init_common(
 
       if (wl->xdg_toplevel_icon_manager)
          wl_create_toplevel_icon(wl, wl->xdg_toplevel);
+
+      if (wl->xdg_toplevel_tag_manager)
+      {
+         xdg_toplevel_tag_manager_v1_set_toplevel_tag(
+            wl->xdg_toplevel_tag_manager, wl->xdg_toplevel, MAIN_WINDOW_TAG);
+         xdg_toplevel_tag_manager_v1_set_toplevel_description(
+            wl->xdg_toplevel_tag_manager, wl->xdg_toplevel, DEFAULT_WINDOW_TITLE " " MAIN_WINDOW_TAG);
+      }
 
       /* Waiting for xdg_toplevel to be configured before starting to draw */
       wl_surface_commit(wl->surface);
@@ -912,34 +1357,24 @@ bool gfx_ctx_wl_init_common(
    wl_display_roundtrip(wl->input.dpy);
    xdg_wm_base_add_listener(wl->xdg_shell, &xdg_shell_listener, NULL);
 
+#ifndef HAVE_LIBDECOR_H
    /* Bind SHM based wl_buffer to wl_surface until the vulkan surface is ready.
     * This shows the window which assigns us a display (wl_output)
     * which is useful for HiDPI and auto selecting a display for fullscreen. */
    if (video_monitor_index == 0 && wl_list_length (&wl->all_outputs) > 1)
    {
       if (!wl_draw_splash_screen(wl))
-         RARCH_ERR("[Wayland]: Failed to draw splash screen\n");
+         RARCH_ERR("[Wayland] Failed to draw splash screen.\n");
 
       /* Make sure splash screen is on screen and sized */
-#ifdef HAVE_LIBDECOR_H
-      if (wl->libdecor)
-      {
-         wl->configured = true;
-         while (wl->configured)
-            if (wl->libdecor_dispatch(wl->libdecor_context, 0) < 0)
-               RARCH_ERR("[Wayland]: libdecor failed to dispatch\n");
-      }
-      else
-#endif
-      {
-         wl->configured = true;
+      wl->configured = true;
 
-         while (wl->configured)
-            wl_display_dispatch(wl->input.dpy);
-      }
+      while (wl->configured)
+      wl_display_dispatch(wl->input.dpy);
    }
+#endif
 
-   // Ignore configure events until splash screen has been replaced
+   /* Ignore configure events until splash screen has been replaced */
    wl->ignore_configuration = true;
 
    wl->input.fd = wl_display_get_fd(wl->input.dpy);
@@ -948,8 +1383,7 @@ bool gfx_ctx_wl_init_common(
    wl->input.mouse.focus     = true;
 
    wl->cursor.surface        = wl_compositor_create_surface(wl->compositor);
-   wl->cursor.theme          = wl_cursor_theme_load(NULL, 16, wl->shm);
-   wl->cursor.default_cursor = wl_cursor_theme_get_cursor(wl->cursor.theme, "left_ptr");
+   gfx_ctx_wl_cursor_load(wl);
 
    wl->num_active_touches    = 0;
 
@@ -964,9 +1398,27 @@ bool gfx_ctx_wl_init_common(
    flush_wayland_fd(&wl->input);
 
    return true;
+}
 
-error:
-   return false;
+static void gfx_ctx_wl_wait_for_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool fullscreen);
+
+/* Windowed geometry must wait until fullscreen is no longer current. */
+static void gfx_ctx_wl_leave_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool wait_for_configure)
+{
+   if (wait_for_configure && !wl->fullscreen && !wl->fullscreen_pending)
+      return;
+   wl->fullscreen_requested = false;
+   wl->fullscreen_pending = wl->fullscreen_pending || wl->fullscreen;
+#ifdef HAVE_LIBDECOR_H
+   if (wl->libdecor)
+      wl->libdecor_frame_unset_fullscreen(wl->libdecor_frame);
+   else
+#endif
+      xdg_toplevel_unset_fullscreen(wl->xdg_toplevel);
+   if (wait_for_configure)
+      gfx_ctx_wl_wait_for_fullscreen(wl, false);
 }
 
 bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
@@ -975,44 +1427,119 @@ bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
    settings_t *settings         = config_get_ptr();
    unsigned video_monitor_index = settings->uints.video_monitor_index;
 
-   wl->width         = width  ? width  : DEFAULT_WINDOWED_WIDTH;
-   wl->height        = height ? height : DEFAULT_WINDOWED_HEIGHT;
-   wl->buffer_width  = wl->width;
-   wl->buffer_height = wl->height;
+   wl->dims          = VIDEO_SCALE_PACK(
+         width  ? width  : DEFAULT_WINDOWED_WIDTH,
+         height ? height : DEFAULT_WINDOWED_HEIGHT);
+   wl->buffer_dims   = wl->dims;
 
    if (!fullscreen)
    {
+      unsigned bw              = VIDEO_SCALE_W(wl->buffer_dims);
+      unsigned bh              = VIDEO_SCALE_H(wl->buffer_dims);
+      /* What a configure leaving the size to us restores */
+      wl->floating_dims        = wl->dims;
       wl->buffer_scale         = wl->pending_buffer_scale;
       wl->fractional_scale_num = wl->pending_fractional_scale_num;
-      wl->buffer_width         = wl->fractional_scale ?
-         FRACTIONAL_SCALE_MULT(wl->buffer_width,  wl->fractional_scale_num) : wl->buffer_width  * wl->buffer_scale;
-      wl->buffer_height        = wl->fractional_scale ?
-         FRACTIONAL_SCALE_MULT(wl->buffer_height, wl->fractional_scale_num) : wl->buffer_height * wl->buffer_scale;
+      wl->buffer_dims          = VIDEO_SCALE_PACK(
+         wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(bw, wl->fractional_scale_num)
+            : bw * wl->buffer_scale,
+         wl->fractional_scale
+            ? FRACTIONAL_SCALE_MULT(bh, wl->fractional_scale_num)
+            : bh * wl->buffer_scale);
+
+      /* out of fullscreen first, then the windowed size below */
+      gfx_ctx_wl_leave_fullscreen(wl, true);
    }
    if (wl->viewport)
    {
       /* Stretch old buffer to fill new size, commit/roundtrip to apply */
-      wp_viewport_set_destination(wl->viewport, wl->width, wl->height);
+      wp_viewport_set_destination(wl->viewport,
+            VIDEO_SCALE_W(wl->dims), VIDEO_SCALE_H(wl->dims));
    }
 
 #ifdef HAVE_LIBDECOR_H
    if (wl->libdecor)
    {
-     wl->libdecor_frame_set_visibility(wl->libdecor_frame, !fullscreen);
-     struct libdecor_state *state = wl->libdecor_state_new(wl->width, wl->height);
-     wl->libdecor_frame_commit(wl->libdecor_frame, state, NULL);
-     wl->libdecor_state_free(state);
+      struct libdecor_state *state;
+
+      wl->libdecor_frame_set_visibility(wl->libdecor_frame, !fullscreen);
+      state = wl->libdecor_state_new(
+            VIDEO_SCALE_W(wl->dims), VIDEO_SCALE_H(wl->dims));
+      wl->libdecor_frame_commit(wl->libdecor_frame, state, NULL);
+      wl->libdecor_state_free(state);
    }
 #endif
 
    return true;
 }
 
-bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
+#define FULLSCREEN_CONFIGURE_TIMEOUT_MS 500
+
+static void gfx_ctx_wl_wait_for_fullscreen(gfx_ctx_wayland_data_t *wl,
       bool fullscreen)
+{
+   struct timespec start, now;
+   int remaining = FULLSCREEN_CONFIGURE_TIMEOUT_MS;
+
+   clock_gettime(CLOCK_MONOTONIC, &start);
+
+   while ((wl->fullscreen_pending || wl->fullscreen != fullscreen)
+         && remaining > 0)
+   {
+#ifdef HAVE_LIBDECOR_H
+      if (wl->libdecor)
+      {
+         int ret = wl->libdecor_dispatch(wl->libdecor_context, remaining);
+         if (ret < 0 && ret != -EINTR)
+         {
+            RARCH_ERR("[Wayland] libdecor failed to dispatch.\n");
+            break;
+         }
+      }
+      else
+#endif
+      {
+         struct pollfd fd;
+         int ret;
+
+         flush_wayland_fd(&wl->input);
+         if (!wl->fullscreen_pending && wl->fullscreen == fullscreen)
+            break;
+
+         fd.fd      = wl->input.fd;
+         fd.events  = POLLIN;
+         fd.revents = 0;
+         ret        = poll(&fd, 1, remaining);
+         if (ret < 0)
+         {
+            if (errno != EINTR)
+               break;
+         }
+         else if (ret > 0 && (fd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+            break;
+      }
+
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      remaining = FULLSCREEN_CONFIGURE_TIMEOUT_MS - (int)(
+              (now.tv_sec  - start.tv_sec)  * 1000
+            + (now.tv_nsec - start.tv_nsec) / 1000000);
+   }
+
+   if (wl->fullscreen_pending || wl->fullscreen != fullscreen)
+      RARCH_WARN("[Wayland] No %s configure received; continuing.\n",
+            fullscreen ? "fullscreen" : "windowed");
+}
+
+static bool gfx_ctx_wl_set_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool fullscreen, bool wait_for_configure)
 {
    settings_t *settings         = config_get_ptr();
    unsigned video_monitor_index = settings->uints.video_monitor_index;
+
+   wl->fullscreen_requested = fullscreen;
+   wl->fullscreen_pending = wl->fullscreen_pending
+      || wl->fullscreen != fullscreen;
 
    if (fullscreen)
    {
@@ -1021,12 +1548,19 @@ bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
       struct wl_output *output = NULL;
       int output_i             = 0;
 
+#ifdef HAVE_LIBDECOR_H
+      if (video_monitor_index <= 0)
+      {
+         RARCH_LOG("[Wayland] Auto fullscreen monitor index, letting compositor decide.\n");
+      }
+#else
       if (video_monitor_index <= 0 && wl->current_output != NULL)
       {
          oi     = wl->current_output;
          output = oi->output;
-         RARCH_LOG("[Wayland]: Auto fullscreen on display \"%s\" \"%s\"\n", oi->make, oi->model);
+         RARCH_LOG("[Wayland] Auto fullscreen on display \"%s\" \"%s\".\n", oi->make, oi->model);
       }
+#endif
       else
       {
          wl_list_for_each(od, &wl->all_outputs, link)
@@ -1035,14 +1569,14 @@ bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
             {
                oi     = od->output;
                output = oi->output;
-               RARCH_LOG("[Wayland]: Fullscreen on display %i \"%s\" \"%s\"\n", output_i, oi->make, oi->model);
+               RARCH_LOG("[Wayland] Fullscreen on display %i \"%s\" \"%s\".\n", output_i, oi->make, oi->model);
                break;
             }
          };
-      }
 
-      if (!output)
-         RARCH_LOG("[Wayland] Failed to specify monitor for fullscreen, letting compositor decide\n");
+         if (!output)
+            RARCH_LOG("[Wayland] Failed to specify monitor for fullscreen, letting compositor decide.\n");
+      }
 
 #ifdef HAVE_LIBDECOR_H
       if (wl->libdecor)
@@ -1052,9 +1586,23 @@ bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
       {
          xdg_toplevel_set_fullscreen(wl->xdg_toplevel, output);
       }
-   }
 
-   flush_wayland_fd(&wl->input);
+      /* Map only once fullscreen, or window managers such as tiling
+       * scripts place the window as a normal one first. */
+      if (wait_for_configure)
+         gfx_ctx_wl_wait_for_fullscreen(wl, true);
+   }
+   else
+      /* A window kept across the reinit that is still fullscreen:
+       * gfx_ctx_wl_set_video_mode_common_size() took it out already,
+       * before sizing it; this is for a caller that did not go
+       * through there. */
+      gfx_ctx_wl_leave_fullscreen(wl, wait_for_configure);
+
+   if (wait_for_configure)
+      flush_wayland_fd(&wl->input);
+   else
+      wl_display_flush(wl->input.dpy);
 
    if (fullscreen)
    {
@@ -1067,12 +1615,24 @@ bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
    return true;
 }
 
+bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool fullscreen)
+{
+   return gfx_ctx_wl_set_fullscreen(wl, fullscreen, true);
+}
+
+bool gfx_ctx_wl_request_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool fullscreen)
+{
+   return gfx_ctx_wl_set_fullscreen(wl, fullscreen, false);
+}
+
 bool gfx_ctx_wl_suppress_screensaver(void *data, bool state)
 {
    gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
 
    if (!wl->idle_inhibit_manager)
-#ifdef HAVE_DBUS
+#ifdef RARCH_HAVE_DBUS_SCREENSAVER
       /* Some Wayland compositors (e.g. Phoc) don't implement Wayland's Idle protocol.
        * They instead rely on things like Gnome Screensaver. */
       return dbus_suspend_screensaver(state);
@@ -1083,13 +1643,13 @@ bool gfx_ctx_wl_suppress_screensaver(void *data, bool state)
    {
       if (state)
       {
-         RARCH_LOG("[Wayland]: Enabling idle inhibitor\n");
          struct zwp_idle_inhibit_manager_v1 *mgr = wl->idle_inhibit_manager;
+         RARCH_LOG("[Wayland] Enabling idle inhibitor.\n");
          wl->idle_inhibitor = zwp_idle_inhibit_manager_v1_create_inhibitor(mgr, wl->surface);
       }
       else
       {
-         RARCH_LOG("[Wayland]: Disabling the idle inhibitor\n");
+         RARCH_LOG("[Wayland] Disabling the idle inhibitor.\n");
          zwp_idle_inhibitor_v1_destroy(wl->idle_inhibitor);
          wl->idle_inhibitor = NULL;
       }
@@ -1098,13 +1658,6 @@ bool gfx_ctx_wl_suppress_screensaver(void *data, bool state)
    return true;
 }
 
-float gfx_ctx_wl_get_refresh_rate(void *data)
-{
-   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-   if (!wl || !wl->current_output)
-      return false;
-   return (float)wl->current_output->refresh_rate / 1000.0f;
-}
 
 bool gfx_ctx_wl_has_focus(void *data)
 {
@@ -1113,25 +1666,22 @@ bool gfx_ctx_wl_has_focus(void *data)
 }
 
 void gfx_ctx_wl_check_window_common(gfx_ctx_wayland_data_t *wl,
-      void (*get_video_size)(void*, unsigned*, unsigned*), bool *quit,
-      bool *resize, unsigned *width, unsigned *height)
+      void (*get_video_size)(void*, unsigned*), bool *quit,
+      bool *resize, unsigned *dims)
 {
    /* this function works with SCALED sizes, it's used from the renderer */
-   unsigned new_width, new_height;
-
+   unsigned new_dims;
    flush_wayland_fd(&wl->input);
 
-   get_video_size(wl, &new_width, &new_height);
+   get_video_size(wl, &new_dims);
 
    if (     wl->pending_buffer_scale != wl->buffer_scale
          || wl->pending_fractional_scale_num != wl->fractional_scale_num
-         || new_width  != *width
-         || new_height != *height)
+         || new_dims != *dims)
    {
       wl->buffer_scale         = wl->pending_buffer_scale;
       wl->fractional_scale_num = wl->pending_fractional_scale_num;
-      *width                   = new_width;
-      *height                  = new_height;
+      *dims                    = new_dims;
       *resize                  = true;
    }
 
@@ -1143,33 +1693,9 @@ static void shm_buffer_handle_release(void *data,
 {
    shm_buffer_t *buffer = data;
 
-   wl_buffer_destroy(buffer->wl_buffer);
-   munmap(buffer->data, buffer->data_size);
-   free(buffer);
+   shm_buffer_free(buffer);
 }
-
-#if 0
-static void xdg_surface_handle_configure(void *data,
-      struct xdg_surface *surface, uint32_t serial)
-{
-   xdg_surface_ack_configure(surface, serial);
-}
-#endif
-
-#ifdef HAVE_LIBDECOR_H
-static void libdecor_handle_error(struct libdecor *context,
-      enum libdecor_error error, const char *message)
-{
-   RARCH_ERR("[Wayland]: libdecor Caught error (%d): %s\n", error, message);
-}
-#endif
 
 const struct wl_buffer_listener shm_buffer_listener = {
    shm_buffer_handle_release,
 };
-
-#ifdef HAVE_LIBDECOR_H
-const struct libdecor_interface libdecor_interface = {
-   .error = libdecor_handle_error,
-};
-#endif

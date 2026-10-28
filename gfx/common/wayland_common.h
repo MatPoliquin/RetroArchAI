@@ -15,21 +15,9 @@
 
 #pragma once
 
-#ifdef HAVE_LIBDECOR_H
-#include <libdecor.h>
-#endif
-
 #include "../../input/common/wayland_common.h"
 
 #define WAYLAND_APP_ID "com.libretro.RetroArch"
-
-typedef struct toplevel_listener
-{
-#ifdef HAVE_LIBDECOR_H
-   struct libdecor_frame_interface libdecor_frame_interface;
-#endif
-   struct xdg_toplevel_listener xdg_toplevel_listener;
-} toplevel_listener_t;
 
 typedef struct shm_buffer
 {
@@ -38,35 +26,30 @@ typedef struct shm_buffer
    size_t data_size;
 } shm_buffer_t;
 
-void xdg_toplevel_handle_configure_common(gfx_ctx_wayland_data_t *wl, void *toplevel,
-      int32_t width, int32_t height, struct wl_array *states);
-
-void xdg_toplevel_handle_close(void *data,
-      struct xdg_toplevel *xdg_toplevel);
-
-#ifdef HAVE_LIBDECOR_H
-void libdecor_frame_handle_configure_common(struct libdecor_frame *frame,
-      struct libdecor_configuration *configuration, gfx_ctx_wayland_data_t *wl);
-
-void libdecor_frame_handle_close(struct libdecor_frame *frame,
-      void *data);
-
-void libdecor_frame_handle_commit(struct libdecor_frame *frame,
-      void *data);
-#endif
-
-void gfx_ctx_wl_get_video_size_common(void *data, unsigned *width,
-      unsigned *height);
+void gfx_ctx_wl_get_video_size_common(void *data, unsigned *dims);
 
 void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl);
+#ifdef WEBOS
+void gfx_ctx_wl_destroy_resources_webos(gfx_ctx_wayland_data_t *wl);
+#endif
+
+/* Frees a context, or on a video reinit (@may_keep) keeps its window
+ * for the next init_common to adopt. */
+void gfx_ctx_wl_free_common(gfx_ctx_wayland_data_t *wl, bool may_keep);
+
+/* Destroys a kept window no context adopted. */
+void gfx_ctx_wl_release_kept(void);
+
+/* The kept window, adopted by the context being initialised; NULL
+ * when none is kept. */
+gfx_ctx_wayland_data_t *gfx_ctx_wl_take_kept(
+      driver_configure_handler_t driver_configure_handler);
 
 void gfx_ctx_wl_update_title_common(void *data);
 
-bool gfx_ctx_wl_get_metrics_common(void *data,
-      enum display_metric_types type, float *value);
 
 bool gfx_ctx_wl_init_common(
-      const toplevel_listener_t *toplevel_listener,
+      driver_configure_handler_t driver_configure_handler,
       gfx_ctx_wayland_data_t **wl);
 
 bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
@@ -75,20 +58,18 @@ bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
 bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
       bool fullscreen);
 
+bool gfx_ctx_wl_request_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool fullscreen);
+
 bool gfx_ctx_wl_suppress_screensaver(void *data, bool state);
 
 bool gfx_ctx_wl_set_video_mode_common(gfx_ctx_wayland_data_t *wl,
       unsigned width, unsigned height,
       bool fullscreen);
 
-float gfx_ctx_wl_get_refresh_rate(void *data);
 
 bool gfx_ctx_wl_has_focus(void *data);
 
 void gfx_ctx_wl_check_window_common(gfx_ctx_wayland_data_t *wl,
-      void (*get_video_size)(void*, unsigned*, unsigned*), bool *quit,
-      bool *resize, unsigned *width, unsigned *height);
-
-#ifdef HAVE_LIBDECOR_H
-extern const struct libdecor_interface libdecor_interface;
-#endif
+      void (*get_video_size)(void*, unsigned*), bool *quit,
+      bool *resize, unsigned *dims);

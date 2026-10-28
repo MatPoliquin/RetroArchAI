@@ -52,7 +52,8 @@ typedef struct
 {
    SceUserServiceUserId userId;
    int handle[PS4_MAX_PAD_PORT_TYPES];
-   bool connected;
+   bool connected; /* the handle is open */
+   bool reporting; /* the last read came from a connected pad */
 } ds_joypad_state;
 
 /* TODO/FIXME - static globals */
@@ -75,7 +76,7 @@ static const char *ps4_joypad_name(unsigned pad)
 
 static void *ps4_joypad_init(void *data)
 {
-   int result, handle;
+   int result;
    SceUserServiceLoginUserIdList user_id_list;
 
    num_players = 0;
@@ -87,7 +88,7 @@ static void *ps4_joypad_init(void *data)
 
    if (result == 0)
    {
-      unsigned i;
+      int i;
       for (i = 0; i < SCE_USER_SERVICE_MAX_LOGIN_USERS; i++)
       {
          SceUserServiceUserId user_id = user_id_list.userId[i];
@@ -130,7 +131,7 @@ static void *ps4_joypad_init(void *data)
 
                   input_autoconfigure_connect(
                         ps4_joypad_name(num_players),
-                        NULL,
+                        NULL, NULL,
                         ps4_joypad.ident,
                         num_players,
                         0,
@@ -197,20 +198,19 @@ static int16_t ps4_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t ps4_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
-   unsigned i;
    int16_t ret                          = 0;
    uint16_t port_idx                    = joypad_info->joy_idx;
 
    if (port_idx < PS4_MAX_ORBISPADS)
    {
+      int i;
       for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
       {
-         /* Auto-binds are per joypad, not per user. */
-         const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-            ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
+         const uint64_t joykey  = joykeys[i];
          if (
                (uint16_t)joykey != NO_BTN
                && pad_state[port_idx] & (UINT64_C(1) << (uint16_t)joykey)
@@ -236,7 +236,6 @@ static void ps4_joypad_poll(void)
 {
    unsigned player;
    ScePadData buttons;
-   unsigned players_count = num_players;
 
    for (player = 0; player < SCE_USER_SERVICE_MAX_LOGIN_USERS; player++)
    {
@@ -249,13 +248,9 @@ static void ps4_joypad_poll(void)
 
       ret     = scePadReadState(ds_joypad_states[player].handle[0],&buttons);
 
-      if (!~buttons.connected)
-      {
-         ds_joypad_states[player].connected = false;
-         continue;
-      }
+      ds_joypad_states[player].reporting = (ret == 0 && buttons.connected);
 
-      if (ret == 0)
+      if (ds_joypad_states[player].reporting)
       {
          int32_t state_tmp = buttons.buttons;
          pad_state[i] = 0;
@@ -281,6 +276,15 @@ static void ps4_joypad_poll(void)
          analog_state[i][RETRO_DEVICE_INDEX_ANALOG_RIGHT][RETRO_DEVICE_ID_ANALOG_X] = convert_u8_to_s16(buttons.rx);
          analog_state[i][RETRO_DEVICE_INDEX_ANALOG_RIGHT][RETRO_DEVICE_ID_ANALOG_Y] = convert_u8_to_s16(buttons.ry);
       }
+      else
+      {
+         /* Unread or not reporting: the handle stays for when it does. */
+         pad_state[i] = 0;
+         analog_state[i][RETRO_DEVICE_INDEX_ANALOG_LEFT] [RETRO_DEVICE_ID_ANALOG_X] = 0;
+         analog_state[i][RETRO_DEVICE_INDEX_ANALOG_LEFT] [RETRO_DEVICE_ID_ANALOG_Y] = 0;
+         analog_state[i][RETRO_DEVICE_INDEX_ANALOG_RIGHT][RETRO_DEVICE_ID_ANALOG_X] = 0;
+         analog_state[i][RETRO_DEVICE_INDEX_ANALOG_RIGHT][RETRO_DEVICE_ID_ANALOG_Y] = 0;
+      }
       for (j = 0; j < 2; j++)
          for (k = 0; k < 2; k++)
             if (analog_state[i][j][k] == -0x8000)
@@ -290,7 +294,7 @@ static void ps4_joypad_poll(void)
 
 static bool ps4_joypad_query_pad(unsigned pad)
 {
-   return pad < PS4_MAX_ORBISPADS && pad_state[pad];
+   return pad < PS4_MAX_ORBISPADS && ds_joypad_states[pad].reporting;
 }
 
 static bool ps4_joypad_rumble(unsigned pad,
@@ -324,7 +328,7 @@ static void ps4_joypad_destroy(void)
    SceUserServiceLoginUserIdList user_id_list;
    if (sceUserServiceGetLoginUserIdList(&user_id_list) == 0)
    {
-      unsigned i;
+      int i;
       for (i = 0; i < SCE_USER_SERVICE_MAX_LOGIN_USERS; i++)
       {
          user_id = user_id_list.userId[i];

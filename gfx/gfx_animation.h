@@ -25,16 +25,38 @@
 
 #include "font_driver.h"
 
-#define TICKER_SPACER_DEFAULT "   |   "
-#define TICKER_SPEED       333333
+#define TICKER_SPACER_DEFAULT "  |  "
 
-/* Pixel ticker nominally increases by one after each
- * TICKER_PIXEL_PERIOD ms (actual increase depends upon
- * ticker speed setting and display resolution)
- *
- * Formula is: (1.0f / 60.0f) * 1000.0f
- * */
-#define TICKER_PIXEL_PERIOD (16.666666666666668f)
+/* Stepped (non-smooth) ticker: one character step per
+ * TICKER_SPEED us of real time (divided by the user's
+ * ticker speed setting) */
+#define TICKER_SPEED          333333
+
+/* Smooth ticker baseline speed, in px/s of real time
+ * (scaled by the ticker speed setting and, for the
+ * horizontal ticker, the menu driver's resolution
+ * callback). The increment each frame is
+ * delta_time / TICKER_PIXEL_PERIOD, accumulated with
+ * fractional carry, so the speed is the same at every
+ * refresh rate */
+#define TICKER_PIXEL_SPEED  (60.0f)
+#define TICKER_PIXEL_PERIOD (1000.0f / TICKER_PIXEL_SPEED)
+
+/* Mean human reading speed for all western languages,
+ * characters per minute */
+#define TICKER_CPM (1000.0f)
+
+/* Base time for which a line should be shown, in us */
+#define TICKER_LINE_DURATION_US(line_len)         ((line_len * 60.0f * 1000.0f * 1000.0f) / TICKER_CPM)
+/* Base time for which a line should be shown, in ms */
+#define TICKER_LINE_DURATION_MS(line_len)         ((line_len * 60.0f * 1000.0f) / TICKER_CPM)
+/* Ticker updates (nominally) once every TICKER_SPEED us
+ * > Base number of ticks for which line should be shown */
+#define TICKER_LINE_DISPLAY_TICKS(line_len)       ((size_t)(TICKER_LINE_DURATION_US(line_len) / (float)TICKER_SPEED))
+/* Smooth ticker updates (nominally) once every TICKER_PIXEL_PERIOD ms
+ * > Base number of ticks for which text should scroll
+ *   from one line to the next */
+#define TICKER_LINE_SMOOTH_SCROLL_TICKS(line_len) ((size_t)(TICKER_LINE_DURATION_MS(line_len) / TICKER_PIXEL_PERIOD))
 
 #define ANIM_IS_ACTIVE(_p) (((_p)->flags & (GFX_ANIM_FLAG_IS_ACTIVE)) || ((_p)->flags & GFX_ANIM_FLAG_TICKER_IS_ACTIVE))
 
@@ -111,8 +133,9 @@ enum gfx_animation_flags
 
 typedef void  (*tween_cb)  (void*);
 
+/* @dims: both axes in one word, VIDEO_SCALE_PACK's layout. */
 typedef void (*update_time_cb) (float *ticker_pixel_increment,
-      unsigned width, unsigned height);
+      unsigned dims);
 
 typedef struct gfx_animation_ctx_entry
 {
@@ -131,6 +154,13 @@ typedef struct gfx_animation_ctx_ticker
    char *s;
    const char *str;
    const char *spacer;
+   /* Size of the buffer @s points at, in BYTES.  Must be set; a
+    * ticker with s_len == 0 is rejected rather than guessed at.
+    * Distinct from @len below, and the distinction matters: one
+    * glyph of CJK or emoji is three or four bytes, so a string that
+    * fits @len glyphs can be several times @s_len bytes long. */
+   size_t s_len;
+   /* Width of the field to fit the string into, in GLYPHS. */
    size_t len;
    enum gfx_animation_ticker_type type_enum;
    bool selected;
@@ -163,6 +193,9 @@ typedef struct gfx_animation_ctx_line_ticker
    size_t line_len;
    size_t max_lines;
    enum gfx_animation_ticker_type type_enum;
+   /* Caller-owned scratch storage, retained between calls. */
+   char **wrap_scratch;
+   size_t *wrap_scratch_cap;
 } gfx_animation_ctx_line_ticker_t;
 
 typedef struct gfx_animation_ctx_line_ticker_smooth
@@ -181,8 +214,8 @@ typedef struct gfx_animation_ctx_line_ticker_smooth
    float *bottom_fade_alpha;
    char *bottom_fade_str;
    size_t bottom_fade_str_len;
-   unsigned field_width;
-   unsigned field_height;
+   /* Both axes in one word, VIDEO_SCALE_PACK's layout. */
+   unsigned field_dims;
    float font_scale;
    enum gfx_animation_ticker_type type_enum;
    bool fade_enabled;
@@ -209,12 +242,21 @@ struct tween
    tween_cb    cb;
    void        *userdata;
    uintptr_t   tag;
+   /* Timestamp (us) of the update frame on which the tween
+    * became live. Zero means 'not yet started' - the field is
+    * lazily initialised on the tween's first update frame
+    * (gfx_animation timestamps use zero as a sentinel, and
+    * the monotonic microsecond clock never legitimately
+    * returns it) */
+   retro_time_t start_time;
    float       duration;
-   float       running_since;
    float       initial_value;
    float       target_value;
    float       *subject;
    bool        deleted;
+   /* Pushed by a widget: moves with the widgets when the threaded
+    * video worker takes them over */
+   bool        widget;
 };
 
 struct gfx_animation
@@ -233,6 +275,14 @@ struct gfx_animation
    float delta_time;
 
    uint8_t flags;
+
+   /* Update bookkeeping, one set per instance: the widgets' instance
+    * is ticked on the threaded video worker */
+   retro_time_t last_clock_update;
+   retro_time_t last_ticker_update;
+   retro_time_t last_ticker_slow_update;
+   float ticker_pixel_accumulator;
+   float ticker_pixel_line_accumulator;
 };
 
 typedef struct gfx_animation gfx_animation_t;
@@ -244,12 +294,17 @@ bool gfx_animation_update(
       retro_time_t current_time,
       bool timedate_enable,
       float ticker_speed,
-      unsigned video_width,
-      unsigned video_height);
+      unsigned video_dims);
 
 bool gfx_animation_ticker(gfx_animation_ctx_ticker_t *ticker);
 
 bool gfx_animation_ticker_smooth(gfx_animation_ctx_ticker_smooth_t *ticker);
+
+bool gfx_animation_line_ticker(gfx_animation_t *p_anim,
+      gfx_animation_ctx_line_ticker_t *line_ticker);
+
+bool gfx_animation_line_ticker_smooth(gfx_animation_t *p_anim,
+      gfx_animation_ctx_line_ticker_smooth_t *line_ticker);
 
 bool gfx_animation_kill_by_tag(uintptr_t *tag);
 
@@ -258,6 +313,27 @@ bool gfx_animation_push(gfx_animation_ctx_entry_t *entry);
 void gfx_animation_push_delayed(unsigned delay, gfx_animation_ctx_entry_t *entry);
 
 void gfx_animation_deinit(void);
+
+/* Widget tweens. Without the threaded video wrapper they share the
+ * main instance and tick with it; with it the worker owns them in an
+ * instance of their own, ticked by gfx_animation_update_widgets(). */
+bool gfx_animation_push_widget(gfx_animation_ctx_entry_t *entry);
+
+bool gfx_animation_kill_widget_by_tag(uintptr_t *tag);
+
+void gfx_animation_timer_start_widget(float *timer,
+      gfx_timer_ctx_entry_t *timer_entry);
+
+bool gfx_animation_ticker_widget(gfx_animation_ctx_ticker_t *ticker);
+
+gfx_animation_t *anim_widgets_get_ptr(void);
+
+/* Hands the widget tweens to the worker's instance or back to the
+ * main one. Neither thread may be touching them. */
+void gfx_animation_widgets_own(bool worker);
+
+void gfx_animation_update_widgets(retro_time_t current_time,
+      float ticker_speed, unsigned video_dims);
 
 gfx_animation_t *anim_get_ptr(void);
 

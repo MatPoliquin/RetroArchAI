@@ -3,7 +3,7 @@
 If you are a developer who wishes to contribute to the development of _RetroArch_; or if you have
 found a bug and wish to submit a minor patch and/or bug report, please read this document.
 
-Active discussions happen on our [Discord](https://discordapp.com/invite/27Xxm2h), mostly within
+Active discussions happen on our [Discord](https://discord.gg/C4amCeV), mostly within
 the _Programming_ channel category. We value discussions that happen in real time around
 these contributions.
 
@@ -11,6 +11,18 @@ Please do note that contributors to _RetroArch_ do such contributions within the
 We do prefer to keep a professional and non-aggressive atmosphere around the project, along
 with any disagreements to be settled professionally without insults, name calling, or otherwise.
 If there are any issues, we are willing to have discussions about it.
+
+## Core authors and upstream developers
+
+Libretro does not make statements about, endorse, or vet the personal
+views or conduct of core authors or upstream developers.
+
+Documentation in this repository describes the software only. Pull
+requests that add statements about the people behind a core, positive
+or negative, will not be accepted.
+
+Decisions about including or removing a core are based on licensing,
+technical, and maintenance criteria.
 
 ## Submitting Bug Reports
 
@@ -64,7 +76,7 @@ may be merged in when it is fully approved. The final approval of merge requests
 discretion of the project.
 
 If you want to develop a larger feature or make broad changes, please do join our
-[Discord](https://discordapp.com/invite/27Xxm2h) server to discuss. The discussion is
+[Discord](https://discord.gg/C4amCeV) server to discuss. The discussion is
 necessary to prevent the possibility of major work being done which will not be accepted at all.
 
 ## libretro API

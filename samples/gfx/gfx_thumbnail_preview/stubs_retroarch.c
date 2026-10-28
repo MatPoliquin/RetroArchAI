@@ -1,0 +1,524 @@
+/* Stubs letting the real gfx/gfx_thumbnail.c link standalone.
+ *
+ * Everything that decides thumbnail behaviour - data_transfer,
+ * image_transfer, image_texture_get_type, path_*, mem_stats - is the
+ * real implementation.  Only the frontend edges are faked: the video
+ * driver hands back a fake texture id and counts uploads, the
+ * animation driver records fade pushes, and the task queue records
+ * whether a still load was ever requested.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <sys/stat.h>
+
+#include <formats/image.h>
+
+#include "../../../gfx/video_defines.h"
+
+#include "harness.h"
+
+harness_probe_t hp;
+
+int menu_driver_media_startup_token(void) { return 0; }
+
+/* ---- video driver ---- */
+bool video_driver_texture_load(void *data, unsigned filter_type,
+      uintptr_t *id)
+{
+   struct texture_image *img = (struct texture_image*)data;
+   hp.texture_uploads++;
+   *id = 0x1000 + hp.texture_uploads;
+   hp.last_tex_w = img->width;
+   hp.last_tex_h = img->height;
+   if (img->fp16 && img->pixels)
+   {
+      size_t c = ((size_t)img->height / 2 * img->width + img->width / 2) * 4;
+      hp.fp16_uploads++;
+      hp.fp16_r = ((const unsigned short*)img->pixels)[c];
+   }
+   return true;
+}
+bool video_driver_texture_unload(uintptr_t *id)
+{
+   hp.texture_unloads++;
+   *id = 0;
+   return true;
+}
+/* No in-place path: every animation frame is a replacement load, so
+ * the upload and unload counts the probes read keep their meaning. */
+bool video_driver_texture_can_update(void) { return false; }
+/* enum video_texture_update: 0 is refused. */
+int video_driver_texture_update(uintptr_t id, void *data)
+{ (void)id; (void)data; return 0; }
+unsigned video_driver_get_disp_flags(void) { return 0; }
+bool video_driver_get_video_output_size(unsigned *dims, char *d, size_t l)
+{ *dims = VIDEO_SCALE_PACK(1920, 1080); (void)d; (void)l; return true; }
+bool video_driver_get_viewport_info(void *vp) { (void)vp; return false; }
+void *video_state_get_ptr(void) { static char b[4096]; return b; }
+unsigned gfx_display_texture_filter(void) { return 0; }
+/* gfx_thumbnail_draw() reaches the display driver through this rather
+ * than through one of the helpers, so it needs its own stub even
+ * though nothing here draws.
+ *
+ * The two pointer parameters are void* rather than their real types.
+ * This file declares its own view of the frontend and including
+ * gfx_display.h to name them drags in a video_driver.h that conflicts
+ * with those declarations; C linkage does not carry parameter types,
+ * so the symbol matches what gfx_thumbnail.c calls either way. */
+void gfx_display_draw(void *dispctx, void *draw, void *data,
+      unsigned video_dims)
+{
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
+ (void)dispctx; (void)draw; (void)data;
+  (void)video_width; (void)video_height; }
+
+void gfx_display_rotate_z(void *a, void *b) { (void)a; (void)b; }
+void *disp_get_ptr(void) { static char b[8192]; return b; }
+
+/* ---- animation driver: this is what the fade goes through ---- */
+void gfx_animation_push(void *entry)
+{
+   /* layout-independent: record the push and force completion, which
+    * is what the real animation does over fade_duration */
+   struct ge { float easing; uintptr_t tag; float duration;
+               float target_value; float *subject; void *cb; void *ud; };
+   (void)entry;
+   hp.fade_pushes++;
+}
+
+/* Blending goes through gfx_display now, on the same terms as the
+ * draw above: void* for the same reason, and nothing to do here. */
+void gfx_display_blend_begin(void *dispctx, void *data)
+{ (void)dispctx; (void)data; }
+void gfx_display_blend_end(void *dispctx, void *data)
+{ (void)dispctx; (void)data; }
+bool gfx_animation_kill_by_tag(uintptr_t *tag) { (void)tag; return true; }
+
+/* ---- task queue ---- */
+bool task_is_on_main_thread(void) { return true; }
+bool task_push_image_load(const char *path, bool rgba, unsigned t,
+      unsigned c, void *cb, void *ud)
+{
+   (void)path; (void)rgba; (void)t; (void)c; (void)cb;
+   hp.still_loads++;
+   free(ud);              /* the tag would be freed by the callback */
+   return true;
+}
+/* The thumbnail loads its stills with the flags form; the same here. */
+bool task_push_image_load_ex(const char *path, unsigned flags, unsigned t,
+      unsigned c, void *cb, void *ud)
+{
+   (void)flags;
+   return task_push_image_load(path, false, t, c, cb, ud);
+}
+bool task_image_detach_video_stream(void *t, void **s, int *ty, void **x,
+      void **b, size_t *l)
+{ (void)t; (void)s; (void)ty; (void)x; (void)b; (void)l; return false; }
+/* No task, no verdict: the real accessor answers -1 (unknown) for
+ * anything that is not a completed PNG image task, and unknown is
+ * exactly what sends the open down its historical file probe. */
+int task_image_png_probe(void *t) { (void)t; return -1; }
+
+/* A set is decoded and lands here and now, with nothing: the tags go
+ * back through the thumbnail's own landing, as the real callback
+ * would hand them */
+bool task_push_image_load_set(const char *const *paths,
+      void *const *item_uds, unsigned n, unsigned load_flags,
+      unsigned upscale_threshold, unsigned downscale_cap,
+      void (*cb)(void *img, int png_probe, void *ud), uint64_t tag)
+{
+   unsigned i;
+   (void)paths; (void)load_flags; (void)upscale_threshold;
+   (void)downscale_cap; (void)tag;
+   hp.still_sets++;
+   hp.set_items += (int)n;
+   if ((int)n > hp.set_max)
+      hp.set_max = (int)n;
+   for (i = 0; i < n; i++)
+      cb(NULL, -1, item_uds[i]);
+   return true;
+}
+bool task_image_set_tag(void *task, uint64_t *tag)
+{ (void)task; (void)tag; return false; }
+bool task_queue_is_threaded(void) { return hp.threaded_queue != 0; }
+
+void *task_queue_find(void *id) { (void)id; return NULL; }
+void task_set_flags(void *t, uint32_t f, bool s) { (void)t; (void)f; (void)s; }
+
+/* ---- config ---- */
+/* Offset and size come from settings_layout_uut.c, compiled with the
+ * UUT's flags, so the blob poke lands on
+ * settings->bools.menu_thumbnail_preview_audio for whatever layout
+ * configuration.h currently has - nothing else in the blob is
+ * disturbed. */
+extern const size_t settings_layout_sizeof;
+extern const size_t settings_layout_preview_audio_off;
+extern const size_t settings_layout_preview_threads_off;
+extern const size_t settings_layout_gfx_thumbnails_off;
+extern const size_t settings_layout_dir_thumbnails_off;
+static char g_settings[1 << 20];
+void *config_get_ptr(void)
+{
+   if (settings_layout_sizeof > sizeof(g_settings))
+      abort();
+   if (hp.thumb_cfg)
+   {
+      unsigned on = 1;
+      memcpy(g_settings + settings_layout_gfx_thumbnails_off, &on,
+            sizeof(on));
+      strcpy(g_settings + settings_layout_dir_thumbnails_off, "/tmp");
+   }
+   g_settings[settings_layout_preview_audio_off] =
+         hp.force_preview_audio ? 1 : 0;
+   {
+      /* THREADS: the preview's thread count, as the menu setting
+       * would set it; the threaded build decodes on the worker and
+       * the pool for anything above one. */
+      const char *te = getenv("THREADS");
+      unsigned t = te ? (unsigned)atoi(te) : 1;
+      memcpy(g_settings + settings_layout_preview_threads_off, &t, sizeof(t));
+   }
+   return g_settings;
+}
+
+/* ---- menu / runloop / playlist ---- */
+static char g_menu_blob[65536];
+static char g_runloop_blob[1 << 18];
+void *menu_state_get_ptr(void) { return g_menu_blob; }
+void *runloop_state_get_ptr(void) { return g_runloop_blob; }
+/* No content switch, no content: what a menu without a core sees */
+bool runloop_is_content_switching(void) { return false; }
+bool runloop_content_loaded(void)       { return false; }
+
+/* A one-entry playlist, cached while a test holds it: the entry is laid
+ * out by settings_layout_uut.c, which sees the UUT's struct layouts. */
+extern const void *layout_savestate_entry_setup(void *menu_blob,
+      size_t menu_size, void *runloop_blob, size_t runloop_size,
+      const char *savestate_dir, const char *entry_path);
+static const void *g_playlist_entry;
+int stub_playlist_entry_set(const char *savestate_dir, const char *entry_path)
+{
+   if (!entry_path)
+   {
+      g_playlist_entry = NULL;
+      return 1;
+   }
+   g_playlist_entry = layout_savestate_entry_setup(
+         g_menu_blob, sizeof(g_menu_blob),
+         g_runloop_blob, sizeof(g_runloop_blob),
+         savestate_dir, entry_path);
+   return g_playlist_entry != NULL;
+}
+void runloop_path_set_redirect(void *a, char *b, char *c)
+{ (void)a; (void)b; (void)c; }
+void dir_set(unsigned t, const char *p) { (void)t; (void)p; }
+void *playlist_get_cached(void)
+{ return g_playlist_entry ? (void*)&g_playlist_entry : NULL; }
+void playlist_get_index(void *p, size_t i, const void **e)
+{ (void)i; if (e) *e = p ? g_playlist_entry : NULL; }
+size_t playlist_get_size(void *p) { (void)p; return 0; }
+char *playlist_get_conf_path(void *p) { (void)p; return NULL; }
+void playlist_get_db_name(void *p, size_t i, const char **n)
+{ (void)p; (void)i; if (n) *n = NULL; }
+int playlist_get_thumbnail_mode(void *p, unsigned id) { (void)p; (void)id; return 0; }
+const char *msg_hash_to_str(unsigned id) { (void)id; return ""; }
+
+/* ---- threads: single-threaded harness, real locks not needed.
+ * The threaded build links rthreads itself and has none of these. ---- */
+#ifndef PREVIEW_THREADED
+/* Declared by rthreads.h, which the audio driver header below pulls
+ * in, so the stubs keep its types: opaque, never dereferenced here. */
+#include <rthreads/rthreads.h>
+slock_t *slock_new(void) { return (slock_t*)malloc(1); }
+void slock_free(slock_t *l) { free(l); }
+void slock_lock(slock_t *l) { (void)l; }
+void slock_unlock(slock_t *l) { (void)l; }
+scond_t *scond_new(void) { return (scond_t*)malloc(1); }
+void scond_free(scond_t *c) { free(c); }
+void scond_wait(scond_t *c, slock_t *l) { (void)c; (void)l; }
+void scond_signal(scond_t *c) { (void)c; }
+int scond_broadcast(scond_t *c) { (void)c; return 0; }
+sthread_t *sthread_create(void (*f)(void*), void *ud) { (void)f; (void)ud; return NULL; }
+void sthread_join(sthread_t *t) { (void)t; }
+#else
+/* The threaded build of gfx_surface asks whether the video thread
+ * wrapper is up before handing a load to it; the harness has no
+ * video thread, so the surface takes its direct path. */
+bool video_driver_thread_wrapper_active(void) { return false; }
+bool video_thread_async_post(void *n) { (void)n; return false; }
+bool video_thread_lend_ready(int idx) { (void)idx; return true; }
+#endif
+
+bool path_is_directory(const char *p)
+{ struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+bool path_mkdir(const char *d) { (void)d; return false; }
+
+/* file_path.c gates these behind RARCH_INTERNAL; provide the real
+ * semantics rather than stubs, since the thumbnail path resolution
+ * depends on them. */
+#include <streams/file_stream.h>
+bool path_is_valid(const char *path)
+{
+   struct stat st;
+   return path && *path && stat(path, &st) == 0;
+}
+int64_t path_get_size(const char *path)
+{
+   struct stat st;
+   if (!path || !*path || stat(path, &st) != 0)
+      return -1;
+   return (int64_t)st.st_size;
+}
+int path_is_media_type(const char *path)
+{
+   const char *e = strrchr(path ? path : "", '.');
+   if (!e) return 0;
+   if (!strcasecmp(e, ".png") || !strcasecmp(e, ".jpg")
+    || !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".bmp")
+    || !strcasecmp(e, ".tga") || !strcasecmp(e, ".webp"))
+      return 3 /* RARCH_CONTENT_IMAGE */;
+   return 0;
+}
+
+/* ---- audio mixer edge (GFX_THUMB_PREVIEW_AUDIO builds) ---- */
+#include <audio/audio_mixer.h>
+#include "../../../audio/audio_driver.h"
+/* Model the mixer closely enough to catch the two failures that
+ * matter: reading past the advertised bound, and the bound never
+ * moving.  The "decoder" walks the container at a fixed byte rate on
+ * every feeder tick, exactly as an audio thread would, and touches
+ * every byte it is told is resident - so an over-claimed avail faults
+ * under ASan instead of passing silently. */
+static const uint8_t *hp_abuf;
+static size_t hp_alen, hp_aavail, hp_atell;
+static void *hp_aowner;
+static void (*hp_aownerfree)(void*);
+static int hp_alive;
+static audio_mixer_sound_t *hp_pcm_sound;
+static audio_mixer_voice_t *hp_pcm_voice;
+
+bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
+{
+   hp.audio_streams++;
+   hp.last_audio_bytes = params->bufsize;
+   hp_abuf       = (const uint8_t*)params->buf;
+   hp_alen       = params->bufsize;
+   hp_aavail     = params->avail ? params->avail : params->bufsize;
+   hp_atell      = 0;
+   hp_aowner     = params->buf_owner;
+   hp_aownerfree = params->buf_owner_free;
+   hp_alive      = 1;
+   if (params->out_slot)
+      *params->out_slot = 7;
+   return true;   /* borrows the window; released via remove_stream */
+}
+
+/* bytes the decoder consumes per feeder tick: 255 kbps at 60 fps */
+static size_t hp_rate(void)
+{
+   const char *e = getenv("AUDIO_BYTES_PER_TICK");
+   return e ? (size_t)atol(e) : 532;   /* 255 kbps at 60 fps */
+}
+#define HP_BYTES_PER_TICK hp_rate()
+
+int64_t audio_driver_mixer_stream_byte_tell(unsigned i)
+{
+   volatile uint8_t sink = 0;
+   size_t want;
+   (void)i;
+   if (!hp_alive)
+      return -1;
+   want = hp_atell + HP_BYTES_PER_TICK;
+   if (want > hp_aavail)
+   {
+      want = hp_aavail;          /* stall at the bound, never past it */
+      /* Only a bound BELOW the file end is the feeder falling behind.
+       * At avail == len the whole container is resident and hitting
+       * the wall is just end of stream before the loop - counting
+       * that as a stall made a 10 MB fixture look like a starved
+       * feeder. */
+      if (hp_aavail < hp_alen)
+         hp.audio_stalls++;
+   }
+   /* touch what we were promised is resident */
+   while (hp_atell < want)
+      sink ^= hp_abuf[hp_atell++];
+   (void)sink;
+   if (hp_atell >= hp_alen)
+      hp_atell = 0;              /* loop */
+   return (int64_t)hp_atell;
+}
+
+void audio_driver_mixer_stream_set_avail(unsigned i, size_t avail)
+{
+   (void)i;
+   if (getenv("FRONTEND_TIMELINE") && hp_pcm_voice)
+   {
+      audio_mixer_voice_set_avail(hp_pcm_voice, avail);
+      hp.audio_avail_raises++;
+      return;
+   }
+   if (avail > hp_alen)
+      avail = hp_alen;
+   if (avail > hp_aavail)
+      hp_aavail = avail;
+   hp.audio_avail_raises++;
+}
+void audio_driver_mixer_stream_set_repeat(unsigned i, bool repeat)
+{
+   (void)i;
+   (void)repeat;
+}
+
+void audio_driver_mixer_stream_set_paused(unsigned i, bool paused)
+{ (void)i; audio_mixer_voice_set_paused(hp_pcm_voice, paused); }
+/* This edge simulates byte residency, not PCM playback. It has no
+ * clock binding; the real clock oracle lives in preview_audio_feed. */
+bool audio_driver_mixer_prepare_format(unsigned *rate, bool *s16)
+{ *rate = 48000; *s16 = false; return true; }
+bool audio_driver_mixer_add_stream_clocked(audio_mixer_stream_params_t *params,
+      audio_mixer_voice_t **voice, size_t *serial)
+{
+   *voice = NULL; *serial = 0;
+   if (getenv("FRONTEND_TIMELINE"))
+   {
+      hp.audio_streams++; hp.last_audio_bytes = params->bufsize;
+      hp_pcm_sound = params->type == AUDIO_MIXER_TYPE_WEBA
+         ? audio_mixer_load_weba_avail(params->buf, params->bufsize, params->avail)
+         : audio_mixer_load_m4a(params->buf, params->bufsize);
+      audio_mixer_sound_set_data_owner(hp_pcm_sound, params->buf_owner, params->buf_owner_free);
+      if (!hp_pcm_sound) return false;
+      audio_mixer_sound_set_avail(hp_pcm_sound, params->avail);
+      hp_pcm_voice = audio_mixer_play(hp_pcm_sound, true, params->volume,
+            "sinc", RESAMPLER_QUALITY_NORMAL, NULL);
+      if (hp_pcm_voice && audio_mixer_voice_clock(hp_pcm_voice, NULL, NULL, serial))
+      {
+         *voice = hp_pcm_voice;
+         if (params->out_slot) *params->out_slot = 7;
+         return true;
+      }
+      if (hp_pcm_voice) audio_mixer_stop(hp_pcm_voice);
+      audio_mixer_destroy(hp_pcm_sound); hp_pcm_sound = NULL; hp_pcm_voice = NULL;
+      return false;
+   }
+   return audio_driver_mixer_add_stream(params);
+}
+/* Seek transport uses actual PCM; the initial byte-feeder model above
+ * stays independent so it can still deliberately touch promised bytes. */
+bool audio_driver_mixer_add_prepared_stream(audio_mixer_stream_params_t *params,
+      audio_mixer_sound_t *sound, audio_mixer_voice_t **voice, size_t *serial)
+{
+   *voice = NULL; *serial = 0;
+   hp_pcm_voice = audio_mixer_play(sound, true, 1.0f, "sinc",
+         RESAMPLER_QUALITY_NORMAL, NULL);
+   if (hp_pcm_voice && audio_mixer_voice_clock(hp_pcm_voice, NULL, NULL, serial))
+   {
+      hp_pcm_sound = sound;
+      *voice = hp_pcm_voice;
+      if (params->out_slot) *params->out_slot = 7;
+      return true;
+   }
+   audio_mixer_destroy(sound);
+   return false;
+}
+void audio_driver_mixer_remove_stream_clocked(unsigned i,
+      audio_mixer_voice_t *voice, size_t serial)
+{
+   size_t current;
+   if (voice == hp_pcm_voice && audio_mixer_voice_clock(voice, NULL, NULL, &current)
+         && current == serial)
+      audio_driver_mixer_remove_stream(i);
+}
+void audio_driver_mixer_stop_stream(unsigned i) { (void)i; hp.audio_stops++; }
+void audio_driver_mixer_remove_stream(unsigned i)
+{
+   (void)i;
+   hp_alive = 0;
+   if (hp_pcm_voice) audio_mixer_stop(hp_pcm_voice);
+   if (hp_pcm_sound) audio_mixer_destroy(hp_pcm_sound);
+   hp_pcm_voice = NULL; hp_pcm_sound = NULL;
+   if (hp_aowner && hp_aownerfree)
+      hp_aownerfree(hp_aowner);
+   hp_aowner = NULL; hp_abuf = NULL;
+}
+const char *audio_driver_mixer_get_stream_name(unsigned i) { (void)i; return "__gfx_thumb_preview"; }
+enum audio_mixer_state audio_driver_mixer_get_stream_state(unsigned i)
+{ (void)i; return AUDIO_STREAM_STATE_NONE; }
+
+bool audio_driver_mixer_stream_stop(unsigned i) { (void)i; return true; }
+
+
+/* Resampler config edges.  The mixer instantiates a resampler when a
+ * stream's rate differs from the mixer rate; none of these values
+ * affect what this sample measures. */
+void config_userdata_free(void *u) { (void)u; }
+int  config_userdata_get_float(void *u, const char *k, float *v, float d)
+{ (void)u; (void)k; if (v) *v = d; return 0; }
+int  config_userdata_get_int(void *u, const char *k, int *v, int d)
+{ (void)u; (void)k; if (v) *v = d; return 0; }
+int  config_userdata_get_float_array(void *u, const char *k, float **v,
+      unsigned *n) { (void)u; (void)k; (void)v; (void)n; return 0; }
+int  config_userdata_get_int_array(void *u, const char *k, int **v,
+      unsigned *n) { (void)u; (void)k; (void)v; (void)n; return 0; }
+int  config_userdata_get_string(void *u, const char *k, char **v,
+      const char *d) { (void)u; (void)k; (void)v; (void)d; return 0; }
+
+/* The surface layer asks the driver what it wants before a decode
+ * (gfx_surface_query_requirements): here there is no driver, so the
+ * answers are the software defaults - no 10-bit source, no compressed
+ * sampling. */
+bool video_driver_test_all_flags(int flags)
+{ (void)flags; return false; }
+/* With HDR_OUTPUT set the run looks like a driver on HDR output: it
+ * keeps half floats and shows them as linear scRGB, so gfx_surface
+ * offers FP16 to an HDR source. Nothing else is supported either way. */
+bool video_driver_supports_texture_format(int fmt)
+{
+   return hp.hdr_output
+      && (fmt == TEXTURE_GPU_FORMAT_RGBA16F || fmt == TEXTURE_GPU_FORMAT_SCRGB);
+}
+
+/* As the frontend fits an image, from this stub's own answers */
+bool video_driver_texture_fit(struct texture_image *ti)
+{
+   if (ti->pix10 && !video_driver_supports_texture_format(TEXTURE_GPU_FORMAT_RGB10A2))
+      image_texture_narrow_10bit(ti);
+   return !ti->fp16
+      || video_driver_supports_texture_format(TEXTURE_GPU_FORMAT_RGBA16F);
+}
+
+/* No driver lends upload memory here: every slot stays the surface's. */
+void *video_driver_texture_lend(uintptr_t id, unsigned slot, size_t pitch, size_t *out_pitch)
+{
+   if (out_pitch)
+      *out_pitch = pitch;
+   (void)id; (void)slot; (void)pitch;
+   return NULL;
+}
+
+/* No device to import into: REFUSED */
+int video_driver_texture_import(uintptr_t *id, const void *frame,
+      int filter)
+{
+   (void)id; (void)frame; (void)filter;
+   return 0;
+}
+
+bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot)
+{
+   (void)id; (void)slot;
+   return true;
+}
+
+bool video_driver_texture_lend_needs_refresh(void) { return false; }
+bool video_thread_lend_get(int idx, void **mem, size_t *pitch)
+{
+   (void)idx;
+   (void)mem;
+   (void)pitch;
+   return false;
+}

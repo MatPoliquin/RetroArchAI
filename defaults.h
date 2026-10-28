@@ -71,16 +71,21 @@ struct defaults
 #ifndef IS_SALAMANDER
    playlist_t *content_history;
    playlist_t *content_favorites;
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    playlist_t *image_history;
 #endif
    playlist_t *music_history;
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
    playlist_t *video_history;
 #endif
 #endif
    int settings_out_latency;
    int settings_in_latency;
+   /* Device-optimal audio output parameters supplied by the
+    * frontend; 0 means the frontend has no opinion and the
+    * built-in defaults apply. */
+   int settings_out_sample_rate;
+   int settings_out_block_frames;
 #ifdef HAVE_MENU
    unsigned menu_materialui_menu_color_theme;
 #endif

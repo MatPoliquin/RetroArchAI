@@ -1,0 +1,133 @@
+name: CI Linux autoconfig regression
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  autoconf-tests:
+    name: Build and run the autoconfig regression suite (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential zlib1g-dev libfreetype6-dev ccache
+    timeout-minutes: ${{ matrix.sanitizer == '' && 15 || 40 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The suite fails on any sanitizer report in any run, so the
+        # sanitized lanes hold the whole frontend it drives - runloop,
+        # task queue, autodetect - to the same bar as the assertions.
+        include:
+          - lane: plain
+            sanitizer: ''
+          - lane: ASan + UBSan
+            sanitizer: address,undefined
+          - lane: TSan
+            sanitizer: thread
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Configure (headless, test drivers)
+        run: |
+          set -eu
+          # The suite drives the test input/joypad drivers with the
+          # null video/audio/menu drivers - no X11/Vulkan/menu needed.
+          # HAVE_TEST_DRIVERS is on by default; assert it survived
+          # configure so a silent drop turns into a clear failure
+          # rather than a skipped test.
+          ./configure --disable-menu --disable-ffmpeg --disable-x11 --disable-wayland
+          grep -q '^HAVE_TEST_DRIVERS = 1' config.mk
+
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.sanitizer }}" ]; then
+            CFLAGS="-O0 -g1" CXXFLAGS="-O0 -g1" make -j"$(nproc)" SANITIZER=${{ matrix.sanitizer }} DEBUG=1
+          else
+            make -j"$(nproc)"
+          fi
+
+      - name: Run autoconfig regression suite
+        shell: bash
+        run: |
+          set -eu
+          test -x ./retroarch
+          if [ "${{ matrix.sanitizer }}" = thread ]; then
+            # TSan cannot map its shadow under the runner's ASLR
+            # entropy; setarch -R carries to every child the suite runs.
+            setarch "$(uname -m)" -R ./tests-other/test_autoconf.sh ./retroarch
+          else
+            ./tests-other/test_autoconf.sh ./retroarch
+          fi
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-${{ github.sha }}

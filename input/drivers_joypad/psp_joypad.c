@@ -27,6 +27,14 @@
 
 #include <defines/psp_defines.h>
 
+#if defined(PSP)
+/* The SDK header this driver's PSP path takes SceCtrlData, the button
+ * bits and the sceCtrl calls from. The VITA path includes its own
+ * below; without this one the file compiled only because griffin
+ * happens to include psp_input.c, which does, before it. */
+#include <pspctrl.h>
+#endif
+
 #ifdef HAVE_MENU
 #include "../../menu/menu_driver.h"
 #endif
@@ -58,9 +66,6 @@ static SceCtrlActuator actuators[DEFAULT_MAX_PADS] = {0};
 /* TODO/FIXME - static globals */
 static uint64_t pad_state[DEFAULT_MAX_PADS];
 static int16_t analog_state[DEFAULT_MAX_PADS][3][2];
-
-/* TODO/FIXME - global referenced outside */
-extern uint64_t lifecycle_state;
 
 static const char *psp_joypad_name(unsigned pad)
 {
@@ -107,7 +112,7 @@ static void *psp_joypad_init(void *data)
    for (i = 0; i < players_count; i++)
       input_autoconfigure_connect(
             psp_joypad_name(i),
-            NULL,
+            NULL, NULL,
             psp_joypad.ident,
             i,
             0,
@@ -192,7 +197,8 @@ static int16_t psp_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t psp_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    unsigned i;
@@ -204,11 +210,8 @@ static int16_t psp_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN 
             && (pad_state[port_idx] & (UINT64_C(1) << (uint16_t)joykey))
@@ -228,9 +231,8 @@ static void psp_joypad_poll(void)
    unsigned player;
    unsigned players_count      = DEFAULT_MAX_PADS;
 #if defined(VITA)
-   settings_t *settings        = config_get_ptr();
-   bool input_backtouch_enable = settings->bools.input_backtouch_enable;
-   bool input_backtouch_toggle = settings->bools.input_backtouch_toggle;
+   bool input_backtouch_enable = input_config_get_backtouch_enable();
+   bool input_backtouch_toggle = input_config_get_backtouch_toggle();
 #endif
 
 #ifdef PSP
@@ -259,7 +261,7 @@ static void psp_joypad_poll(void)
                curr_ctrl_info.port[player + 1] != SCE_CTRL_TYPE_UNPAIRED)
             input_autoconfigure_connect(
                   psp_joypad_name(player),
-                  NULL,
+                  NULL, NULL,
                   psp_joypad.ident,
                   player,
                   0,
@@ -272,11 +274,10 @@ static void psp_joypad_poll(void)
 
    CtrlSetSamplingMode(DEFAULT_SAMPLING_MODE);
 
-   BIT64_CLEAR(lifecycle_state, RARCH_MENU_TOGGLE);
-
    for (player = 0; player < players_count; player++)
    {
       unsigned j, k;
+      int32_t ret;
       SceCtrlData state_tmp;
       unsigned i  = player;
 #if defined(VITA)
@@ -294,20 +295,31 @@ static void psp_joypad_poll(void)
 #else
       unsigned p  = player;
 #endif
-      int32_t ret = CtrlPeekBufferPositive(p, &state_tmp, 1);
+      ret = CtrlPeekBufferPositive(p, &state_tmp, 1);
 
       pad_state[i] = 0;
       analog_state[i][0][0] = analog_state[i][0][1] =
          analog_state[i][1][0] = analog_state[i][1][1] = 
          analog_state[i][2][0] = analog_state[i][2][1] = 0;
 
-#if defined(SN_TARGET_PSP2) || defined(VITA)
       if (ret < 0)
          continue;
-#endif
 #if defined(VITA)
+      /* The system keyboard (psp_input.c) is modal and reads the pad
+       * itself; the buttons that drive it must not also drive the
+       * menu behind it. */
+      if (input_driver_native_keyboard_shown())
+         continue;
+      /* The touch panels stand in for L2/R2/L3/R3 in-game only.  In
+       * the menu the front panel is the pointer and the rear one is
+       * where the hands rest, and a trigger pressed from either is a
+       * scroll action nobody asked for. */
       if (sceKernelGetModelForCDialog() == SCE_KERNEL_MODEL_VITA
-         && input_backtouch_enable)
+         && input_backtouch_enable
+#ifdef HAVE_MENU
+         && !menu_driver_alive()
+#endif
+         )
       {
          unsigned i;
          SceTouchData touch_surface = {0};
@@ -368,9 +380,20 @@ static void psp_joypad_poll(void)
    }
 }
 
+/* Whether a pad is connected, as the other joypad drivers report it:
+ * the built-in controls are always there, and on the TV model a port
+ * is connected when a controller is paired to it. */
 static bool psp_joypad_query_pad(unsigned pad)
 {
-   return pad < DEFAULT_MAX_PADS && pad_state[pad];
+   if (pad >= DEFAULT_MAX_PADS)
+      return false;
+#if defined(VITA)
+   if (psp2_model != SCE_KERNEL_MODEL_VITATV)
+      return pad == 0;
+   return curr_ctrl_info.port[pad + 1] != SCE_CTRL_TYPE_UNPAIRED;
+#else
+   return pad == 0;
+#endif
 }
 
 static bool psp_joypad_rumble(unsigned pad,

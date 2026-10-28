@@ -31,6 +31,7 @@
 
 #include "../../configuration.h"
 #include "../../file_path_special.h"
+#include "../../tasks/task_content.h"
 #include "../../core.h"
 #include "../../core_info.h"
 #include "../../core_option_manager.h"
@@ -43,6 +44,7 @@
 #include "../../performance_counters.h"
 #include "../../playlist.h"
 #include "../../manual_content_scan.h"
+#include "../../msg_hash_lbl_str.h"
 
 #include "../../audio/audio_driver.h"
 #include "../../input/input_remapping.h"
@@ -104,53 +106,35 @@ static int action_start_override_file_info(
    struct menu_state *menu_st      = menu_state_get_ptr();
    rarch_system_info_t *sys_info   = &runloop_state_get_ptr()->system;
    config_load_override(sys_info);
+
    /* Refresh menu */
    menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
                                    |  MENU_ST_FLAG_PREVENT_POPULATE;
    return 0;
 }
 
-static int action_start_shader_preset(
+static int action_start_shader_preset_file_info(
       const char *path, const char *label,
       unsigned type, size_t idx, size_t entry_idx)
 {
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
-   struct menu_state *menu_st      = menu_state_get_ptr();
-   struct video_shader *shader     = menu_shader_get();
-   shader->passes                  = 0;
-   menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                                   |  MENU_ST_FLAG_PREVENT_POPULATE;
-   command_event(CMD_EVENT_SHADERS_APPLY_CHANGES, NULL);
+   const char *current = video_shader_get_current_shader_preset();
+   command_set_shader(NULL, current);
 #endif
    return 0;
 }
 
-static int action_start_shader_preset_prepend(
-   const char* path, const char* label,
-   unsigned type, size_t idx, size_t entry_idx)
+static int action_start_shader_parameters(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
 {
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
-   struct menu_state *menu_st      = menu_state_get_ptr();
-   struct video_shader* shader     = menu_shader_get();
-   shader->passes                  = 0;
-   menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                                   |  MENU_ST_FLAG_PREVENT_POPULATE;
-   command_event(CMD_EVENT_SHADERS_APPLY_CHANGES, NULL);
-#endif
-   return 0;
-}
-
-static int action_start_shader_preset_append(
-   const char* path, const char* label,
-   unsigned type, size_t idx, size_t entry_idx)
-{
-#if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
-   struct menu_state *menu_st      = menu_state_get_ptr();
-   struct video_shader* shader     = menu_shader_get();
-   shader->passes                  = 0;
-   menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                                   |  MENU_ST_FLAG_PREVENT_POPULATE;
-   command_event(CMD_EVENT_SHADERS_APPLY_CHANGES, NULL);
+   generic_action_ok_displaylist_push(
+         msg_hash_to_str(MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_PARAMETERS),
+         NULL,
+         MENU_ENUM_LABEL_VIDEO_SHADER_PARAMETERS_STR,
+         MENU_SETTING_ACTION,
+         idx, 0, ACTION_OK_DL_GENERIC);
 #endif
    return 0;
 }
@@ -164,12 +148,15 @@ static int action_start_video_filter_file_load(
    if (!settings)
       return -1;
 
-   if (!string_is_empty(settings->paths.path_softfilter_plugin))
+   if (*settings->paths.path_softfilter_plugin)
    {
       struct menu_state *menu_st      = menu_state_get_ptr();
-      /* Unload video filter */
+      /* Unload video filter; the driver gets the core's frames */
       settings->paths.path_softfilter_plugin[0] = '\0';
-      command_event(CMD_EVENT_REINIT, NULL);
+#ifdef HAVE_VIDEO_FILTER
+      video_driver_filter_free();
+      video_driver_filter_apply();
+#endif
 
       /* Refresh menu */
       menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
@@ -188,7 +175,7 @@ static int action_start_audio_dsp_plugin_file_load(
    if (!settings)
       return -1;
 
-   if (!string_is_empty(settings->paths.path_audio_dsp_plugin))
+   if (*settings->paths.path_audio_dsp_plugin)
    {
       struct menu_state *menu_st      = menu_state_get_ptr();
       /* Unload DSP plugin filter */
@@ -243,8 +230,8 @@ static int action_start_input_desc(
 
    if (settings && sys_info)
    {
-      unsigned user_idx    = (type - MENU_SETTINGS_INPUT_DESC_BEGIN) / (RARCH_FIRST_CUSTOM_BIND + 8);
-      unsigned btn_idx     = (type - MENU_SETTINGS_INPUT_DESC_BEGIN) - (RARCH_FIRST_CUSTOM_BIND + 8) * user_idx;
+      unsigned user_idx    = (type - MENU_SETTINGS_INPUT_DESC_BEGIN) / RARCH_ANALOG_BIND_LIST_END;
+      unsigned btn_idx     = (type - MENU_SETTINGS_INPUT_DESC_BEGIN) - RARCH_ANALOG_BIND_LIST_END * user_idx;
       unsigned mapped_port = settings->uints.input_remap_ports[user_idx];
 
       if (     (user_idx    >= MAX_USERS)
@@ -253,13 +240,12 @@ static int action_start_input_desc(
          return 0;
 
       /* Check whether core has defined this input */
-      if (!string_is_empty(sys_info->input_desc_btn[mapped_port][btn_idx]))
+      if (sys_info->input_desc_btn[mapped_port][btn_idx] && *sys_info->input_desc_btn[mapped_port][btn_idx])
       {
-         const struct retro_keybind *keyptr = &input_config_binds[user_idx][btn_idx];
-         settings->uints.input_remap_ids[user_idx][btn_idx] = keyptr->id;
+         input_config_set_remap_id(user_idx, btn_idx, btn_idx);
       }
       else
-         settings->uints.input_remap_ids[user_idx][btn_idx] = RARCH_UNMAPPED;
+         input_config_set_remap_id(user_idx, btn_idx, RARCH_UNMAPPED);
    }
 
    return 0;
@@ -299,10 +285,12 @@ static int action_start_shader_action_parameter_generic(
    if (!shader_info.data)
       return 0;
 
+   /* Reset to initial via the driver-level setter; initial and the
+    * range are stable outside set_shader's blocking window. */
    param          = &shader_info.data->parameters
       [parameter];
-   param->current = param->initial;
-   param->current = MIN(MAX(param->minimum, param->current), param->maximum);
+   video_shader_driver_set_parameter(shader_info.data, parameter,
+         MIN(MAX(param->minimum, param->initial), param->maximum));
 
    return menu_shader_manager_clear_parameter(menu_shader_get(), parameter);
 }
@@ -384,22 +372,6 @@ static int action_start_shader_num_passes(
       unsigned type, size_t idx, size_t entry_idx)
 {
    return menu_shader_manager_clear_num_passes(menu_shader_get());
-}
-#endif
-
-#ifdef HAVE_CHEATS
-static int action_start_cheat_num_passes(
-      const char *path, const char *label,
-      unsigned type, size_t idx, size_t entry_idx)
-{
-   if (cheat_manager_get_size())
-   {
-      struct menu_state *menu_st  = menu_state_get_ptr();
-      menu_st->flags             |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
-      cheat_manager_realloc(0, CHEAT_HANDLER_TYPE_EMU);
-   }
-
-   return 0;
 }
 #endif
 
@@ -502,6 +474,42 @@ static int action_start_state_slot(
    return 0;
 }
 
+static int action_start_state_load(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings       = config_get_ptr();
+
+   if (settings->bools.quick_menu_show_undo_save_load_state)
+      return action_start_state_slot(path, label, type, idx, entry_idx);
+   else
+   {
+      if (generic_action_ok_command(CMD_EVENT_UNDO_LOAD_STATE) == -1)
+         return -1;
+      return generic_action_ok_command(CMD_EVENT_RESUME);
+   }
+
+   return 0;
+}
+
+static int action_start_state_save(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings       = config_get_ptr();
+
+   if (settings->bools.quick_menu_show_undo_save_load_state)
+      return action_start_state_slot(path, label, type, idx, entry_idx);
+   else
+   {
+      if (generic_action_ok_command(CMD_EVENT_UNDO_SAVE_STATE) == -1)
+         return -1;
+      return generic_action_ok_command(CMD_EVENT_RESUME);
+   }
+
+   return 0;
+}
+
 static int action_start_replay_slot(
       const char *path, const char *label,
       unsigned type, size_t idx, size_t entry_idx)
@@ -529,14 +537,11 @@ static int action_start_menu_wallpaper(
       unsigned type, size_t idx, size_t entry_idx)
 {
    settings_t *settings       = config_get_ptr();
-   struct menu_state *menu_st = menu_state_get_ptr();
 
    settings->paths.path_menu_wallpaper[0] = '\0';
 
-   /* Reset wallpaper by menu context reset */
-   if (menu_st->driver_ctx && menu_st->driver_ctx->context_reset)
-      menu_st->driver_ctx->context_reset(menu_st->userdata,
-            video_driver_is_threaded());
+   /* Reset wallpaper by menu context rebuild */
+   menu_driver_context_rebuild();
 
    return 0;
 }
@@ -566,13 +571,45 @@ static int action_start_manual_content_scan_dir(
    return 0;
 }
 
+static int action_start_scan_method(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   manual_content_scan_set_menu_scan_method(MANUAL_CONTENT_SCAN_METHOD_AUTOMATIC);
+   menu_st->flags             |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   return 0;
+}
+
+static int action_start_scan_use_db(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   manual_content_scan_set_menu_scan_use_db(MANUAL_CONTENT_SCAN_USE_DB_STRICT);
+   menu_st->flags             |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   return 0;
+}
+
+static int action_start_scan_db_select(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   manual_content_scan_set_menu_scan_db_select(MANUAL_CONTENT_SCAN_SELECT_DB_AUTO, "");
+   menu_st->flags             |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   return 0;
+}
+
 static int action_start_manual_content_scan_system_name(
       const char *path, const char *label,
       unsigned type, size_t idx, size_t entry_idx)
 {
+   struct menu_state *menu_st = menu_state_get_ptr();
    /* Reset system name */
    manual_content_scan_set_menu_system_name(
-         MANUAL_CONTENT_SCAN_SYSTEM_NAME_CONTENT_DIR, "");
+         MANUAL_CONTENT_SCAN_SYSTEM_NAME_AUTO, "");
+   menu_st->flags             |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
    return 0;
 }
 
@@ -590,42 +627,51 @@ static int action_start_video_resolution(
       const char *path, const char *label,
       unsigned type, size_t idx, size_t entry_idx)
 {
-#if defined(GEKKO) || defined(PS2) || !defined(__PSL1GHT__) && !defined(__PS3__)
-   unsigned width = 0, height = 0;
+   unsigned dims = 0;
    char desc[64] = {0};
-   global_t *global = global_get_ptr();
+#if defined(PS2)
+   config_get_ptr()->uints.video_ps2_mode = 0;
+#else
+   settings_t *settings = config_get_ptr();
 
-   /*  Reset the resolution id to zero */
-   global->console.screen.resolutions.current.id = 0;
+   /* The display's own mode */
+   settings->uints.video_fullscreen_x = 0;
+   settings->uints.video_fullscreen_y = 0;
+#endif
 
-   if (video_driver_get_video_output_size(&width, &height, desc, sizeof(desc)))
+   if (video_driver_get_video_output_size(&dims, desc, sizeof(desc)))
    {
       size_t _len;
       char msg[128];
+#if defined(GEKKO) || defined(PS2) || defined(__PS3__)
+      bool fullscreen = true;
+#else
+      /* The window state the frontend is in, as driver init reads it */
+      bool fullscreen = config_get_ptr()->bools.video_fullscreen
+            || (video_driver_get_disp_flags() & VIDEO_FLAG_FORCE_FULLSCREEN);
+#endif
       msg[0] = '\0';
 
-#if defined(_WIN32) || !defined(__PSL1GHT__) && !defined(__PS3__)
+      /* PS3: the video output is configured at video init */
       generic_action_ok_command(CMD_EVENT_REINIT);
-#endif
-      video_driver_set_video_mode(width, height, true);
+      video_driver_set_video_mode(dims, fullscreen);
 #ifdef GEKKO
-      if (width == 0 || height == 0)
-         _len = strlcpy(msg, "Resetting to: DEFAULT", sizeof(msg));
+      if (!VIDEO_SCALE_W(dims) || !VIDEO_SCALE_H(dims))
+         _len = strlcpy_lit(msg, "Resetting to: DEFAULT", sizeof(msg));
       else
 #endif
       {
-         if (!string_is_empty(desc))
+         if (*desc)
             _len = snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_SCREEN_RESOLUTION_RESETTING_DESC),
-               width, height, desc);
+               VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), desc);
          else
             _len = snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_SCREEN_RESOLUTION_RESETTING_NO_DESC),
-               width, height);
+               VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
       }
 
       runloop_msg_queue_push(msg, _len, 1, 100, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
    }
-#endif
 
    return 0;
 }
@@ -642,6 +688,26 @@ static int action_start_load_core(
    return ret;
 }
 
+static int action_start_restart_content(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   const char *core_path      = path_get(RARCH_PATH_CORE);
+   const char *content_path   = path_get(RARCH_PATH_CONTENT);
+   content_ctx_info_t content_info;
+
+   content_info.argc          = 0;
+   content_info.argv          = NULL;
+   content_info.args          = NULL;
+   content_info.environ_get   = NULL;
+
+   return task_push_load_content_with_new_core_from_menu(
+         core_path, content_path,
+         &content_info,
+         CORE_TYPE_PLAIN,
+         NULL, NULL);
+}
+
 #ifdef HAVE_BLUETOOTH
 static int action_start_bluetooth(const char *path, const char *label,
          unsigned menu_type, size_t idx, size_t entry_idx)
@@ -651,6 +717,22 @@ static int action_start_bluetooth(const char *path, const char *label,
    return 0;
 }
 #endif
+
+static int action_start_core_load(
+      const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings = config_get_ptr();
+   char core_path[PATH_MAX_LENGTH];
+
+   fill_pathname_join_special(core_path,
+         settings->paths.directory_libretro,
+         path,
+         sizeof(core_path));
+
+   return action_ok_push_core_information_list(
+         core_path, label, type, idx, entry_idx);
+}
 
 #ifdef HAVE_NETWORKING
 static int action_start_core_updater_entry(
@@ -664,7 +746,7 @@ static int action_start_core_updater_entry(
     * information menu */
    if (   core_list
        && core_updater_list_get_filename(core_list, path, &entry)
-       && !string_is_empty(entry->local_core_path)
+       && (entry->local_core_path && *entry->local_core_path)
        && path_is_valid(entry->local_core_path))
       return action_ok_push_core_information_list(
             entry->local_core_path, label, type, idx, entry_idx);
@@ -681,10 +763,8 @@ static int action_start_core_lock(
    const char *core_path      = path;
    struct menu_state *menu_st = menu_state_get_ptr();
    int ret                    = 0;
-
-   if (string_is_empty(core_path))
+   if (!core_path || !*core_path)
       return -1;
-
    /* Core should be unlocked by default
     * > If it is currently unlocked, do nothing */
    if (!core_info_get_core_lock(core_path, true))
@@ -711,11 +791,11 @@ static int action_start_core_lock(
       /* Build error message */
       _len = strlcpy(msg, msg_hash_to_str(MSG_CORE_UNLOCK_FAILED), sizeof(msg));
 
-      if (!string_is_empty(core_name))
+      if (core_name && *core_name)
          _len += strlcpy(msg + _len, core_name, sizeof(msg) - _len);
 
       /* Generate log + notification */
-      RARCH_ERR("%s\n", msg);
+      RARCH_ERR("[Core] %s\n", msg);
 
       runloop_msg_queue_push(msg, _len, 1, 100, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
@@ -738,10 +818,8 @@ static int action_start_core_set_standalone_exempt(
       unsigned type, size_t idx, size_t entry_idx)
 {
    const char *core_path = path;
-
-   if (string_is_empty(core_path))
+   if (!core_path || !*core_path)
       return -1;
-
    /* Core should not be exempt by default
     * > If it is currently 'not exempt', do nothing */
    if (core_info_get_core_standalone_exempt(core_path))
@@ -769,11 +847,11 @@ static int action_start_core_set_standalone_exempt(
                msg_hash_to_str(MSG_CORE_UNSET_STANDALONE_EXEMPT_FAILED),
                sizeof(msg));
 
-         if (!string_is_empty(core_name))
+         if (core_name && *core_name)
             _len += strlcpy(msg + _len, core_name, sizeof(msg) - _len);
 
          /* Generate log + notification */
-         RARCH_ERR("%s\n", msg);
+         RARCH_ERR("[Core] %s\n", msg);
 
          runloop_msg_queue_push(msg, _len, 1, 100, true, NULL,
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
@@ -802,14 +880,18 @@ static int menu_cbs_init_bind_start_compare_label(menu_file_list_cbs_t *cbs)
          case MENU_ENUM_LABEL_CORE_LIST_UNLOAD:
             BIND_ACTION_START(cbs, action_start_load_core);
             break;
+         case MENU_ENUM_LABEL_RESTART_CONTENT:
+            BIND_ACTION_START(cbs, action_start_restart_content);
+            break;
          case MENU_ENUM_LABEL_VIDEO_SHADER_PRESET:
-            BIND_ACTION_START(cbs, action_start_shader_preset);
-            break;
-         case MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_APPEND:
-            BIND_ACTION_START(cbs, action_start_shader_preset_append);
-            break;
          case MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_PREPEND:
-            BIND_ACTION_START(cbs, action_start_shader_preset_prepend);
+         case MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_APPEND:
+         case MENU_ENUM_LABEL_VIDEO_SHADER_PARAMETERS:
+         case MENU_ENUM_LABEL_SHADER_APPLY_CHANGES:
+            BIND_ACTION_START(cbs, action_start_shader_parameters);
+            break;
+         case MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_FILE_INFO:
+            BIND_ACTION_START(cbs, action_start_shader_preset_file_info);
             break;
          case MENU_ENUM_LABEL_REMAP_FILE_INFO:
             BIND_ACTION_START(cbs, action_start_remap_file_info);
@@ -848,11 +930,6 @@ static int menu_cbs_init_bind_start_compare_label(menu_file_list_cbs_t *cbs)
             BIND_ACTION_START(cbs, action_start_shader_num_passes);
 #endif
             break;
-         case MENU_ENUM_LABEL_CHEAT_NUM_PASSES:
-#ifdef HAVE_CHEATS
-            BIND_ACTION_START(cbs, action_start_cheat_num_passes);
-#endif
-            break;
          case MENU_ENUM_LABEL_SCREEN_RESOLUTION:
             BIND_ACTION_START(cbs, action_start_video_resolution);
             break;
@@ -877,6 +954,15 @@ static int menu_cbs_init_bind_start_compare_label(menu_file_list_cbs_t *cbs)
          case MENU_ENUM_LABEL_MANUAL_CONTENT_SCAN_DIR:
             BIND_ACTION_START(cbs, action_start_manual_content_scan_dir);
             break;
+         case MENU_ENUM_LABEL_SCAN_METHOD:
+            BIND_ACTION_START(cbs, action_start_scan_method);
+            break;
+         case MENU_ENUM_LABEL_SCAN_USE_DB:
+            BIND_ACTION_START(cbs, action_start_scan_use_db);
+            break;
+         case MENU_ENUM_LABEL_SCAN_DB_SELECT:
+            BIND_ACTION_START(cbs, action_start_scan_db_select);
+            break;
          case MENU_ENUM_LABEL_MANUAL_CONTENT_SCAN_SYSTEM_NAME:
             BIND_ACTION_START(cbs, action_start_manual_content_scan_system_name);
             break;
@@ -896,6 +982,13 @@ static int menu_cbs_init_bind_start_compare_label(menu_file_list_cbs_t *cbs)
             break;
          case MENU_ENUM_LABEL_MENU_WALLPAPER:
             BIND_ACTION_START(cbs, action_start_menu_wallpaper);
+            break;
+         case MENU_ENUM_LABEL_LOAD_CONTENT_HISTORY:
+         case MENU_ENUM_LABEL_GOTO_FAVORITES:
+         case MENU_ENUM_LABEL_GOTO_IMAGES:
+         case MENU_ENUM_LABEL_GOTO_MUSIC:
+         case MENU_ENUM_LABEL_GOTO_VIDEO:
+            BIND_ACTION_START(cbs, action_ok_push_playlist_manager_settings);
             break;
          default:
             return -1;
@@ -955,6 +1048,9 @@ static int menu_cbs_init_bind_start_compare_type(menu_file_list_cbs_t *cbs,
          case FILE_TYPE_PLAYLIST_COLLECTION:
             BIND_ACTION_START(cbs, action_ok_push_playlist_manager_settings);
             break;
+         case FILE_TYPE_CORE:
+            BIND_ACTION_START(cbs, action_start_core_load);
+            break;
 #ifdef HAVE_NETWORKING
          case FILE_TYPE_DOWNLOAD_CORE:
             BIND_ACTION_START(cbs, action_start_core_updater_entry);
@@ -967,8 +1063,10 @@ static int menu_cbs_init_bind_start_compare_type(menu_file_list_cbs_t *cbs,
             BIND_ACTION_START(cbs, action_start_core_set_standalone_exempt);
             break;
          case MENU_SETTING_ACTION_SAVESTATE:
+            BIND_ACTION_START(cbs, action_start_state_save);
+            break;
          case MENU_SETTING_ACTION_LOADSTATE:
-            BIND_ACTION_START(cbs, action_start_state_slot);
+            BIND_ACTION_START(cbs, action_start_state_load);
             break;
          case MENU_SETTING_ACTION_PLAYREPLAY:
          case MENU_SETTING_ACTION_RECORDREPLAY:

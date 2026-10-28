@@ -1,0 +1,7 @@
+# Waits on the video thread allowed per file, as tools/wait_budget.sh
+# counts them: calls of video_thread_wait_idle() and
+# video_thread_run_blocking(). A ceiling that only comes down.
+#
+# file                    allowed
+gfx/video_driver.c        5
+retroarch.c               3

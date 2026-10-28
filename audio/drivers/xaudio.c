@@ -14,8 +14,9 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#if !defined(_XBOX) && (_MSC_VER == 1310)
+#if !defined(_XBOX) && (_MSC_VER == 1310) || defined(_MSC_VER) && (_WIN32_WINNT <= _WIN32_WINNT_WIN2K)
 #ifndef _WIN32_DCOM
+/* needed for CoInitializeEx */
 #define _WIN32_DCOM
 #endif
 #endif
@@ -23,6 +24,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include <boolean.h>
 
 #include <compat/msvc.h>
@@ -31,31 +33,51 @@
 #include <encodings/utf.h>
 #include <lists/string_list.h>
 
-#if defined(_MSC_VER) && (_WIN32_WINNT <= _WIN32_WINNT_WIN2K)
-/* needed for CoInitializeEx */
-#define _WIN32_DCOM
-#endif
-
 #include "xaudio.h"
 
-#if (_WIN32_WINNT >= 0x0602 /*_WIN32_WINNT_WIN8*/)
+#if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0600 /*_WIN32_WINNT_VISTA */)
+#ifndef HAVE_MMDEVICE
+#define HAVE_MMDEVICE
+#endif
+#endif
+
+#include <retro_atomic.h>
+
+#ifdef HAVE_MMDEVICE
 #include "../common/mmdevice_common.h"
+#include "../common/mmdevice_common_inline.h"
+#ifdef HAVE_THREADS
+#include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
+#endif
 #endif
 
 #include "../audio_driver.h"
+#include "../../configuration.h"
 #include "../../verbosity.h"
 
 typedef struct xaudio2 xaudio2_t;
 
 #define MAX_BUFFERS      16
-
 #define MAX_BUFFERS_MASK (MAX_BUFFERS - 1)
-
-#ifndef COINIT_MULTITHREADED
-#define COINIT_MULTITHREADED 0x00
-#endif
-
-#define XAUDIO2_WRITE_AVAILABLE(handle) ((handle)->bufsize * (MAX_BUFFERS - (handle)->buffers - 1))
+/* Padding width used to isolate the cross-thread fields of struct
+ * xaudio2 on their own cache line.  64 covers x86-64, AArch64 and
+ * modern ARM/PowerPC; Apple Silicon's effective coherency granule is
+ * 128, where this still removes the sharing, just less tightly. */
+#define XA_CACHE_LINE    64
+/* Bytes writable without blocking: free queue slots minus what the
+ * current staging sub-buffer has already consumed.  The previous form
+ * ignored bufptr, overstating free space by up to one sub-buffer
+ * (1/16 of the whole window) in the rate-control occupancy report and
+ * the nonblocking clamp.  At a full queue this reports 0 rather than
+ * underflowing size_t on the bufptr subtraction; the staging remainder
+ * it forgoes there cannot be flushed without blocking anyway. */
+/* Bytes-writable computation lives in xaudio2_write_available()
+ * below the struct definition: it reads the cross-thread `buffers`
+ * counter exactly once, with acquire semantics.  The macro it
+ * replaces read the field twice, so the occupancy report could mix
+ * two different counter values. */
+#define XAUDIO_TIMEOUT   256
 
 enum xa_flags
 {
@@ -65,13 +87,58 @@ enum xa_flags
 
 typedef struct
 {
+#ifdef HAVE_MMDEVICE
+#ifdef HAVE_THREADS
+   sthread_t *imm_thread;
+#else
+   HANDLE imm_thread;
+#endif
+#endif
    xaudio2_t *xa;
    size_t bufsize;
    uint8_t flags;
 } xa_t;
 
-/* Forward declarations */
-static void *xa_list_new(void *u);
+#ifdef HAVE_MMDEVICE
+static void xaudio_imm_stop_thread(xa_t *xa)
+{
+#if !defined(_XBOX) && !defined(__WINRT__)
+   if (!xa->imm_thread)
+      return;
+
+   PostThreadMessage(IMMNotificationThreadId, WM_QUIT, 0, 0);
+
+#ifdef HAVE_THREADS
+   sthread_join(xa->imm_thread);
+#else
+   WaitForSingleObject(xa->imm_thread, XAUDIO_TIMEOUT);
+   CloseHandle(xa->imm_thread);
+#endif
+
+   IMMNotificationThreadId = 0;
+   xa->imm_thread = NULL;
+#endif
+}
+
+static bool xaudio_imm_start_thread(xa_t *xa)
+{
+#if !defined(_XBOX) && !defined(__WINRT__)
+   if (!xa->imm_thread)
+   {
+#ifdef HAVE_THREADS
+      xa->imm_thread = sthread_create(mmdevice_thread,
+            (void*)&audio_state_get_ptr()->reinit_request);
+#else
+      xa->imm_thread = CreateThread(NULL, 0, mmdevice_thread,
+            (void*)&audio_state_get_ptr()->reinit_request, 0, NULL);
+#endif
+      if (!xa->imm_thread)
+         return false;
+   }
+#endif
+   return true;
+}
+#endif
 
 #if defined(__cplusplus) && !defined(CINTERFACE)
 struct xaudio2 : public IXAudio2VoiceCallback
@@ -82,8 +149,8 @@ struct xaudio2
 #if defined(__cplusplus) && !defined(CINTERFACE)
    xaudio2() :
       buf(0), pXAudio2(0), pMasterVoice(0),
-      pSourceVoice(0), hEvent(0), buffers(0), bufsize(0),
-      bufptr(0), write_buffer(0)
+      pSourceVoice(0), bufsize(0), bufptr(0),
+      write_buffer(0), buffers(0)
    {}
 
    virtual ~xaudio2() {}
@@ -91,8 +158,11 @@ struct xaudio2
    STDMETHOD_(void, OnBufferStart) (void *) {}
    STDMETHOD_(void, OnBufferEnd) (void *)
    {
-      InterlockedDecrement((LONG volatile*)&buffers);
-      SetEvent(hEvent);
+      /* XAudio2's engine thread: one atomic and a gated wake - no
+       * syscall unless the writer is actually parked, where SetEvent
+       * was one per buffer regardless. */
+      retro_atomic_fetch_sub_int(&buffers, 1);
+      retro_eventcount_notify(&park);
    }
    STDMETHOD_(void, OnLoopEnd) (void *) {}
    STDMETHOD_(void, OnStreamEnd) () {}
@@ -107,50 +177,105 @@ struct xaudio2
    IXAudio2 *pXAudio2;
    IXAudio2MasteringVoice *pMasterVoice;
    IXAudio2SourceVoice *pSourceVoice;
-   HANDLE hEvent;
+   WAVEFORMATEXTENSIBLE wf;
+   uint32_t layout;   /* the frontend's mask the source voice carries */
 
-   unsigned long volatile buffers;
-   unsigned bufsize;
+   /* Producer-only (emulator thread).  bufptr and write_buffer are
+    * stored on every chunk copied in xa_write. */
+   size_t bufsize;
    unsigned bufptr;
    unsigned write_buffer;
+
+   /* A full cache line of padding on either side of the cross-thread
+    * pair below, so no allocation alignment can put a producer-only
+    * field on the same line as `buffers`.  See the commit message. */
+   char _pad0[XA_CACHE_LINE];
+
+   /* Touched by the XAudio2 engine thread: OnBufferEnd decrements
+    * `buffers` and notifies `park`.  The producer reads both.
+    * retro_atomic rather than raw Interlocked + volatile: the
+    * Interlocked RMWs were full barriers, but the producer-side
+    * plain volatile reads carried no acquire ordering, which is
+    * real on Windows-on-ARM (MSVC defaults to /volatile:iso on
+    * ARM64, unlike /volatile:ms on x86/x64). */
+   /* The writer's park; OnBufferEnd notifies. */
+   retro_eventcount_t park;
+   retro_atomic_int_t buffers;
+
+   char _pad1[XA_CACHE_LINE];
 };
 
+static INLINE size_t xaudio2_write_available(xaudio2_t *handle)
+{
+   int buffers = retro_atomic_load_acquire_int(&handle->buffers);
+   if (buffers < MAX_BUFFERS - 1)
+      return handle->bufsize * (size_t)(MAX_BUFFERS - buffers - 1)
+            - handle->bufptr;
+   return 0;
+}
+
 #if !defined(__cplusplus) || defined(CINTERFACE)
-static void WINAPI voice_on_buffer_end(IXAudio2VoiceCallback *handle_, void *data)
+static void WINAPI xa_voice_on_buffer_end(IXAudio2VoiceCallback *handle_, void *data)
 {
    xaudio2_t *handle = (xaudio2_t*)handle_;
    (void)data;
-   InterlockedDecrement((LONG volatile*)&handle->buffers);
-   SetEvent(handle->hEvent);
+   retro_atomic_fetch_sub_int(&handle->buffers, 1);
+   retro_eventcount_notify(&handle->park);
 }
 
-static void WINAPI dummy_voidp(IXAudio2VoiceCallback *handle, void *data) { (void)handle; (void)data; }
-static void WINAPI dummy_nil(IXAudio2VoiceCallback *handle) { (void)handle; }
-static void WINAPI dummy_uint32(IXAudio2VoiceCallback *handle, UINT32 dummy) { (void)handle; (void)dummy; }
-static void WINAPI dummy_voidp_hresult(IXAudio2VoiceCallback *handle, void *data, HRESULT dummy) { (void)handle; (void)data; (void)dummy; }
+static void WINAPI xa_dummy_voidp(IXAudio2VoiceCallback *handle, void *data) { (void)handle; (void)data; }
+static void WINAPI xa_dummy_nil(IXAudio2VoiceCallback *handle) { (void)handle; }
+static void WINAPI xa_dummy_uint32(IXAudio2VoiceCallback *handle, UINT32 dummy) { (void)handle; (void)dummy; }
+static void WINAPI xa_dummy_voidp_hresult(IXAudio2VoiceCallback *handle, void *data, HRESULT dummy) { (void)handle; (void)data; (void)dummy; }
 
-const struct IXAudio2VoiceCallbackVtbl voice_vtable = {
-   dummy_uint32,
-   dummy_nil,
-   dummy_nil,
-   dummy_voidp,
-   voice_on_buffer_end,
-   dummy_voidp,
-   dummy_voidp_hresult,
+const struct IXAudio2VoiceCallbackVtbl xa_voice_vtable = {
+   xa_dummy_uint32,
+   xa_dummy_nil,
+   xa_dummy_nil,
+   xa_dummy_voidp,
+   xa_voice_on_buffer_end,
+   xa_dummy_voidp,
+   xa_dummy_voidp_hresult,
 };
 #endif
 
-static void xaudio2_set_wavefmt(WAVEFORMATEX *wfx,
-      unsigned channels, unsigned samplerate)
+/* The source voice's format. Stereo is the plain WAVEFORMATEX it
+ * always was; a wider layout is a WAVEFORMATEXTENSIBLE with the
+ * speaker mask - the frontend's bits are Windows' own - so XAudio2
+ * knows which channel is which and routes each to the mastering
+ * voice's speaker of that position, mixing where the device lacks
+ * one. Without the mask it would assume a default layout for the
+ * count, and six channels' rear pair would be the back pair whatever
+ * was meant. */
+static void xaudio2_set_format(WAVEFORMATEXTENSIBLE *wfx,
+      bool float_fmt, unsigned channels, uint32_t layout, unsigned rate)
 {
-   wfx->wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
-   wfx->nBlockAlign     = channels * sizeof(float);
-   wfx->wBitsPerSample  = sizeof(float) * 8;
+   WAVEFORMATEX *wf      = &wfx->Format;
+   WORD wBitsPerSample   = float_fmt ? 32 : 16;
+   WORD nBlockAlign      = (channels * wBitsPerSample) / 8;
+   DWORD nAvgBytesPerSec = rate * nBlockAlign;
 
-   wfx->nChannels       = channels;
-   wfx->nSamplesPerSec  = samplerate;
-   wfx->nAvgBytesPerSec = wfx->nSamplesPerSec * wfx->nBlockAlign;
-   wfx->cbSize          = 0;
+   memset(wfx, 0, sizeof(*wfx));
+   wf->nChannels         = channels;
+   wf->nSamplesPerSec    = rate;
+   wf->nAvgBytesPerSec   = nAvgBytesPerSec;
+   wf->nBlockAlign       = nBlockAlign;
+   wf->wBitsPerSample    = wBitsPerSample;
+
+   if (channels > 2)
+   {
+      wf->wFormatTag              = WAVE_FORMAT_EXTENSIBLE;
+      wf->cbSize                  = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+      wfx->Samples.wValidBitsPerSample = wBitsPerSample;
+      wfx->dwChannelMask          = (DWORD)layout;
+      wfx->SubFormat              = float_fmt
+            ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
+   }
+   else
+   {
+      wf->wFormatTag        = float_fmt ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+      wf->cbSize            = 0;
+   }
 }
 
 static void xaudio2_free(xaudio2_t *handle)
@@ -175,8 +300,7 @@ static void xaudio2_free(xaudio2_t *handle)
       IXAudio2_Release(handle->pXAudio2);
    }
 
-   if (handle->hEvent)
-      CloseHandle(handle->hEvent);
+   retro_eventcount_free(&handle->park);
 
    free(handle->buf);
 
@@ -191,23 +315,109 @@ static void xaudio2_free(xaudio2_t *handle)
 #endif
 }
 
-static xaudio2_t *xaudio2_new(unsigned samplerate, unsigned channels,
-      size_t len, const char *device)
+static const char *xaudio2_wave_format_name(WAVEFORMATEX *format)
+{
+   switch (format->wFormatTag)
+   {
+      case WAVE_FORMAT_PCM:
+         return "WAVE_FORMAT_PCM";
+      case WAVE_FORMAT_IEEE_FLOAT:
+         return "WAVE_FORMAT_IEEE_FLOAT";
+      default:
+         break;
+   }
+
+   return "<unknown>";
+}
+
+static size_t xa_device_get_samplerate(int id)
+{
+#if defined(_XBOX) || !defined(HAVE_MMDEVICE)
+   size_t _len    = 0;
+   XAUDIO2_DEVICE_DETAILS dev_detail;
+   IXAudio2 *ixa2 = NULL;
+   if (SUCCEEDED(XAudio2Create(&ixa2, 0, XAUDIO2_DEFAULT_PROCESSOR)))
+   {
+      if (IXAudio2_GetDeviceDetails(ixa2, id, &dev_detail) == S_OK)
+         _len = dev_detail.OutputFormat.Format.nSamplesPerSec;
+      IXAudio2_Release(ixa2);
+   }
+   return _len;
+#elif defined(__WINRT__)
+   /* TODO/FIXME - implement? */
+   return 0;
+#else
+   return mmdevice_get_samplerate(id);
+#endif
+}
+
+static void *xa_device_list_new(void *u)
+{
+#if defined(_XBOX) || !defined(HAVE_MMDEVICE)
+   unsigned i;
+   union string_list_elem_attr attr;
+   uint32_t dev_count              = 0;
+   IXAudio2 *ixa2                  = NULL;
+   struct string_list *sl          = string_list_new();
+
+   if (!sl)
+      return NULL;
+
+   attr.i = 0;
+
+   if (FAILED(XAudio2Create(&ixa2, 0, XAUDIO2_DEFAULT_PROCESSOR)))
+      return NULL;
+
+   IXAudio2_GetDeviceCount(ixa2, &dev_count);
+
+   for (i = 0; i < dev_count; i++)
+   {
+      XAUDIO2_DEVICE_DETAILS dev_detail;
+      if (IXAudio2_GetDeviceDetails(ixa2, i, &dev_detail) == S_OK)
+      {
+         char *str = utf16_to_utf8_string_alloc(dev_detail.DisplayName);
+
+         if (str)
+         {
+            string_list_append(sl, str, attr);
+            free(str);
+         }
+      }
+   }
+
+   IXAudio2_Release(ixa2);
+
+   return sl;
+#elif defined(__WINRT__)
+   return NULL;
+#else
+   return mmdevice_list_new(u, 0 /* eRender */);
+#endif
+}
+
+static xaudio2_t *xaudio2_new(unsigned *rate, unsigned channels,
+      uint32_t layout,
+      unsigned latency, size_t len, bool float_fmt, const char *dev_id)
 {
    int32_t idx_found        = -1;
-   WAVEFORMATEX wfx         = {0};
+   WAVEFORMATEXTENSIBLE desired_wf;
    struct string_list *list = NULL;
    xaudio2_t *handle        = NULL;
 
 #if !defined(_XBOX) && !defined(__WINRT__)
-   if (FAILED(CoInitialize(NULL)))
-      goto error;
+   if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)))
+      return NULL;
 #endif
 
 #if defined(__cplusplus) && !defined(CINTERFACE)
    handle = new xaudio2;
 #else
    handle = (xaudio2_t*)calloc(1, sizeof(*handle));
+   /* calloc zero-fill is not a portable initializer for an atomic -
+    * initialize it explicitly.  (The C++ path handles this in the
+    * constructor's mem-initializer list.) */
+   if (handle)
+      retro_atomic_int_init(&handle->buffers, 0);
 #endif
 
    if (!handle)
@@ -215,45 +425,64 @@ static xaudio2_t *xaudio2_new(unsigned samplerate, unsigned channels,
 #if !defined(_XBOX) && !defined(__WINRT__)
       CoUninitialize();
 #endif
-      goto error;
+      return NULL;
    }
 
-   list = (struct string_list*)xa_list_new(NULL);
+   list = (struct string_list*)xa_device_list_new(NULL);
 
 #if !defined(__cplusplus) || defined(CINTERFACE)
-   handle->lpVtbl = &voice_vtable;
+   handle->lpVtbl = &xa_voice_vtable;
 #endif
 
    if (FAILED(XAudio2Create(&handle->pXAudio2, 0, XAUDIO2_DEFAULT_PROCESSOR)))
       goto error;
 
-   if (device)
+   xaudio2_set_format(&desired_wf, float_fmt, channels, layout, *rate);
+   RARCH_DBG("[XAudio2] Requesting %u-bit %u-channel client with %s samples at %uHz %ums.\n",
+         desired_wf.Format.wBitsPerSample,
+         desired_wf.Format.nChannels,
+         xaudio2_wave_format_name(&desired_wf.Format),
+         desired_wf.Format.nSamplesPerSec,
+         latency);
+   *rate = desired_wf.Format.nSamplesPerSec;
+
+   if (dev_id)
    {
       /* Search for device name first */
       if (list && list->elems)
       {
-         if (list->elems)
+         /* If any devices were found... */
+         size_t i;
+         for (i = 0; i < list->size; i++)
          {
-            unsigned i;
-            for (i = 0; i < list->size; i++)
+            if (string_is_equal(dev_id, list->elems[i].data))
             {
-               if (string_is_equal(device, list->elems[i].data))
+               size_t new_rate = 0;
+               RARCH_LOG("[XAudio2] Found device #%d: \"%s\".\n", i,
+                     list->elems[i].data);
+               idx_found = i;
+               new_rate  = xa_device_get_samplerate(i);
+               if (new_rate > 0)
                {
-                  idx_found       = i;
-                  break;
+                  /* Re-derive the format at the device's native rate,
+                   * honouring the negotiated sample format - this
+                   * previously hardcoded float, silently overriding an
+                   * int16 negotiation whenever a named device was
+                   * matched. */
+                  xaudio2_set_format(&desired_wf, float_fmt, channels, layout, new_rate);
+                  *rate = desired_wf.Format.nSamplesPerSec;
                }
+               break;
             }
-            /* Index was not found yet based on name string,
-             * just assume id is a one-character number index. */
+         }
 
-            if (idx_found == -1)
-            {
-               if (isdigit(device[0]))
-               {
-                  RARCH_LOG("[XAudio2]: Fallback, device index is a single number index instead: %d.\n", idx_found);
-                  idx_found = strtoul(device, NULL, 0);
-               }
-            }
+         /* Index was not found yet based on name string,
+          * just assume id is a one-character number index. */
+         if (idx_found == -1 && isdigit(dev_id[0]))
+         {
+            idx_found = strtoul(dev_id, NULL, 0);
+            RARCH_LOG("[XAudio2] Fallback, device index is a single number index instead: %d.\n",
+                  idx_found);
          }
       }
    }
@@ -264,10 +493,19 @@ static xaudio2_t *xaudio2_new(unsigned samplerate, unsigned channels,
 #if (_WIN32_WINNT >= 0x0602 /*_WIN32_WINNT_WIN8*/)
    {
       wchar_t *temp = NULL;
-      if (device)
+      /* Only dereference the enumeration list for a validated index.
+       * idx_found can come from the unclamped strtoul fallback (any
+       * number the user typed), and list can be NULL or empty while
+       * dev_id is set - either way the previous unconditional
+       * list->elems[idx_found] access read out of bounds or through
+       * NULL.  An unmatched name falls through with temp == NULL,
+       * which selects the default device. */
+      if (dev_id && list && idx_found >= 0 && (size_t)idx_found < list->size)
          temp = utf8_to_utf16_string_alloc((const char*)list->elems[idx_found].userdata);
 
-      if (FAILED(IXAudio2_CreateMasteringVoice(handle->pXAudio2, &handle->pMasterVoice, channels, samplerate, 0, (LPCWSTR)(uintptr_t)temp, NULL, AudioCategory_GameEffects)))
+      if (FAILED(IXAudio2_CreateMasteringVoice(handle->pXAudio2,
+                  &handle->pMasterVoice, channels, *rate, 0,
+                  (LPCWSTR)(uintptr_t)temp, NULL, AudioCategory_GameEffects)))
       {
          free(temp);
          goto error;
@@ -276,22 +514,24 @@ static xaudio2_t *xaudio2_new(unsigned samplerate, unsigned channels,
          free(temp);
    }
 #else
-   if (FAILED(IXAudio2_CreateMasteringVoice(handle->pXAudio2, &handle->pMasterVoice, channels, samplerate, 0, idx_found, NULL)))
+   /* FIXME 2.7: idx_found order depends on OS default device,
+    * therefore index can be correct only by accident */
+   if (FAILED(IXAudio2_CreateMasteringVoice(handle->pXAudio2,
+               &handle->pMasterVoice, channels, *rate, 0, idx_found, NULL)))
       goto error;
 #endif
 
-   xaudio2_set_wavefmt(&wfx, channels, samplerate);
-
    if (FAILED(IXAudio2_CreateSourceVoice(handle->pXAudio2,
-               &handle->pSourceVoice, &wfx,
+               &handle->pSourceVoice, &desired_wf.Format,
                XAUDIO2_VOICE_NOSRC, XAUDIO2_DEFAULT_FREQ_RATIO,
                (IXAudio2VoiceCallback*)handle, 0, 0)))
       goto error;
 
-   handle->hEvent  = CreateEvent(0, FALSE, FALSE, 0);
-   if (!handle->hEvent)
+   if (!retro_eventcount_init(&handle->park))
       goto error;
 
+   handle->wf      = desired_wf;
+   handle->layout  = layout;
    handle->bufsize = len / MAX_BUFFERS;
    handle->buf     = (uint8_t*)calloc(1, handle->bufsize * MAX_BUFFERS);
    if (!handle->buf)
@@ -312,11 +552,14 @@ error:
    return NULL;
 }
 
-static void *xa_init(const char *device, unsigned rate, unsigned latency,
-      unsigned block_frames,
-      unsigned *new_rate)
+static void *xa_init(const char *dev_id, unsigned rate, unsigned latency,
+       unsigned *new_rate)
 {
    size_t bufsize;
+   uint32_t layout;
+   unsigned channels;
+   bool want_float = (config_get_ptr()->uints.audio_format_negotiation
+         == AUDIO_FORMAT_NEGOTIATION_FLOAT);
    xa_t *xa    = (xa_t*)calloc(1, sizeof(*xa));
 
    if (!xa)
@@ -325,24 +568,35 @@ static void *xa_init(const char *device, unsigned rate, unsigned latency,
    if (latency < 8)
       latency  = 8; /* Do not allow shenanigans. */
 
+   /* The layout the frontend asked for; XAudio2 routes its positions
+    * to the mastering voice's speakers, so what is asked is carried. */
+   layout      = audio_driver_requested_layout();
+   channels    = audio_layout_channels(layout);
    bufsize     = latency * rate / 1000;
-   xa->bufsize = bufsize * 2 * sizeof(float);
+   xa->bufsize = bufsize * channels * (want_float ? sizeof(float) : sizeof(int16_t));
 
-   if (!(xa->xa = xaudio2_new(rate, 2, xa->bufsize, device)))
+   if (!(xa->xa = xaudio2_new(&rate, channels, layout, latency, xa->bufsize, want_float, dev_id)))
    {
       RARCH_ERR("[XAudio2] Failed to init driver.\n");
       free(xa);
       return NULL;
    }
 
-   RARCH_LOG("[XAudio2]: Requesting %u ms latency, using %d ms latency.\n",
+   *new_rate = rate;
+
+   RARCH_LOG("[XAudio2] Requesting %u ms latency, using %d ms latency.\n",
          latency, (int)bufsize * 1000 / rate);
+
+#ifdef HAVE_MMDEVICE
+   xaudio_imm_start_thread(xa);
+#endif
 
    return xa;
 }
 
 static ssize_t xa_write(void *data, const void *s, size_t len)
 {
+   size_t _len           = 0;
    unsigned bytes        = len;
    xa_t *xa              = (xa_t*)data;
    xaudio2_t *handle     = xa->xa;
@@ -350,7 +604,7 @@ static ssize_t xa_write(void *data, const void *s, size_t len)
 
    if (xa->flags & XA2_FLAG_NONBLOCK)
    {
-      size_t avail = XAUDIO2_WRITE_AVAILABLE(xa->xa);
+      size_t avail = xaudio2_write_available(xa->xa);
 
       if (avail == 0)
          return 0;
@@ -362,21 +616,40 @@ static ssize_t xa_write(void *data, const void *s, size_t len)
    {
       unsigned need   = MIN(bytes, handle->bufsize - handle->bufptr);
 
-      memcpy(handle->buf + handle->write_buffer *
-            handle->bufsize + handle->bufptr,
-            buffer, need);
-
-      handle->bufptr += need;
-      buffer         += need;
-      bytes          -= need;
+      if (need > 0)
+      {
+         memcpy(handle->buf + handle->write_buffer *
+               handle->bufsize + handle->bufptr,
+               buffer, need);
+         handle->bufptr += need;
+         buffer         += need;
+         _len           += need;
+         bytes          -= need;
+      }
 
       if (handle->bufptr == handle->bufsize)
       {
          XAUDIO2_BUFFER xa2buffer;
 
-         while (handle->buffers == MAX_BUFFERS - 1)
-            if (!(WaitForSingleObject(handle->hEvent, 50) == WAIT_OBJECT_0))
-               return -1;
+         /* A period with no completion is a voice that has stopped, not
+          * a device gone: the bytes already staged stay staged and are
+          * submitted on the next write that finds a slot, and this one
+          * returns what it took. A failed submit below is what -1 is
+          * for. */
+         while (retro_atomic_load_acquire_int(&handle->buffers)
+               == MAX_BUFFERS - 1)
+         {
+            int key = retro_eventcount_prepare_wait(&handle->park);
+            if (retro_atomic_load_acquire_int(&handle->buffers)
+                  != MAX_BUFFERS - 1)
+            {
+               retro_eventcount_cancel_wait(&handle->park);
+               break;
+            }
+            if (!retro_eventcount_commit_wait_timeout(&handle->park,
+                     key, (int64_t)XAUDIO_TIMEOUT * 1000))
+               return (ssize_t)_len;
+         }
 
          xa2buffer.Flags      = 0;
          xa2buffer.AudioBytes = handle->bufsize;
@@ -396,13 +669,13 @@ static ssize_t xa_write(void *data, const void *s, size_t len)
             return 0;
          }
 
-         InterlockedIncrement((LONG volatile*)&handle->buffers);
+         retro_atomic_fetch_add_int(&handle->buffers, 1);
          handle->bufptr       = 0;
          handle->write_buffer = (handle->write_buffer + 1) & MAX_BUFFERS_MASK;
       }
    }
 
-   return len;
+   return _len;
 }
 
 static bool xa_stop(void *data)
@@ -441,7 +714,18 @@ static bool xa_start(void *data, bool is_shutdown)
    return true;
 }
 
-static bool xa_use_float(void *data) { return true; }
+static uint32_t xa_layout(void *data)
+{
+   xa_t *xa = (xa_t*)data;
+   return (xa && xa->xa) ? xa->xa->layout : AUDIO_LAYOUT_STEREO;
+}
+
+static bool xa_use_float(void *data)
+{
+   xa_t *xa              = (xa_t*)data;
+   xaudio2_t *handle     = xa->xa;
+   return (handle && handle->wf.Format.wBitsPerSample == 32);
+}
 
 static void xa_free(void *data)
 {
@@ -450,16 +734,67 @@ static void xa_free(void *data)
    if (!xa)
       return;
 
+#ifdef HAVE_MMDEVICE
+   xaudio_imm_stop_thread(xa);
+#endif
+
    if (xa->xa)
       xaudio2_free(xa->xa);
    free(xa);
 }
 
+/* Sleep on the event the voice's OnBufferEnd callback sets until at
+ * least len bytes fit across the queued buffers, capped at half the
+ * total so the wait always ends. Returns the free space then, or 0 when
+ * the event stays silent past the timeout. */
+static size_t xa_wait_writable(void *data, size_t len)
+{
+   xa_t *xa          = (xa_t*)data;
+   xaudio2_t *handle = xa->xa;
+   size_t total      = handle->bufsize * (size_t)(MAX_BUFFERS - 1);
+   size_t avail;
+   int    laps       = 8;
+
+   if (len > total / 2)
+      len = total / 2;
+
+   for (;;)
+   {
+      avail = xaudio2_write_available(handle);
+      if (avail >= len)
+         return avail;
+      /* Each wait is bounded; this bounds the loop, for a voice that
+       * keeps completing buffers but never frees enough. */
+      if (--laps < 0)
+         return 0;
+      {
+         int key = retro_eventcount_prepare_wait(&handle->park);
+         if (xaudio2_write_available(handle) >= len)
+         {
+            retro_eventcount_cancel_wait(&handle->park);
+            continue;
+         }
+         if (!retro_eventcount_commit_wait_timeout(&handle->park,
+                  key, (int64_t)XAUDIO_TIMEOUT * 1000))
+            return 0;
+      }
+   }
+}
+
 static size_t xa_write_avail(void *data)
 {
    xa_t *xa = (xa_t*)data;
-   return XAUDIO2_WRITE_AVAILABLE(xa->xa);
+   return xaudio2_write_available(xa->xa);
 }
+
+/* No frames_consumed(): XAudio2 exposes no device clock. SamplesPlayed
+ * counts our samples rendered and pauses whenever the voice runs dry -
+ * for a stretch with a non-blocking writer, for a moment between bursts
+ * even with a blocking one - while the device runs on. On a pin that
+ * reads +11 ppm through asio, WASAPI exclusive and WASAPI shared it read
+ * -1569 non-blocking and -1480 climbing to -754 blocking: a count
+ * diluting over a growing baseline, not a clock. The sink rate estimate
+ * leaves xaudio alone; dsound and wasapi report on the same devices. */
 
 static size_t xa_buffer_size(void *data)
 {
@@ -477,50 +812,6 @@ static void xa_device_list_free(void *u, void *slp)
       string_list_free(sl);
 }
 
-static void *xa_list_new(void *u)
-{
-#if defined(_XBOX) || !(_WIN32_WINNT >= 0x0602 /*_WIN32_WINNT_WIN8*/)
-   unsigned i;
-   union string_list_elem_attr attr;
-   uint32_t dev_count              = 0;
-   IXAudio2 *ixa2                  = NULL;
-   struct string_list *sl          = string_list_new();
-
-   if (!sl)
-      return NULL;
-
-   attr.i = 0;
-
-   if (FAILED(XAudio2Create(&ixa2, 0, XAUDIO2_DEFAULT_PROCESSOR)))
-      return NULL;
-
-   IXAudio2_GetDeviceCount(ixa2, &dev_count);
-
-   for (i = 0; i < dev_count; i++)
-   {
-      XAUDIO2_DEVICE_DETAILS dev_detail;
-      if (IXAudio2_GetDeviceDetails(ixa2, i, &dev_detail) == S_OK)
-      {
-         char *str = utf16_to_utf8_string_alloc(dev_detail.DisplayName);
-
-         if (str)
-         {
-            string_list_append(sl, str, attr);
-            free(str);
-         }
-      }
-   }
-
-   IXAudio2_Release(ixa2);
-
-   return sl;
-#elif defined(__WINRT__)
-   return NULL;
-#else
-   return mmdevice_list_new(u, eRender);
-#endif
-}
-
 audio_driver_t audio_xa = {
    xa_init,
    xa_write,
@@ -531,8 +822,13 @@ audio_driver_t audio_xa = {
    xa_free,
    xa_use_float,
    "xaudio",
-   xa_list_new,
+   xa_device_list_new,
    xa_device_list_free,
    xa_write_avail,
    xa_buffer_size,
+   NULL, /* write_raw */
+   xa_wait_writable,
+   NULL, /* frames_consumed */
+   NULL, /* underruns */
+   xa_layout
 };

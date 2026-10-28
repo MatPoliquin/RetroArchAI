@@ -70,14 +70,14 @@ static void *normal2x_height_generic_create(const struct softfilter_config *conf
    struct filter_data *filt = (struct filter_data*)calloc(1, sizeof(*filt));
    if (!filt)
       return NULL;
-   if (!(filt->workers = (struct softfilter_thread_data*)calloc(1, sizeof(struct softfilter_thread_data))))
+   if (!(filt->workers = (struct softfilter_thread_data*)calloc(threads ? threads : 1, sizeof(struct softfilter_thread_data))))
    {
       free(filt);
       return NULL;
    }
-   /* Apparently the code is not thread-safe,
-    * so force single threaded operation... */
-   filt->threads = 1;
+   /* Each output row comes from its own source row alone, so the
+    * rows are split between the workers. */
+   filt->threads = threads ? threads : 1;
    filt->in_fmt  = in_fmt;
    return filt;
 }
@@ -106,21 +106,14 @@ static void normal2x_height_work_cb_xrgb8888(void *data, void *thread_data)
    uint32_t *output                   = (uint32_t*)thr->out_data;
    uint32_t in_stride                 = (uint32_t)(thr->in_pitch >> 2);
    uint32_t out_stride                = (uint32_t)(thr->out_pitch >> 2);
-   uint32_t x, y;
+   uint32_t y;
 
    for (y = 0; y < thr->height; ++y)
    {
-      uint32_t *out_ptr = output;
-      for (x = 0; x < thr->width; ++x)
-      {
-         uint32_t color          = *(input + x);
-
-         /* Duplicate pixels in the y direction */
-         *out_ptr                = color;
-         *(out_ptr + out_stride) = color;
-
-         out_ptr++;
-      }
+      /* Duplicate the row in the y direction: copy the source row to
+       * both output rows.  memcpy replaces the per-pixel store loop. */
+      memcpy(output,              input, thr->width * sizeof(uint32_t));
+      memcpy(output + out_stride, input, thr->width * sizeof(uint32_t));
 
       input  += in_stride;
       output += out_stride << 1;
@@ -134,21 +127,13 @@ static void normal2x_height_work_cb_rgb565(void *data, void *thread_data)
    uint16_t *output                   = (uint16_t*)thr->out_data;
    uint16_t in_stride                 = (uint16_t)(thr->in_pitch >> 1);
    uint16_t out_stride                = (uint16_t)(thr->out_pitch >> 1);
-   uint16_t x, y;
+   uint16_t y;
 
    for (y = 0; y < thr->height; ++y)
    {
-      uint16_t *out_ptr = output;
-      for (x = 0; x < thr->width; ++x)
-      {
-         uint16_t color          = *(input + x);
-
-         /* Duplicate pixels in the y direction */
-         *out_ptr                = color;
-         *(out_ptr + out_stride) = color;
-
-         out_ptr++;
-      }
+      /* Duplicate the row in the y direction. */
+      memcpy(output,              input, thr->width * sizeof(uint16_t));
+      memcpy(output + out_stride, input, thr->width * sizeof(uint16_t));
 
       input  += in_stride;
       output += out_stride << 1;
@@ -160,26 +145,28 @@ static void normal2x_height_generic_packets(void *data,
       void *output, size_t output_stride,
       const void *input, unsigned width, unsigned height, size_t input_stride)
 {
-   /* We are guaranteed single threaded operation
-    * (filt->threads = 1) so we don't need to loop
-    * over threads and can cull some code. This only
-    * makes the tiniest performance difference, but
-    * every little helps when running on an o3DS... */
-   struct filter_data *filt           = (struct filter_data*)data;
-   struct softfilter_thread_data *thr = (struct softfilter_thread_data*)&filt->workers[0];
+   unsigned i;
+   struct filter_data *filt = (struct filter_data*)data;
 
-   thr->out_data                      = (uint8_t*)output;
-   thr->in_data                       = (const uint8_t*)input;
-   thr->out_pitch                     = output_stride;
-   thr->in_pitch                      = input_stride;
-   thr->width                         = width;
-   thr->height                        = height;
+   for (i = 0; i < filt->threads; i++)
+   {
+      struct softfilter_thread_data *thr = &filt->workers[i];
+      unsigned y_start = (height * i) / filt->threads;
+      unsigned y_end   = (height * (i + 1)) / filt->threads;
 
-   if (filt->in_fmt == SOFTFILTER_FMT_XRGB8888)
-      packets[0].work                 = normal2x_height_work_cb_xrgb8888;
-   else if (filt->in_fmt == SOFTFILTER_FMT_RGB565)
-      packets[0].work                 = normal2x_height_work_cb_rgb565;
-   packets[0].thread_data             = thr;
+      thr->out_data  = (uint8_t*)output + (size_t)y_start * 2 * output_stride;
+      thr->in_data   = (const uint8_t*)input + (size_t)y_start * input_stride;
+      thr->out_pitch = output_stride;
+      thr->in_pitch  = input_stride;
+      thr->width     = width;
+      thr->height    = y_end - y_start;
+
+      if (filt->in_fmt == SOFTFILTER_FMT_XRGB8888)
+         packets[i].work = normal2x_height_work_cb_xrgb8888;
+      else if (filt->in_fmt == SOFTFILTER_FMT_RGB565)
+         packets[i].work = normal2x_height_work_cb_rgb565;
+      packets[i].thread_data = thr;
+   }
 }
 
 static const struct softfilter_implementation normal2x_height_generic = {

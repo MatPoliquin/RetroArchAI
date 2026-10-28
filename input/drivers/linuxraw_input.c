@@ -69,13 +69,25 @@ static void *linuxraw_input_init(const char *joypad_driver)
    return linuxraw;
 }
 
+/* Which of @keys are down: bit n of @down for keys[n]. */
+static void linuxraw_keys_down(void *data, unsigned port,
+      const uint16_t *keys, const uint8_t *bind, unsigned count,
+      uint32_t *down)
+{
+   unsigned i;
+   linuxraw_input_t *linuxraw = (linuxraw_input_t*)data;
+   (void)port;
+   (void)bind;
+   for (i = 0; i < count; i++)
+      if (linuxraw->state[rarch_keysym_lut[keys[i]] & 0x7F])
+         down[i >> 5] |= (1u << (i & 31));
+}
+
 static int16_t linuxraw_input_state(
       void *data,
       const input_device_driver_t *joypad,
-      const input_device_driver_t *sec_joypad,
       rarch_joypad_info_t *joypad_info,
       const retro_keybind_set *binds,
-      bool keyboard_mapping_blocked,
       unsigned port,
       unsigned device,
       unsigned idx,
@@ -85,74 +97,9 @@ static int16_t linuxraw_input_state(
 
    switch (device)
    {
-      case RETRO_DEVICE_JOYPAD:
-         if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
-         {
-            unsigned i;
-            int16_t ret = 0;
-
-            if (!keyboard_mapping_blocked)
-            {
-               for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
-               {
-                  if (binds[port][i].valid)
-                  {
-                     if (     (binds[port][i].key && binds[port][i].key < RETROK_LAST)
-                           && linuxraw->state[rarch_keysym_lut[(enum retro_key)binds[port][i].key] & 0X7F])
-                        ret |= (1 << i);
-                  }
-               }
-            }
-
-            return ret;
-         }
-
-         if (id < RARCH_BIND_LIST_END)
-         {
-            if (binds[port][id].valid)
-            {
-               if (     (binds[port][id].key && binds[port][id].key < RETROK_LAST)
-                     && linuxraw->state[rarch_keysym_lut[(enum retro_key)binds[port][id].key] & 0X7F]
-                     && (id == RARCH_GAME_FOCUS_TOGGLE || !keyboard_mapping_blocked)
-                  )
-                  return 1;
-            }
-         }
-         break;
-      case RETRO_DEVICE_ANALOG:
-         if (binds)
-         {
-            int id_minus_key      = 0;
-            int id_plus_key       = 0;
-            unsigned id_minus     = 0;
-            unsigned id_plus      = 0;
-            int16_t ret           = 0;
-            bool id_plus_valid    = false;
-            bool id_minus_valid   = false;
-
-            input_conv_analog_id_to_bind_id(idx, id, id_minus, id_plus);
-
-            id_minus_valid        = binds[port][id_minus].valid;
-            id_plus_valid         = binds[port][id_plus].valid;
-            id_minus_key          = binds[port][id_minus].key;
-            id_plus_key           = binds[port][id_plus].key;
-
-            if (id_plus_valid && id_plus_key && id_plus_key < RETROK_LAST)
-            {
-               unsigned sym = rarch_keysym_lut[(enum retro_key)id_plus_key] & 0X7F;
-               if (linuxraw->state[sym])
-                  ret = 0x7fff;
-            }
-            if (id_minus_valid && id_minus_key && id_minus_key < RETROK_LAST)
-            {
-               unsigned sym = rarch_keysym_lut[(enum retro_key)id_minus_key] & 0X7F;
-               if (linuxraw->state[sym])
-                  ret += -0x7fff;
-            }
-
-            return ret;
-         }
-         break;
+      /* The RetroPad's buttons, the hotkeys and a stick's axes, where
+       * they are bound to keys, are the frontend's to answer: it asks
+       * linuxraw_keys_down() for the keys once a poll. */
       case RETRO_DEVICE_KEYBOARD:
          if (id && id < RETROK_LAST)
          {
@@ -286,5 +233,7 @@ input_driver_t input_linuxraw = {
    "linuxraw",
    NULL,                         /* grab_mouse */
    linux_terminal_grab_stdin,
-   NULL
+   NULL,
+   NULL,                         /* survives_video */
+   linuxraw_keys_down
 };

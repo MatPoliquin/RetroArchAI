@@ -32,6 +32,7 @@
 
 #include "../input_driver.h"
 #include "../input_keymaps.h"
+#include "../../gfx/video_driver.h"
 
 #include "wiiu_dbg.h"
 
@@ -88,16 +89,14 @@ static void kb_key_callback(KBDKeyEvent *key)
 static int16_t wiiu_input_state(
       void *data,
       const input_device_driver_t *joypad,
-      const input_device_driver_t *sec_joypad,
       rarch_joypad_info_t *joypad_info,
       const retro_keybind_set *binds,
-      bool keyboard_mapping_blocked,
       unsigned port,
       unsigned device,
       unsigned idx,
       unsigned id)
 {
-   if (!(port < DEFAULT_MAX_PADS) || !binds || !binds[port])
+   if (!(port < DEFAULT_MAX_PADS) || !binds)
       return 0;
 
    switch (device)
@@ -123,9 +122,16 @@ static int16_t wiiu_input_state(
                   return BIT256_GET(state, VPAD_BUTTON_TOUCH_BIT) ? 1 : 0;
                }
             case RETRO_DEVICE_ID_POINTER_X:
-               return joypad->axis(0, 0xFFFF0004UL);
             case RETRO_DEVICE_ID_POINTER_Y:
-               return joypad->axis(0, 0xFFFF0005UL);
+               {
+                  int16_t x = joypad->axis(0, 0xFFFF0004UL);
+                  int16_t y = joypad->axis(0, 0xFFFF0005UL);
+                  /* The core's pointer is in its packed frame when the
+                   * GamePad shows its views */
+                  if (device == RETRO_DEVICE_POINTER)
+                     gx2_views_touch(x, y, &x, &y);
+                  return (id == RETRO_DEVICE_ID_POINTER_X) ? x : y;
+               }
          }
          break;
    }
@@ -145,7 +151,7 @@ static void* wiiu_input_init(const char *joypad_driver)
          &kb_disconnection_callback,
          &kb_key_callback);
 
-   input_keymaps_init_keyboard_lut(rarch_key_map_wiiu);
+   input_keymaps_init_keyboard_lut(rarch_key_map_hid);
 
    return (void*)-1;
 }

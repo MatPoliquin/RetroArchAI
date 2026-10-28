@@ -19,6 +19,9 @@
 #include "softfilter.h"
 #include <stdlib.h>
 
+/* Vector runs over blocks of one colour (see softfilter_copyrun.h) */
+#include "softfilter_copyrun.h"
+
 #ifdef RARCH_INTERNAL
 #define softfilter_get_implementation supertwoxsai_get_implementation
 #define softfilter_thread_data supertwoxsai_softfilter_thread_data
@@ -37,7 +40,9 @@ struct softfilter_thread_data
    unsigned width;
    unsigned height;
    int first;
-   int last;
+   /* frame rows below this worker's slice, which its neighbourhood
+    * may read into */
+   unsigned below;
 };
 
 struct filter_data
@@ -45,6 +50,8 @@ struct filter_data
    unsigned threads;
    struct softfilter_thread_data *workers;
    unsigned in_fmt;
+   /* The copy runs for this machine (NULL without a vector tier) */
+   struct softfilter_copyrun copyrun;
 };
 
 static unsigned supertwoxsai_generic_input_fmts(void)
@@ -79,9 +86,10 @@ static void *supertwoxsai_generic_create(const struct softfilter_config *config,
    }
    /* Apparently the code is not thread-safe,
     * so force single threaded operation... */
-   filt->threads = 1;
+   filt->threads = threads;
    filt->in_fmt  = in_fmt;
 
+   softfilter_copy3_pick(&filt->copyrun, simd);
    return filt;
 }
 
@@ -114,24 +122,28 @@ static void supertwoxsai_generic_destroy(void *data)
 #define supertwoxsai_result(A, B, C, D) (((A) != (C) || (A) != (D)) - ((B) != (C) || (B) != (D)))
 
 #ifndef supertwoxsai_declare_variables
-#define supertwoxsai_declare_variables(typename_t, in, nextline) \
+/* prevline/nextline/nextline2 are row offsets already clamped against
+ * the top and bottom of the frame, and xm1/xp1/xp2 are column offsets
+ * clamped against its left and right edge, so the sampled
+ * neighbourhood never reaches outside the source. */
+#define supertwoxsai_declare_variables(typename_t, in, prevline, nextline, nextline2, xm1, xp1, xp2) \
          typename_t product1a, product1b, product2a, product2b; \
-         const typename_t colorB0 = *(in - nextline - 1); \
-         const typename_t colorB1 = *(in - nextline + 0); \
-         const typename_t colorB2 = *(in - nextline + 1); \
-         const typename_t colorB3 = *(in - nextline + 2); \
-         const typename_t color4  = *(in - 1); \
-         const typename_t color5  = *(in + 0); \
-         const typename_t color6  = *(in + 1); \
-         const typename_t colorS2 = *(in + 2); \
-         const typename_t color1  = *(in + nextline - 1); \
-         const typename_t color2  = *(in + nextline + 0); \
-         const typename_t color3  = *(in + nextline + 1); \
-         const typename_t colorS1 = *(in + nextline + 2); \
-         const typename_t colorA0 = *(in + nextline + nextline - 1); \
-         const typename_t colorA1 = *(in + nextline + nextline + 0); \
-         const typename_t colorA2 = *(in + nextline + nextline + 1); \
-         const typename_t colorA3 = *(in + nextline + nextline + 2)
+         const typename_t colorB0 = *(in - prevline + xm1); \
+         const typename_t colorB1 = *(in - prevline); \
+         const typename_t colorB2 = *(in - prevline + xp1); \
+         const typename_t colorB3 = *(in - prevline + xp2); \
+         const typename_t color4  = *(in + xm1); \
+         const typename_t color5  = *(in); \
+         const typename_t color6  = *(in + xp1); \
+         const typename_t colorS2 = *(in + xp2); \
+         const typename_t color1  = *(in + nextline + xm1); \
+         const typename_t color2  = *(in + nextline); \
+         const typename_t color3  = *(in + nextline + xp1); \
+         const typename_t colorS1 = *(in + nextline + xp2); \
+         const typename_t colorA0 = *(in + nextline2 + xm1); \
+         const typename_t colorA1 = *(in + nextline2); \
+         const typename_t colorA2 = *(in + nextline2 + xp1); \
+         const typename_t colorA3 = *(in + nextline2 + xp2)
 #endif
 
 #ifndef supertwoxsai_function
@@ -197,30 +209,282 @@ static void supertwoxsai_generic_destroy(void *data)
          out += 2
 #endif
 
+#ifdef SOFTFILTER_HAVE_COPYRUN
+/* One pixel of xrgb8888, the plain loop's body: for pixels a copy run
+ * finds are not in a block of one colour. */
+static SOFTFILTER_FORCE_INLINE void supertwoxsai_full_xrgb8888(const uint32_t *row,
+      unsigned x, unsigned width, unsigned prevline, unsigned nextline,
+      unsigned nextline2, uint32_t *dst, unsigned dst_stride)
+{
+   const uint32_t *in = row + x;
+   uint32_t *out      = dst + 2 * x;
+   unsigned finish = width - x;
+   {
+         /* finish counts down from width, so it doubles as the distance
+          * to the right edge. */
+         int xm1 = (finish < width) ? -1 : 0;
+         int xp1 = (finish > 1) ? 1 : 0;
+         int xp2 = (finish > 2) ? 2 : (int)finish - 1;
+
+         /* A flat 2x2 block - the pixel and its right, lower and
+          * lower-right neighbours all one colour - comes out as that
+          * colour in all four pixels whichever rule applies (the
+          * tie-break's terms all cancel, and the colour blended with
+          * itself is the colour), so it is written without loading the
+          * rest of the neighbourhood or running the rules. */
+         uint32_t flat_ = *in;
+         if (     flat_ == *(in + xp1)
+               && flat_ == *(in + nextline)
+               && flat_ == *(in + nextline + xp1))
+         {
+            out[0] = out[1] = out[dst_stride] = out[dst_stride + 1] = flat_;
+            ++in;
+            out += 2;
+         }
+         else
+         {
+            supertwoxsai_declare_variables(uint32_t, in, prevline, nextline, nextline2,
+                  xm1, xp1, xp2);
+
+            /*---------------------------    B1 B2
+             *                             4  5  6 S2
+             *                             1  2  3 S1
+             *                               A1 A2
+             *--------------------------------------
+             */
+
+            supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_xrgb8888, supertwoxsai_interpolate2_xrgb8888);
+         }
+   }
+   (void)in;
+   (void)out;
+}
+
+/* Pixels x0 up to x1 of a row of xrgb8888, in the plain loop's own form */
+static void supertwoxsai_seg_xrgb8888(const uint32_t *row, unsigned x0,
+      unsigned x1, unsigned width, unsigned prevline, unsigned nextline,
+      unsigned nextline2, uint32_t *dst, unsigned dst_stride)
+{
+   const uint32_t *in = row + x0;
+   uint32_t *out      = dst + 2 * x0;
+   unsigned finish;
+   for (finish = width - x0; finish > width - x1; finish -= 1)
+   {
+         /* finish counts down from width, so it doubles as the distance
+          * to the right edge. */
+         int xm1 = (finish < width) ? -1 : 0;
+         int xp1 = (finish > 1) ? 1 : 0;
+         int xp2 = (finish > 2) ? 2 : (int)finish - 1;
+
+         /* A flat 2x2 block - the pixel and its right, lower and
+          * lower-right neighbours all one colour - comes out as that
+          * colour in all four pixels whichever rule applies (the
+          * tie-break's terms all cancel, and the colour blended with
+          * itself is the colour), so it is written without loading the
+          * rest of the neighbourhood or running the rules. */
+         uint32_t flat_ = *in;
+         if (     flat_ == *(in + xp1)
+               && flat_ == *(in + nextline)
+               && flat_ == *(in + nextline + xp1))
+         {
+            out[0] = out[1] = out[dst_stride] = out[dst_stride + 1] = flat_;
+            ++in;
+            out += 2;
+         }
+         else
+         {
+            supertwoxsai_declare_variables(uint32_t, in, prevline, nextline, nextline2,
+                  xm1, xp1, xp2);
+
+            /*---------------------------    B1 B2
+             *                             4  5  6 S2
+             *                             1  2  3 S1
+             *                               A1 A2
+             *--------------------------------------
+             */
+
+            supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_xrgb8888, supertwoxsai_interpolate2_xrgb8888);
+         }
+   }
+}
+
+static void supertwoxsai_vec_xrgb8888(const struct filter_data *filt,
+      unsigned width, unsigned height, int first, unsigned below,
+      const uint32_t *src, unsigned src_stride, uint32_t *dst,
+      unsigned dst_stride)
+{
+   SOFTFILTER_COPYRUN_ROWS(uint32_t, supertwoxsai_full_xrgb8888, supertwoxsai_seg_xrgb8888,
+         filt->copyrun.xrgb8888, filt->copyrun.lanes_xrgb8888)
+}
+
+/* One pixel of rgb565, the plain loop's body: for pixels a copy run
+ * finds are not in a block of one colour. */
+static SOFTFILTER_FORCE_INLINE void supertwoxsai_full_rgb565(const uint16_t *row,
+      unsigned x, unsigned width, unsigned prevline, unsigned nextline,
+      unsigned nextline2, uint16_t *dst, unsigned dst_stride)
+{
+   const uint16_t *in = row + x;
+   uint16_t *out      = dst + 2 * x;
+   unsigned finish = width - x;
+   {
+         /* finish counts down from width, so it doubles as the distance
+          * to the right edge. */
+         int xm1 = (finish < width) ? -1 : 0;
+         int xp1 = (finish > 1) ? 1 : 0;
+         int xp2 = (finish > 2) ? 2 : (int)finish - 1;
+
+         /* A flat 2x2 block - the pixel and its right, lower and
+          * lower-right neighbours all one colour - comes out as that
+          * colour in all four pixels whichever rule applies (the
+          * tie-break's terms all cancel, and the colour blended with
+          * itself is the colour), so it is written without loading the
+          * rest of the neighbourhood or running the rules. */
+         uint16_t flat_ = *in;
+         if (     flat_ == *(in + xp1)
+               && flat_ == *(in + nextline)
+               && flat_ == *(in + nextline + xp1))
+         {
+            out[0] = out[1] = out[dst_stride] = out[dst_stride + 1] = flat_;
+            ++in;
+            out += 2;
+         }
+         else
+         {
+            supertwoxsai_declare_variables(uint16_t, in, prevline, nextline, nextline2,
+                  xm1, xp1, xp2);
+
+            /*---------------------------    B1 B2
+             *                             4  5  6 S2
+             *                             1  2  3 S1
+             *                               A1 A2
+             *--------------------------------------
+             */
+
+            supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_rgb565, supertwoxsai_interpolate2_rgb565);
+         }
+   }
+   (void)in;
+   (void)out;
+}
+
+/* Pixels x0 up to x1 of a row of rgb565, in the plain loop's own form */
+static void supertwoxsai_seg_rgb565(const uint16_t *row, unsigned x0,
+      unsigned x1, unsigned width, unsigned prevline, unsigned nextline,
+      unsigned nextline2, uint16_t *dst, unsigned dst_stride)
+{
+   const uint16_t *in = row + x0;
+   uint16_t *out      = dst + 2 * x0;
+   unsigned finish;
+   for (finish = width - x0; finish > width - x1; finish -= 1)
+   {
+         /* finish counts down from width, so it doubles as the distance
+          * to the right edge. */
+         int xm1 = (finish < width) ? -1 : 0;
+         int xp1 = (finish > 1) ? 1 : 0;
+         int xp2 = (finish > 2) ? 2 : (int)finish - 1;
+
+         /* A flat 2x2 block - the pixel and its right, lower and
+          * lower-right neighbours all one colour - comes out as that
+          * colour in all four pixels whichever rule applies (the
+          * tie-break's terms all cancel, and the colour blended with
+          * itself is the colour), so it is written without loading the
+          * rest of the neighbourhood or running the rules. */
+         uint16_t flat_ = *in;
+         if (     flat_ == *(in + xp1)
+               && flat_ == *(in + nextline)
+               && flat_ == *(in + nextline + xp1))
+         {
+            out[0] = out[1] = out[dst_stride] = out[dst_stride + 1] = flat_;
+            ++in;
+            out += 2;
+         }
+         else
+         {
+            supertwoxsai_declare_variables(uint16_t, in, prevline, nextline, nextline2,
+                  xm1, xp1, xp2);
+
+            /*---------------------------    B1 B2
+             *                             4  5  6 S2
+             *                             1  2  3 S1
+             *                               A1 A2
+             *--------------------------------------
+             */
+
+            supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_rgb565, supertwoxsai_interpolate2_rgb565);
+         }
+   }
+}
+
+static void supertwoxsai_vec_rgb565(const struct filter_data *filt,
+      unsigned width, unsigned height, int first, unsigned below,
+      const uint16_t *src, unsigned src_stride, uint16_t *dst,
+      unsigned dst_stride)
+{
+   SOFTFILTER_COPYRUN_ROWS(uint16_t, supertwoxsai_full_rgb565, supertwoxsai_seg_rgb565,
+         filt->copyrun.rgb565, filt->copyrun.lanes_rgb565)
+}
+
+#else
 static void supertwoxsai_generic_xrgb8888(unsigned width, unsigned height,
-      int first, int last, uint32_t *src,
+      int first, unsigned below, uint32_t *src,
       unsigned src_stride, uint32_t *dst, unsigned dst_stride)
 {
    unsigned finish;
-   unsigned nextline = (last) ? 0 : src_stride;
+   unsigned row = 0;
 
-   for (; height; height--)
+   for (; height; height--, row++)
    {
-      uint32_t *in  = (uint32_t*)src;
-      uint32_t *out = (uint32_t*)dst;
+      uint32_t *in             = (uint32_t*)src;
+      uint32_t *out            = (uint32_t*)dst;
+      /* Rows above are only unavailable on the frame's very first row;
+       * a worker that does not start at the top can always read back
+       * into the preceding slice. */
+      unsigned prevline  = (first == 0 && row == 0) ? 0 : src_stride;
+      /* Rows below this one in the frame: the rest of this slice and
+       * the slices after it. Clamped against the frame, not the
+       * slice: a worker whose slice ends a row above the bottom,
+       * behind a one-row slice, would otherwise read past it. */
+      unsigned rows_below = (height - 1) + below;
+      unsigned nextline   = rows_below >= 1 ? src_stride : 0;
+      unsigned nextline2  = rows_below >= 2 ? 2 * src_stride : nextline;
 
       for (finish = width; finish; finish -= 1)
       {
-         supertwoxsai_declare_variables(uint32_t, in, nextline);
+         /* finish counts down from width, so it doubles as the distance
+          * to the right edge. */
+         int xm1 = (finish < width) ? -1 : 0;
+         int xp1 = (finish > 1) ? 1 : 0;
+         int xp2 = (finish > 2) ? 2 : (int)finish - 1;
 
-         /*---------------------------    B1 B2
-          *                             4  5  6 S2
-          *                             1  2  3 S1
-          *                               A1 A2
-          *--------------------------------------
-          */
+         /* A flat 2x2 block - the pixel and its right, lower and
+          * lower-right neighbours all one colour - comes out as that
+          * colour in all four pixels whichever rule applies (the
+          * tie-break's terms all cancel, and the colour blended with
+          * itself is the colour), so it is written without loading the
+          * rest of the neighbourhood or running the rules. */
+         uint32_t flat_ = *in;
+         if (     flat_ == *(in + xp1)
+               && flat_ == *(in + nextline)
+               && flat_ == *(in + nextline + xp1))
+         {
+            out[0] = out[1] = out[dst_stride] = out[dst_stride + 1] = flat_;
+            ++in;
+            out += 2;
+         }
+         else
+         {
+            supertwoxsai_declare_variables(uint32_t, in, prevline, nextline, nextline2,
+                  xm1, xp1, xp2);
 
-         supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_xrgb8888, supertwoxsai_interpolate2_xrgb8888);
+            /*---------------------------    B1 B2
+             *                             4  5  6 S2
+             *                             1  2  3 S1
+             *                               A1 A2
+             *--------------------------------------
+             */
+
+            supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_xrgb8888, supertwoxsai_interpolate2_xrgb8888);
+         }
       }
 
       src += src_stride;
@@ -229,35 +493,72 @@ static void supertwoxsai_generic_xrgb8888(unsigned width, unsigned height,
 }
 
 static void supertwoxsai_generic_rgb565(unsigned width, unsigned height,
-      int first, int last, uint16_t *src,
+      int first, unsigned below, uint16_t *src,
       unsigned src_stride, uint16_t *dst, unsigned dst_stride)
 {
    unsigned finish;
-   unsigned nextline = (last) ? 0 : src_stride;
+   unsigned row = 0;
 
-   for (; height; height--)
+   for (; height; height--, row++)
    {
-      uint16_t *in  = (uint16_t*)src;
-      uint16_t *out = (uint16_t*)dst;
+      uint16_t *in             = (uint16_t*)src;
+      uint16_t *out            = (uint16_t*)dst;
+      /* Rows above are only unavailable on the frame's very first row;
+       * a worker that does not start at the top can always read back
+       * into the preceding slice. */
+      unsigned prevline  = (first == 0 && row == 0) ? 0 : src_stride;
+      /* Rows below this one in the frame: the rest of this slice and
+       * the slices after it. Clamped against the frame, not the
+       * slice: a worker whose slice ends a row above the bottom,
+       * behind a one-row slice, would otherwise read past it. */
+      unsigned rows_below = (height - 1) + below;
+      unsigned nextline   = rows_below >= 1 ? src_stride : 0;
+      unsigned nextline2  = rows_below >= 2 ? 2 * src_stride : nextline;
 
       for (finish = width; finish; finish -= 1)
       {
-         supertwoxsai_declare_variables(uint16_t, in, nextline);
+         /* finish counts down from width, so it doubles as the distance
+          * to the right edge. */
+         int xm1 = (finish < width) ? -1 : 0;
+         int xp1 = (finish > 1) ? 1 : 0;
+         int xp2 = (finish > 2) ? 2 : (int)finish - 1;
 
-         /*---------------------------    B1 B2
-          *                             4  5  6 S2
-          *                             1  2  3 S1
-          *                               A1 A2
-          *--------------------------------------
-          */
+         /* A flat 2x2 block - the pixel and its right, lower and
+          * lower-right neighbours all one colour - comes out as that
+          * colour in all four pixels whichever rule applies (the
+          * tie-break's terms all cancel, and the colour blended with
+          * itself is the colour), so it is written without loading the
+          * rest of the neighbourhood or running the rules. */
+         uint16_t flat_ = *in;
+         if (     flat_ == *(in + xp1)
+               && flat_ == *(in + nextline)
+               && flat_ == *(in + nextline + xp1))
+         {
+            out[0] = out[1] = out[dst_stride] = out[dst_stride + 1] = flat_;
+            ++in;
+            out += 2;
+         }
+         else
+         {
+            supertwoxsai_declare_variables(uint16_t, in, prevline, nextline, nextline2,
+                  xm1, xp1, xp2);
 
-         supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_rgb565, supertwoxsai_interpolate2_rgb565);
+            /*---------------------------    B1 B2
+             *                             4  5  6 S2
+             *                             1  2  3 S1
+             *                               A1 A2
+             *--------------------------------------
+             */
+
+            supertwoxsai_function(supertwoxsai_result, supertwoxsai_interpolate_rgb565, supertwoxsai_interpolate2_rgb565);
+         }
       }
 
       src += src_stride;
       dst += 2 * dst_stride;
    }
 }
+#endif
 
 static void supertwoxsai_work_cb_rgb565(void *data, void *thread_data)
 {
@@ -266,11 +567,19 @@ static void supertwoxsai_work_cb_rgb565(void *data, void *thread_data)
    uint16_t *output                   = (uint16_t*)thr->out_data;
    unsigned width                     = thr->width;
    unsigned height                    = thr->height;
-   supertwoxsai_generic_rgb565(width, height,
-         thr->first, thr->last, input,
+#ifdef SOFTFILTER_HAVE_COPYRUN
+   supertwoxsai_vec_rgb565((const struct filter_data*)data, width, height,
+         thr->first, thr->below, input,
         (unsigned)(thr->in_pitch / SOFTFILTER_BPP_RGB565),
         output,
         (unsigned)(thr->out_pitch / SOFTFILTER_BPP_RGB565));
+#else
+   supertwoxsai_generic_rgb565(width, height,
+         thr->first, thr->below, input,
+        (unsigned)(thr->in_pitch / SOFTFILTER_BPP_RGB565),
+        output,
+        (unsigned)(thr->out_pitch / SOFTFILTER_BPP_RGB565));
+#endif
 }
 
 static void supertwoxsai_work_cb_xrgb8888(void *data, void *thread_data)
@@ -280,11 +589,19 @@ static void supertwoxsai_work_cb_xrgb8888(void *data, void *thread_data)
    uint32_t *output                   = (uint32_t*)thr->out_data;
    unsigned width                     = thr->width;
    unsigned height                    = thr->height;
-   supertwoxsai_generic_xrgb8888(width, height,
-         thr->first, thr->last, input,
+#ifdef SOFTFILTER_HAVE_COPYRUN
+   supertwoxsai_vec_xrgb8888((const struct filter_data*)data, width, height,
+         thr->first, thr->below, input,
 	 (unsigned)(thr->in_pitch / SOFTFILTER_BPP_XRGB8888),
 	 output,
 	 (unsigned)(thr->out_pitch / SOFTFILTER_BPP_XRGB8888));
+#else
+   supertwoxsai_generic_xrgb8888(width, height,
+         thr->first, thr->below, input,
+	 (unsigned)(thr->in_pitch / SOFTFILTER_BPP_XRGB8888),
+	 output,
+	 (unsigned)(thr->out_pitch / SOFTFILTER_BPP_XRGB8888));
+#endif
 }
 
 static void supertwoxsai_generic_packets(void *data,
@@ -311,7 +628,7 @@ static void supertwoxsai_generic_packets(void *data,
       /* Workers need to know if they can access pixels 
        * outside their given buffer. */
       thr->first             = y_start;
-      thr->last              = y_end == height;
+      thr->below             = height - y_end;
 
       if (filt->in_fmt == SOFTFILTER_FMT_RGB565)
          packets[i].work     = supertwoxsai_work_cb_rgb565;

@@ -17,7 +17,15 @@
 #ifndef __VIDEO_DEFINES__H
 #define __VIDEO_DEFINES__H
 
+#include <stddef.h>
+
 #include <retro_common_api.h>
+
+/* One-cycle alias: builds that still pass the old switch get the
+ * in-tree modeline engine. */
+#if defined(HAVE_CRTSWITCHRES) && !defined(HAVE_MODELINE)
+#define HAVE_MODELINE
+#endif
 
 RETRO_BEGIN_DECLS
 
@@ -102,6 +110,24 @@ enum video_rotation_type
    VIDEO_ROTATION_270_DEG
 };
 
+/* How hard to push for exclusive fullscreen where the platform lets the
+ * application decide (VK_EXT_full_screen_exclusive on Windows Vulkan). */
+enum video_fse_negotiation
+{
+   VIDEO_FSE_RELAXED = 0, /* hint only; the driver may decline */
+   VIDEO_FSE_FORCED,      /* take it explicitly and hold it    */
+   VIDEO_FSE_LAST
+};
+
+/* Whether video RetroArch plays itself (previews) is decoded on the
+ * GPU where the driver has a hardware decoder for it. */
+enum video_hw_decode
+{
+   VIDEO_HW_DECODE_OFF = 0,
+   VIDEO_HW_DECODE_AUTO,
+   VIDEO_HW_DECODE_LAST
+};
+
 enum autoswitch_refresh_rate
 {
    AUTOSWITCH_REFRESH_RATE_EXCLUSIVE_FULLSCREEN = 0,
@@ -109,6 +135,16 @@ enum autoswitch_refresh_rate
    AUTOSWITCH_REFRESH_RATE_ALL_FULLSCREEN,
    AUTOSWITCH_REFRESH_RATE_OFF,
    AUTOSWITCH_REFRESH_RATE_LAST
+};
+
+enum time_show_type
+{
+   TIME_SHOW_OFF = 0,
+   TIME_SHOW_HM,
+   TIME_SHOW_HMS,
+   TIME_SHOW_HM_AMPM,
+   TIME_SHOW_HMS_AMPM,
+   TIME_SHOW_LAST
 };
 
 enum rarch_display_type
@@ -121,34 +157,12 @@ enum rarch_display_type
    RARCH_DISPLAY_WIN32,
    RARCH_DISPLAY_WAYLAND,
    RARCH_DISPLAY_OSX,
-   RARCH_DISPLAY_KMS
+   RARCH_DISPLAY_KMS,
+   /* Legacy Raspberry Pi firmware stack: no window, modes through
+    * the firmware's gencmd interface */
+   RARCH_DISPLAY_VIDEOCORE
 };
 
-enum font_driver_render_api
-{
-   FONT_DRIVER_RENDER_DONT_CARE,
-   FONT_DRIVER_RENDER_OPENGL_API,
-   FONT_DRIVER_RENDER_OPENGL_CORE_API,
-   FONT_DRIVER_RENDER_OPENGL1_API,
-   FONT_DRIVER_RENDER_D3D8_API,
-   FONT_DRIVER_RENDER_D3D9_API,
-   FONT_DRIVER_RENDER_D3D10_API,
-   FONT_DRIVER_RENDER_D3D11_API,
-   FONT_DRIVER_RENDER_D3D12_API,
-   FONT_DRIVER_RENDER_PS2,
-   FONT_DRIVER_RENDER_VITA2D,
-   FONT_DRIVER_RENDER_CTR,
-   FONT_DRIVER_RENDER_WIIU,
-   FONT_DRIVER_RENDER_VULKAN_API,
-   FONT_DRIVER_RENDER_METAL_API,
-   FONT_DRIVER_RENDER_CACA,
-   FONT_DRIVER_RENDER_SIXEL,
-   FONT_DRIVER_RENDER_NETWORK_VIDEO,
-   FONT_DRIVER_RENDER_GDI,
-   FONT_DRIVER_RENDER_VGA,
-   FONT_DRIVER_RENDER_SWITCH,
-   FONT_DRIVER_RENDER_RSX
-};
 
 enum text_alignment
 {
@@ -184,25 +198,157 @@ enum text_alignment
 #define FONT_COLOR_GET_ALPHA(col) (((col) >>  0) & 0xff)
 #define FONT_COLOR_ARGB_TO_RGBA(col) ( (((col) >> 24) & 0xff) | (((unsigned)(col) << 8) & 0xffffff00) )
 
+/* The statistics overlay's text, the buffer it is built in and the
+ * copy the threaded wrapper draws from alike. */
+#define VIDEO_STAT_TEXT_SIZE 1664
+
+/* A size pair in one word: width in the high half, height in the low,
+ * clamped so neither axis can write over the other. Anything past
+ * 65535 an axis is beyond what a driver here allocates. */
+#define VIDEO_SCALE_DIM_MAX 0xffffu
+/* Each axis becomes unsigned before it is compared, so a caller holding
+ * its sizes in int or float packs without a cast of its own. */
+#define VIDEO_SCALE_CLAMP(v) \
+   ((unsigned)(v) > VIDEO_SCALE_DIM_MAX ? VIDEO_SCALE_DIM_MAX : (unsigned)(v))
+#define VIDEO_SCALE_PACK(w, h) \
+   ((VIDEO_SCALE_CLAMP(w) << 16) | VIDEO_SCALE_CLAMP(h))
+#define VIDEO_SCALE_W(d) (((unsigned)(d) >> 16) & VIDEO_SCALE_DIM_MAX)
+#define VIDEO_SCALE_H(d)  ((unsigned)(d)        & VIDEO_SCALE_DIM_MAX)
+/* Whether a size packs without clamping. Anything sized for storage
+ * from a word has to ask first: a clamped axis would allocate less
+ * than the source it holds. */
+#define VIDEO_SCALE_FITS(w, h) \
+   ((unsigned)(w) <= VIDEO_SCALE_DIM_MAX && (unsigned)(h) <= VIDEO_SCALE_DIM_MAX)
+
+/* The pixel count, as size_t. Both axes are at most 65535, so their
+ * product reaches 0xfffe0001 -- inside 32-bit unsigned, but a buffer
+ * size is that times the bytes per pixel, and 32-bit arithmetic gives
+ * a too-small allocation rather than a failure. Widening here means a
+ * caller writing VIDEO_SCALE_AREA(d) * 4 gets the wide multiply
+ * without having to remember the cast. */
+#define VIDEO_SCALE_AREA(d) ((size_t)VIDEO_SCALE_W(d) * VIDEO_SCALE_H(d))
+
+/* Each axis of two pairs at its least or greatest, staying packed: a
+ * half compares with the other one masked off. */
+#define VIDEO_SCALE_HI_MASK (VIDEO_SCALE_DIM_MAX << 16)
+#define VIDEO_SCALE_HALF_MIN(a, b, m) \
+   (((unsigned)(a) & (m)) < ((unsigned)(b) & (m)) \
+    ? ((unsigned)(a) & (m)) : ((unsigned)(b) & (m)))
+#define VIDEO_SCALE_HALF_MAX(a, b, m) \
+   (((unsigned)(a) & (m)) > ((unsigned)(b) & (m)) \
+    ? ((unsigned)(a) & (m)) : ((unsigned)(b) & (m)))
+#define VIDEO_SCALE_MIN(a, b) \
+   (  VIDEO_SCALE_HALF_MIN(a, b, VIDEO_SCALE_HI_MASK) \
+    | VIDEO_SCALE_HALF_MIN(a, b, VIDEO_SCALE_DIM_MAX))
+#define VIDEO_SCALE_MAX(a, b) \
+   (  VIDEO_SCALE_HALF_MAX(a, b, VIDEO_SCALE_HI_MASK) \
+    | VIDEO_SCALE_HALF_MAX(a, b, VIDEO_SCALE_DIM_MAX))
+
+/* An alpha modulation as an 8-bit channel, saturated. An overlay's
+ * alpha is its opacity times a per-desc alpha_mod, which packs set
+ * above 1 to brighten a pressed button; packed straight into a byte
+ * that product wraps, so 1.4 comes out as 0x65. */
+#define VIDEO_ALPHA_BYTE(a) \
+   ((a) <= 0.0f ? 0u : (a) >= 1.0f ? 0xFFu : (unsigned)((a) * 0xFF))
+
+/* One axis of a packed pair, leaving the other half as it stands.
+ * A viewport whose axes are set apart from each other reads back
+ * through VIDEO_SCALE_W/H either way. */
+#define VIDEO_SCALE_PUT_W(d, w) \
+   ((d) = VIDEO_SCALE_PACK((w), VIDEO_SCALE_H(d)))
+#define VIDEO_SCALE_PUT_H(d, h) \
+   ((d) = VIDEO_SCALE_PACK(VIDEO_SCALE_W(d), (h)))
+
+/* An origin in one word: x in the high half, y in the low, each a
+ * signed 16-bit offset. A viewport's origin goes negative wherever
+ * integer scaling overscans the window, so both halves sign-extend on
+ * the way back out. An offset past +-32767 is further off a display
+ * than any of these drivers places one. */
+#define VIDEO_POS_MAX    32767
+#define VIDEO_POS_MIN  (-32768)
+#define VIDEO_POS_CLAMP(v) \
+   ((int)(v) > VIDEO_POS_MAX ? VIDEO_POS_MAX \
+    : ((int)(v) < VIDEO_POS_MIN ? VIDEO_POS_MIN : (int)(v)))
+#define VIDEO_POS_PACK(x, y) \
+   ((((unsigned)VIDEO_POS_CLAMP(x) & 0xffffu) << 16) \
+    | ((unsigned)VIDEO_POS_CLAMP(y) & 0xffffu))
+#define VIDEO_POS_X(p) ((int)(int16_t)(((unsigned)(p) >> 16) & 0xffffu))
+#define VIDEO_POS_Y(p) ((int)(int16_t)( (unsigned)(p)        & 0xffffu))
+/* One axis of a packed position set, or both moved by a delta, the
+ * other half kept. */
+#define VIDEO_POS_PUT_X(p, x) ((p) = VIDEO_POS_PACK((x), VIDEO_POS_Y(p)))
+#define VIDEO_POS_PUT_Y(p, y) ((p) = VIDEO_POS_PACK(VIDEO_POS_X(p), (y)))
+#define VIDEO_POS_ADD(p, dx, dy) \
+   ((p) = VIDEO_POS_PACK(VIDEO_POS_X(p) + (dx), VIDEO_POS_Y(p) + (dy)))
+/* The top-down y of an element with origin p and size d on a surface h
+ * tall, whose origin is bottom-up. Signed: an element reaching past the
+ * top comes out negative. */
+#define VIDEO_POS_FLIP_Y(h, p, d) \
+   ((int)(h) - VIDEO_POS_Y(p) - (int)VIDEO_SCALE_H(d))
+
+/* One axis of an origin, leaving the other half as it stands. */
+#define VIDEO_POS_PUT_X(p, x) \
+   ((p) = VIDEO_POS_PACK((x), VIDEO_POS_Y(p)))
+#define VIDEO_POS_PUT_Y(p, y) \
+   ((p) = VIDEO_POS_PACK(VIDEO_POS_X(p), (y)))
+
+/* A float length or position as the whole pixels a display can show
+ * it in. Every menu metric is a constant times a DPI scale, and every
+ * animated position is a tween between two of those, so the value
+ * arriving here is nearly always fractional and something has to
+ * decide which pixel it means.
+ *
+ * It rounds. Truncating is what the plain conversion does, and it
+ * loses up to a pixel off every metric in the same direction: at the
+ * 1.3333 scale a 50px row became 66 rather than 67, which is two
+ * thirds of a pixel per row and thirteen down a twenty-row list.
+ * Rounding halves the worst case and stops it accumulating in one
+ * direction.
+ *
+ * It also bounds the conversion. Converting a float past INT_MAX is
+ * undefined, and widget layout has produced such a value in the
+ * frames before an icon's metrics are known: sdl2_gfx and sdl3_gfx
+ * each carry a hand-written range test against the NaN vertices it
+ * turned into downstream. A value out of range - NaN included, since
+ * neither comparison holds for it - lands at the far edge instead,
+ * which draws off-screen and is over the following frame.
+ *
+ * v is evaluated more than once, as it is in VIDEO_POS_CLAMP above;
+ * callers pass a variable or a plain arithmetic expression. */
+#define VIDEO_PX(v) \
+   (((v) >= (float)VIDEO_POS_MIN && (v) <= (float)VIDEO_POS_MAX) \
+    ? (int)((v) + ((v) < 0.0f ? -0.5f : 0.5f)) \
+    : (((v) > 0.0f) ? VIDEO_POS_MAX : VIDEO_POS_MIN))
+
 typedef struct video_viewport
 {
-   int x;
-   int y;
-   unsigned width;
-   unsigned height;
-   unsigned full_width;
-   unsigned full_height;
+   /* The origin, one signed pair in VIDEO_POS_PACK's layout. */
+   unsigned pos;
+   /* The drawn area and the window that holds it, each a size pair
+    * in one word, VIDEO_SCALE_PACK's layout. */
+   unsigned dims;
+   unsigned full_dims;
 } video_viewport_t;
+
+/* The custom viewport as the settings hold it: an origin in
+ * VIDEO_POS_PACK's layout and a size in VIDEO_SCALE_PACK's, the same
+ * two words video_viewport_t carries.
+ *
+ * The config file still keeps custom_viewport_x/_y/_width/_height as
+ * four keys and the menu still shows four rows. Neither binds a half
+ * by address any more: a config row carries which half of the word it
+ * is (CFG_HALF_HI / CFG_HALF_LO in configuration.c) and a menu row
+ * carries the same in its SD_FREE_FLAG_PACKED_HI / _LO bit. */
+typedef struct video_viewport_settings
+{
+   unsigned pos;
+   unsigned dims;
+} video_viewport_settings_t;
 
 typedef struct gfx_ctx_flags
 {
    uint32_t flags;
 } gfx_ctx_flags_t;
-
-struct Size2D
-{
-   unsigned width, height;
-};
 
 enum gfx_ctx_api
 {
@@ -227,7 +373,9 @@ enum display_metric_types
    DISPLAY_METRIC_MM_HEIGHT,
    DISPLAY_METRIC_DPI,
    DISPLAY_METRIC_PIXEL_WIDTH,
-   DISPLAY_METRIC_PIXEL_HEIGHT
+   DISPLAY_METRIC_PIXEL_HEIGHT,
+   /* Lines per refresh, blanking included */
+   DISPLAY_METRIC_TOTAL_LINES
 };
 
 enum display_flags
@@ -249,7 +397,56 @@ enum display_flags
    GFX_CTX_FLAGS_OVERLAY_BEHIND_MENU_SUPPORTED,
    GFX_CTX_FLAGS_CRT_SWITCHRES,
    GFX_CTX_FLAGS_SUBFRAME_SHADERS,
-   GFX_CTX_FLAGS_FAST_TOGGLE_SHADERS
+   GFX_CTX_FLAGS_FAST_TOGGLE_SHADERS,
+   /* Set by a video driver that can present a native XRGB2101010 (10-bit
+    * per channel) source frame without the frontend down-converting it to
+    * XRGB8888 first. */
+   GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE,
+   /* Set by a context driver whose default framebuffer is FP16 scRGB
+    * (linear, 1.0 = 80 nits): the video driver must encode SDR content
+    * for HDR output itself (paper-white scaling etc.). */
+   GFX_CTX_FLAGS_SCRGB_FRAMEBUFFER,
+   /* Set by a context driver whose default framebuffer is 10-bit
+    * Rec.2020 PQ (HDR10, e.g. a KMS scanout with HDR metadata): the
+    * video driver encodes its frame to PQ instead of scRGB. */
+   GFX_CTX_FLAGS_HDR10_FRAMEBUFFER,
+   /* The window can go between windowed and borderless fullscreen where
+    * it stands, through set_video_mode, with the driver seeing only a
+    * resize: a fullscreen toggle need not restart the drivers. */
+   GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE,
+   /* Set by a video driver that presents a core's view map
+    * (RETRO_ENVIRONMENT_SET_VIDEO_VIEWS) itself. */
+   GFX_CTX_FLAGS_VIDEO_VIEWS,
+   /* Set while such a driver draws a frame that has a map whole. */
+   GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK,
+   /* Set by a video driver whose GPU recording reads the core's image
+    * before the menu, overlays and messages are drawn over it, when
+    * Record Game Only is on - in its present output mode. */
+   GFX_CTX_FLAGS_RECORD_GAME_ONLY,
+   /* Exclusive mode can change without restarting the drivers. */
+   GFX_CTX_FLAGS_FULLSCREEN_EXCLUSIVE_IN_PLACE,
+   /* set_video_mode can resize an existing window without restarting video. */
+   GFX_CTX_FLAGS_WINDOW_RESIZE_IN_PLACE,
+   /* Set by a headset's own context driver (the Quest's): the headset is
+    * all it shows, the headset's frames are begun and ended in the video
+    * frame, and the platform's flat context follows it in the list. */
+   GFX_CTX_FLAGS_HEADSET_INLINE,
+   /* Set by a video driver that shows each eye on a display of its own,
+    * as the 3DS's top screen does, and places the views on its displays
+    * itself: the views are laid out flat, whatever the stereo mode. */
+   GFX_CTX_FLAGS_VIDEO_VIEWS_OWN_EYES,
+   /* Set while such a driver shows both eyes. */
+   GFX_CTX_FLAGS_VIDEO_VIEWS_STEREO,
+   /* This context cannot give a hardware core a context of its own
+    * that shares objects with the driver's: the platform has one GL
+    * context per process (the Switch's nvservices), or the share
+    * context could not be created. The threaded wrapper's ring then
+    * hands the driver's one context between the two threads instead
+    * of giving the core a shared one. */
+   GFX_CTX_FLAGS_NO_SHARED_CONTEXT,
+   /* Set by a video driver that presents secondary screens in windows
+    * of their own through its context's gfx_ctx_window_driver_t. */
+   GFX_CTX_FLAGS_VIDEO_WINDOWS
 };
 
 enum shader_uniform_type
@@ -282,12 +479,10 @@ enum shader_program_type
 
 struct font_glyph
 {
-   unsigned width;
-   unsigned height;
-
-   /* Texel coordinate offset for top-left pixel of this glyph. */
-   unsigned atlas_offset_x;
-   unsigned atlas_offset_y;
+   /* Width and height, and the texel offset of the glyph's top-left
+    * pixel in the atlas, each a pair in VIDEO_SCALE_PACK's layout. */
+   unsigned dims;
+   unsigned atlas_pos;
 
    /* When drawing this glyph, apply an offset to
     * current X/Y draw coordinate. */
@@ -299,11 +494,47 @@ struct font_glyph
    int advance_y;
 };
 
+/* Coverage bit depth of a font atlas. A8 is the default; A16 is
+ * produced when a higher-precision atlas was requested (HDR output)
+ * and the renderer supports it, with samples stored as native-endian
+ * uint16_t in 'buffer'. Consumers must check 'format' before
+ * interpreting the buffer or sizing uploads. */
+enum font_atlas_format
+{
+   FONT_ATLAS_FORMAT_A8 = 0,
+   FONT_ATLAS_FORMAT_A16
+};
+
+#define FONT_ATLAS_DIRTY_MAX 16
+
 struct font_atlas
 {
-   uint8_t *buffer; /* Alpha channel. */
+   uint8_t *buffer; /* Coverage samples; layout per 'format'. */
    unsigned width;
    unsigned height;
+   /* Dirty region in pixels, covering every glyph cell updated since
+    * the consumer last cleared the dirty flag: its top-left corner and
+    * its exclusive bottom-right one, each x and y in VIDEO_SCALE_PACK's
+    * layout (read with VIDEO_SCALE_W/H), only meaningful while dirty is
+    * set. Consumers may upload just this region (or any superset of
+    * it, such as the full-width row band) instead of the whole atlas. */
+   unsigned dirty_xy0;
+   unsigned dirty_xy1;
+   /* The same region as up to FONT_ATLAS_DIRTY_MAX rectangles, each its
+    * two corners as above, so cells far apart are not sent with all
+    * between them; read through font_atlas_dirty_rect(). 0 when only
+    * the corners above describe it. */
+   unsigned dirty_rect[FONT_ATLAS_DIRTY_MAX][2];
+   unsigned dirty_rects;
+   /* Set by the consumer to the largest texture it can make, packed
+    * with VIDEO_SCALE_PACK. When a frame needs more glyphs than the
+    * atlas has cells for, the next get_atlas() call in a later frame
+    * grows the atlas - width and height, never past these - and the
+    * consumer remakes its texture at the new size. Zero, the default,
+    * keeps the atlas at its first size. Cells only ever get added: a
+    * glyph's offsets never change. */
+   unsigned max_dims;
+   enum font_atlas_format format;
    bool dirty;
 };
 
@@ -315,6 +546,21 @@ struct font_params
 
    /* ABGR. Use the macros. */
    uint32_t color;
+
+   /* Optional full-precision colour. When non-NULL it points to 4 floats
+    * (R, G, B, A, each 0..1) that take precedence over the 8-bit 'color'
+    * above, letting a caller drive text at more than 8 bits per channel on a
+    * deep-colour (e.g. 10-bit) framebuffer. NULL means "use 'color'".
+    *
+    * Only honoured by font backends that opt in; the rest ignore it and use
+    * 'color', so it is always safe to leave set or unset. Because most
+    * font_params are built field by field, a producer that wants to use this
+    * MUST set it explicitly (to NULL or to a valid array) - do not assume it
+    * is zero-initialised. It is only ever read by backends fed from the
+    * central builders that initialise it (the menu text path and the OSD
+    * stat params), so an uninitialised value at other sites is never
+    * dereferenced. */
+   const float *color_hp;
 
    float x;
    float y;
@@ -336,14 +582,14 @@ struct font_line_metrics
    float descender;
 };
 
+/* A pass in the FBO chain, its three sizes each in VIDEO_SCALE_PACK's
+ * layout: what the pass renders this frame, the largest it renders at
+ * any input size, and the texture that holds it. */
 struct video_fbo_rect
 {
-   unsigned img_width;
-   unsigned img_height;
-   unsigned max_img_width;
-   unsigned max_img_height;
-   unsigned width;
-   unsigned height;
+   unsigned img_dims;
+   unsigned max_img_dims;
+   unsigned dims;
 };
 
 struct video_ortho

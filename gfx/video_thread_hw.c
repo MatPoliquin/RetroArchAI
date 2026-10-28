@@ -1,0 +1,1751 @@
+/*  RetroArch - A frontend for libretro.
+ *  Copyright (C) 2026 - libretroadmin
+ *
+ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
+ *  of the GNU General Public License as published by the Free Software Found-
+ *  ation, either version 3 of the License, or (at your option) any later version.
+ *
+ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ *  PURPOSE.  See the GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along with RetroArch.
+ *  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* See video_thread_hw.h. */
+
+#include <stdlib.h>
+#include <string.h>
+
+#include <string/stdstring.h>
+
+#include "video_driver.h"
+#include "video_thread_wrapper.h"
+#include "video_thread_hw.h"
+#include "video_thread_hw_fence.h"
+#include "gfx_instrument.h"
+#ifdef HAVE_TEMPORAL_UPSCALER
+#include "video_upscaler.h"
+#endif
+#include "../configuration.h"
+#include "../verbosity.h"
+
+#ifdef HAVE_THREADS
+
+#ifdef HAVE_VULKAN
+#include <libretro_vulkan.h>
+#endif
+#ifdef HAVE_D3D12
+#include <libretro_d3d12.h>
+#include "common/d3d12_hw_interface.h"
+#endif
+#ifdef HAVE_D3D11
+#include <libretro_d3d11.h>
+#include "common/d3d11_hw_interface.h"
+#endif
+/* The d3d9_hlsl driver's, which is the one with the interface */
+#if defined(HAVE_D3D9) && defined(HAVE_HLSL) && !defined(_XBOX)
+#define VIDEO_THREAD_HW_D3D9 1
+#include <libretro_d3d9.h>
+#endif
+
+#if defined(HAVE_VULKAN) || defined(HAVE_D3D12) || defined(HAVE_D3D11) \
+   || defined(VIDEO_THREAD_HW_D3D9) \
+   || defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#define VIDEO_THREAD_HW_ANY 1
+#endif
+
+#ifdef VIDEO_THREAD_HW_ANY
+
+typedef struct
+{
+#ifdef HAVE_VULKAN
+   /* Vulkan: what the core handed over for this slot. The image is a
+    * copy: the core's own struct may be rewritten for its next frame
+    * while the video thread is still driving the driver with this one. */
+   struct retro_vulkan_image image;
+   VkSemaphore          *semaphores;
+   VkPipelineStageFlags *wait_stages;
+   VkCommandBuffer      *cmd;
+   unsigned         num_semaphores;
+   unsigned         cap_semaphores;
+   unsigned         num_cmd;
+   unsigned         cap_cmd;
+   uint32_t         src_queue_family;
+   bool             has_image;
+#endif
+#ifdef HAVE_D3D12
+   /* Direct3D 12: the texture the core set for this frame, and its
+    * format. The driver copies it into the slot's own texture at
+    * publish; after that the core may do what it likes with its own. */
+   const void      *texture;
+   unsigned         format;
+   /* Version 2 (set_texture_fenced): the driver reads the core's own
+    * texture, once `fence` has reached `value`; nothing is copied. The
+    * slot holds a reference to both until it is handed over again. */
+   ID3D12Resource  *v2_texture;
+   ID3D12Fence     *v2_fence;
+   UINT64           v2_value;
+   bool             v2;
+#endif
+#ifdef HAVE_D3D11
+   /* Direct3D 11, interface version 2: the texture the core named with
+    * set_texture for this frame. Not referenced: the driver copies it at
+    * publish, inside the video_refresh the core called with it. */
+   ID3D11Texture2D *d3d11_texture;
+   /* Version 3: the texture is the core's own and is read directly. The
+    * slot holds a reference from publish until it is handed over again. */
+   ID3D11Texture2D *d3d11_direct;
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+   /* Direct3D 9: the core's texture for the slot. Not referenced: that
+    * is device work, which only the device's holder may do. */
+   IDirect3DTexture9 *d3d9_texture;
+#endif
+   /* Armed by the video thread after every frame it drives the driver
+    * with from this slot, and by the core's thread behind a frame it
+    * took back; the next user of the slot waits it first. Handed
+    * between the two threads lock-free: video_thread_hw_fence.h. */
+   hw_fence_t       fence;
+#ifdef HAVE_TEMPORAL_UPSCALER
+   /* The temporal upscaler's inputs the core set for this frame, a
+    * copy: the core rewrites its own for its next frame while the
+    * video thread is still presenting this one, and the driver takes
+    * them inside its frame call, on that thread. */
+   struct retro_hw_upscaler_inputs upscaler;
+   bool             has_upscaler;
+#endif
+} hw_slot_t;
+
+enum hw_api
+{
+   HW_API_NONE = 0,
+   HW_API_VULKAN,
+   HW_API_D3D12,
+   HW_API_D3D11,
+   HW_API_D3D9,
+   HW_API_GL
+};
+
+typedef struct
+{
+   union
+   {
+#ifdef HAVE_VULKAN
+      struct retro_hw_render_interface_vulkan vk;
+#endif
+#ifdef HAVE_D3D12
+      struct retro_hw_render_interface_d3d12  d3d12;
+#endif
+#ifdef HAVE_D3D11
+      struct retro_hw_render_interface_d3d11  d3d11;
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+      struct retro_hw_render_interface_d3d9   d3d9;
+#endif
+      /* OpenGL interposes nothing; this keeps the union non-empty on
+       * a build with only OpenGL. */
+      struct retro_hw_render_interface        base;
+   } iface;
+   /* OpenGL: the driver's handle for the core's context; Direct3D 11:
+    * the proxy in front of the core's deferred context. Both from
+    * hw_ring_context_new. */
+   void *core_ctx;
+   /* Direct3D 11, interface version 2: the core holds the immediate
+    * context, by taking turns with the driver; there is no core_ctx.
+    * Version 3 on top of that: frames are not copied into the slots. */
+   bool  d3d11_v2;
+   /* The interface version last reported in the log. A core may ask for
+    * the interface more than once - when it first needs the context, and
+    * again when it builds its device - and gets the same answer each
+    * time; the log says it once per ring, or again if it ever changed. */
+   unsigned logged_version;
+   const struct retro_hw_render_interface *real;
+   hw_slot_t slot[VIDEO_THREAD_HW_RING];
+   /* The core's current sync index: the slot it is rendering into.
+    * Main thread only between pushes; the push moves it. */
+   unsigned  index;
+   /* OpenGL: the slot whose framebuffer the core last asked for, and
+    * whether it asked since the last publish. A core that caches the
+    * framebuffer from context_reset renders into that slot whatever
+    * index says, so the ring stays on it (#19727). */
+   unsigned  gl_fbo_slot;
+   bool      gl_queried;
+   /* The slot the video thread last drew a real frame from, or -1. A
+    * dupe (video_refresh(NULL)) draws it again, and on Vulkan so does
+    * a software frame, so it is what they fence and what the core is
+    * not given. Written by the video thread when it claims a frame;
+    * read by the push. */
+   retro_atomic_int_t last_presented;
+   enum hw_api api;
+   thread_video_t *thr;
+#ifdef HAVE_VULKAN
+   /* For waiting a dropped frame's semaphores, see video_thread_hw_drop. */
+   PFN_vkQueueSubmit queue_submit;
+#endif
+   /* OpenGL on a context that cannot share (one GL context per process):
+    * the driver's one context is handed between the threads. The owner
+    * word, moved only by compare-and-swap, holds who has it
+    * (HW_CTX_HOLDER: FREE, MAIN or VIDEO), HW_CTX_GRANT while a release
+    * has handed it to a holder that has not bound it yet, and the
+    * HW_CTX_WANT bit of a thread parked on ctx_free waiting for it. A
+    * release goes to the thread that asked, never back to the free
+    * pool, so a waiter has it after the other thread's current hold
+    * and no later. The main thread holds it around the core's work,
+    * the video thread around a pass of its loop. */
+   retro_atomic_int_t  ctx_owner;
+   retro_eventcount_t  ctx_free;
+   bool                handoff;
+} hw_ring_t;
+
+#define HW_CTX_FREE      0
+#define HW_CTX_MAIN      1
+#define HW_CTX_VIDEO     2
+#define HW_CTX_HOLDER    3
+#define HW_CTX_GRANT     4
+#define HW_CTX_WANT(who) (4 << (who))
+
+static hw_ring_t *hw_handoff_ring(thread_video_t *thr);
+
+/* Give the context up on the calling thread `me`, if it holds it:
+ * unbound here first, since a context current on this thread cannot be
+ * made current on the other. It goes to the other thread when that
+ * thread asked for it, or when `give` says it will take it - only for
+ * a thread certain to call video_thread_hw_ctx_take(), since nothing
+ * else ends a grant. True when it was held. */
+static bool hw_ctx_hand(hw_ring_t *ring, int me, bool give)
+{
+   int other = HW_CTX_MAIN + HW_CTX_VIDEO - me;
+   int v     = retro_atomic_load_acquire_int(&ring->ctx_owner);
+   if ((v & (HW_CTX_HOLDER | HW_CTX_GRANT)) != me)
+      return false;
+   video_context_driver_release_current();
+   /* Only the other thread moves the word meanwhile, and only to ask */
+   while (!retro_atomic_cas_int(&ring->ctx_owner, v,
+            (give || (v & HW_CTX_WANT(other)))
+            ? (other | HW_CTX_GRANT) : HW_CTX_FREE))
+      v = retro_atomic_load_acquire_int(&ring->ctx_owner);
+   retro_eventcount_notify(&ring->ctx_free);
+   return true;
+}
+
+#ifdef HAVE_VULKAN
+/* The Vulkan interface a core is handed under the wrapper. It is kept
+ * here, not in the ring it describes, for the reason the driver keeps
+ * its own in static storage (vulkan_hw_iface in drivers/vulkan.c): a
+ * core that asked the frontend to keep its context (cache_context) is
+ * not told when the video is restarted, and goes on with the pointer it
+ * was given. The ring is freed with the wrapper; this is not.
+ *
+ * The handle is the wrapper. video_thread_hw_free() clears it, so that
+ * a call landing between one wrapper and the next finds no ring and
+ * does nothing, and video_thread_get_hw_render_interface() fills the
+ * whole of it in again for the next wrapper - which the frontend asks
+ * for after a restart that did not reset the core
+ * (video_driver_hw_render_interface_kept()). */
+static struct retro_hw_render_interface_vulkan hw_vk_core_iface;
+#endif
+
+static hw_ring_t *hw_ring_of(void *handle)
+{
+   thread_video_t *thr = (thread_video_t*)handle;
+   return thr ? (hw_ring_t*)thr->frame.hw_ring : NULL;
+}
+
+/* Waits a slot's fence on the core's thread. On Apple, in slices with
+ * the main-thread pump between: the video thread may need the main
+ * thread to run a job before it can signal - a swapchain rebuild
+ * marshalled through the Cocoa trampoline - and an unbounded wait here
+ * left both threads waiting on each other, reported as the trampoline
+ * stalling with a Vulkan core. Everywhere else there is no trampoline
+ * and nothing to pump, so the wait is the single unbounded one it was:
+ * the slices are a cost only the platform that needs them pays. */
+static void hw_wait_slot(hw_ring_t *ring, unsigned i)
+{
+   hw_slot_t *s        = &ring->slot[i];
+   thread_video_t *thr = ring->thr;
+   if (!thr->poke || !thr->poke->hw_ring_fence_wait)
+      return;
+#ifdef __APPLE__
+   while (!hw_fence_wait(&s->fence, thr->poke->hw_ring_fence_wait,
+            thr->driver_data, 2000))
+      video_thread_main_pump();
+#else
+   hw_fence_wait(&s->fence, thr->poke->hw_ring_fence_wait,
+         thr->driver_data, HW_RING_WAIT_FOREVER);
+#endif
+}
+
+/* --- Vulkan: the core's side, main thread ----------------------------- */
+#ifdef HAVE_VULKAN
+
+static uint32_t hw_get_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   return ring ? ring->index : 0;
+}
+
+static uint32_t hw_get_sync_index_mask(void *handle)
+{
+   (void)handle;
+   return (1u << VIDEO_THREAD_HW_RING) - 1;
+}
+
+static void hw_wait_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (ring)
+      hw_wait_slot(ring, ring->index);
+}
+
+static void hw_set_image(void *handle,
+      const struct retro_vulkan_image *image,
+      uint32_t num_semaphores, const VkSemaphore *semaphores,
+      uint32_t src_queue_family)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   hw_slot_t *s;
+   uint32_t i;
+   if (!ring)
+      return;
+   s = &ring->slot[ring->index];
+   if (image)
+   {
+      s->image     = *image;
+      s->has_image = true;
+   }
+   else
+   {
+      s->has_image = false;
+      /* A core that withdraws its image means every frame after this
+       * one, dupes included - that is what the call does without the
+       * wrapper, where it writes the driver's state directly. Here it
+       * only reached the slot the core fills next, which is not the
+       * one a dupe re-reads: the ring went on handing the driver the
+       * last presented image, and a core that withdraws it to destroy
+       * it had it drawn from afterwards. */
+      video_thread_invalidate_hw_render_cache(ring->thr);
+   }
+   if (num_semaphores > s->cap_semaphores)
+   {
+      VkSemaphore *grown = (VkSemaphore*)realloc(s->semaphores,
+            sizeof(*grown) * num_semaphores);
+      VkPipelineStageFlags *stages;
+      if (grown)
+         s->semaphores = grown;
+      stages = (VkPipelineStageFlags*)realloc(s->wait_stages,
+            sizeof(*stages) * num_semaphores);
+      if (stages)
+         s->wait_stages = stages;
+      if (!grown || !stages)
+      {
+         s->num_semaphores = 0;
+         return;
+      }
+      s->cap_semaphores = num_semaphores;
+   }
+   if (num_semaphores)
+   {
+      memcpy(s->semaphores, semaphores, sizeof(*semaphores) * num_semaphores);
+      for (i = 0; i < num_semaphores; i++)
+         s->wait_stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+   }
+   s->num_semaphores   = num_semaphores;
+   s->src_queue_family = src_queue_family;
+}
+
+static void hw_set_command_buffers(void *handle, uint32_t num_cmd,
+      const VkCommandBuffer *cmd)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   hw_slot_t *s;
+   if (!ring)
+      return;
+   s = &ring->slot[ring->index];
+   if (num_cmd > s->cap_cmd)
+   {
+      VkCommandBuffer *grown = (VkCommandBuffer*)realloc(s->cmd,
+            sizeof(*grown) * num_cmd);
+      if (!grown)
+      {
+         s->num_cmd = 0;
+         return;
+      }
+      s->cmd     = grown;
+      s->cap_cmd = num_cmd;
+   }
+   if (num_cmd)
+      memcpy(s->cmd, cmd, sizeof(*cmd) * num_cmd);
+   s->num_cmd = num_cmd;
+}
+
+/* Forwarded: the driver serialises queue use for cores that submit from
+ * other threads, which is exactly the situation here. */
+static void hw_lock_queue(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_vulkan *real;
+   if (!ring)
+      return;
+   real = (const struct retro_hw_render_interface_vulkan*)ring->real;
+   if (real->lock_queue)
+      real->lock_queue(real->handle);
+}
+
+static void hw_unlock_queue(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_vulkan *real;
+   if (!ring)
+      return;
+   real = (const struct retro_hw_render_interface_vulkan*)ring->real;
+   if (real->unlock_queue)
+      real->unlock_queue(real->handle);
+}
+
+static void hw_set_signal_semaphore(void *handle, VkSemaphore semaphore)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_vulkan *real;
+   if (!ring)
+      return;
+   real = (const struct retro_hw_render_interface_vulkan*)ring->real;
+   if (real->set_signal_semaphore)
+      real->set_signal_semaphore(real->handle, semaphore);
+}
+#endif /* HAVE_VULKAN */
+
+#if defined(HAVE_VULKAN) || defined(HAVE_D3D11) || defined(HAVE_D3D12) \
+   || defined(VIDEO_THREAD_HW_D3D9) || defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+/* --- slots that are the core's own texture -----------------------------
+ * Vulkan, libretro_d3d12.h version 2 and libretro_d3d11.h version 3:
+ * nothing is copied into the slot, the driver reads the core's image or
+ * texture itself. */
+
+/* Whether a frame the video thread is drawing, or has yet to claim,
+ * names ring slot i, given the ring word 'st'. The pending frame is
+ * tail, both are pending at two, and the one being drawn is tail ^ 1.
+ * The slots' hw_slot fields are this thread's own writes. */
+static bool hw_slot_queued(const thread_video_t *thr, unsigned i, int st)
+{
+   const hw_ring_t *ring = (const hw_ring_t*)thr->frame.hw_ring;
+   unsigned w;
+   unsigned tail    = VIDEO_THREAD_RING_TAIL_OF(st);
+   unsigned pending = VIDEO_THREAD_RING_PENDING_OF(st);
+   bool busy        = VIDEO_THREAD_RING_BUSY_OF(st);
+   for (w = 0; w < 2; w++)
+   {
+      /* Dupes select the last presented texture when they are drawn. */
+      if (thr->frame.slot[w].hw_slot != (int)i
+            && (!thr->frame.slot[w].dupe || !ring
+               || retro_atomic_load_acquire_int(&ring->last_presented) != (int)i))
+         continue;
+      if (     pending == 2
+            || (pending == 1 && w == tail)
+            || (busy && w == (tail ^ 1)))
+         return true;
+   }
+   return false;
+}
+
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12) || defined(VIDEO_THREAD_HW_D3D9) \
+   || defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+/* The wait itself, for any slot that is the core's own texture: parks
+ * on the ring until the word has moved and the slot is no longer
+ * named. */
+static void hw_wait_queued(hw_ring_t *ring, unsigned i)
+{
+   thread_video_t *thr = ring->thr;
+   for (;;)
+   {
+      int st  = retro_atomic_load_acquire_int(&thr->frame.state);
+      int key;
+      if (!hw_slot_queued(thr, i, st))
+         return;
+      key = retro_eventcount_prepare_wait(&thr->frame.ring);
+      if (retro_atomic_load_acquire_int(&thr->frame.state) != st)
+      {
+         retro_eventcount_cancel_wait(&thr->frame.ring);
+         continue;
+      }
+      retro_eventcount_commit_wait(&thr->frame.ring, key);
+   }
+}
+#endif
+
+#ifdef HAVE_VULKAN
+/* The slot the core renders into after `published`. The frame being
+ * drawn names the slot last presented, and so does every dupe and
+ * software frame drawn after it (video_thread_hw_dupe_slot), so the
+ * core takes the third slot. A frame queued on it that the video
+ * thread has not claimed is taken back, as the push replaces one
+ * (video_thread_ring_pick), and its semaphores waited: the core runs
+ * ahead of a slow presenter instead of waiting for it. Only a claim
+ * seen halfway - the ring word moved, the slot last presented not yet -
+ * is waited out; the claim stores both before it notifies. */
+static unsigned hw_vk_next_slot(hw_ring_t *ring, unsigned published,
+      unsigned *taken_back)
+{
+   thread_video_t *thr = ring->thr;
+   for (;;)
+   {
+      int st           = retro_atomic_load_acquire_int(&thr->frame.state);
+      int last         = retro_atomic_load_acquire_int(&ring->last_presented);
+      unsigned tail    = VIDEO_THREAD_RING_TAIL_OF(st);
+      unsigned pending = VIDEO_THREAD_RING_PENDING_OF(st);
+      bool busy        = VIDEO_THREAD_RING_BUSY_OF(st);
+      unsigned next    = (published + 1) % VIDEO_THREAD_HW_RING;
+      int key;
+      if ((int)next == last)
+         next = (next + 1) % VIDEO_THREAD_HW_RING;
+      if (!hw_slot_queued(thr, next, st))
+         return next;
+      /* Unclaimed frames on it: take back the newest, the one a push
+       * replaces. A dupe or software frame behind a frame on the slot
+       * reads it once that is drawn, so it goes first. */
+      if (     pending
+            && hw_slot_queued(thr, next,
+               VIDEO_THREAD_RING_MAKE(tail, pending, false)))
+      {
+         unsigned newest = (pending == 2) ? (tail ^ 1) : tail;
+         if (retro_atomic_cas_int(&thr->frame.state, st,
+                  VIDEO_THREAD_RING_MAKE(tail, pending - 1, busy)))
+         {
+            (*taken_back)++;
+            video_thread_hw_drop(thr, thr->frame.slot[newest].hw_slot);
+         }
+         continue;
+      }
+      key = retro_eventcount_prepare_wait(&thr->frame.ring);
+      if (     retro_atomic_load_acquire_int(&thr->frame.state) != st
+            || retro_atomic_load_acquire_int(&ring->last_presented) != last)
+      {
+         retro_eventcount_cancel_wait(&thr->frame.ring);
+         continue;
+      }
+#ifdef __APPLE__
+      retro_eventcount_commit_wait_timeout(&thr->frame.ring, key, 1000);
+      video_thread_main_pump();
+#else
+      retro_eventcount_commit_wait(&thr->frame.ring, key);
+#endif
+   }
+}
+#endif
+#endif
+
+/* --- Direct3D 12: the core's side, main thread ------------------------ */
+#ifdef HAVE_D3D12
+static void hw_d3d12_slot_release_v2(hw_slot_t *s);
+static void hw_d3d12_wait_queued(hw_ring_t *ring, unsigned i);
+
+static void hw_d3d12_set_texture(void *handle, ID3D12Resource *texture,
+      DXGI_FORMAT format)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   hw_slot_t *s;
+   if (!ring)
+      return;
+   s          = &ring->slot[ring->index];
+   s->texture = texture;
+   s->format  = (unsigned)format;
+   /* A version 1 handoff, whatever the slot carried before. */
+   if (s->v2)
+   {
+      hw_d3d12_wait_queued(ring, ring->index);
+      hw_wait_slot(ring, ring->index);
+      hw_d3d12_slot_release_v2(s);
+   }
+}
+
+/* --- Direct3D 12, interface version 2 ----------------------------------
+ * The core keeps one present texture per ring slot and says when each is
+ * complete; the wrapper says when it is done with it. No copy. */
+
+/* The slot's fence says the video thread has driven the driver with the
+ * slot and the GPU is done. It says nothing until then: a frame that is
+ * queued but not yet claimed, or claimed and still being recorded, has
+ * armed no fence. With a copy per slot that window costs nothing - the
+ * copy is simply replaced by a newer one. With version 2 the slot IS the
+ * core's texture, and a core let back in during that window draws into
+ * a texture the frame about to be recorded will read. So for version 2
+ * the wait covers the window too: until no queued frame names the slot.
+ * The video thread notifies the ring when it claims a frame and when
+ * it finishes one. */
+static void hw_d3d12_wait_queued(hw_ring_t *ring, unsigned i)
+{
+   if (!ring->slot[i].v2)
+      return;
+   hw_wait_queued(ring, i);
+}
+
+
+static void hw_d3d12_slot_release_v2(hw_slot_t *s)
+{
+   if (s->v2_texture)
+      s->v2_texture->lpVtbl->Release(s->v2_texture);
+   if (s->v2_fence)
+      s->v2_fence->lpVtbl->Release(s->v2_fence);
+   s->v2_texture = NULL;
+   s->v2_fence   = NULL;
+   s->v2_value   = 0;
+   s->v2         = false;
+}
+
+static unsigned hw_d3d12_get_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   return ring ? ring->index : 0;
+}
+
+static unsigned hw_d3d12_get_sync_index_mask(void *handle)
+{
+   (void)handle;
+   return (1u << VIDEO_THREAD_HW_RING) - 1;
+}
+
+static void hw_d3d12_wait_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (!ring)
+      return;
+   hw_d3d12_wait_queued(ring, ring->index);
+   hw_wait_slot(ring, ring->index);
+}
+
+/* Main thread. The slot's previous frame is done with - the core called
+ * wait_sync_index, and publish waited the slot before moving onto it -
+ * so its references can go. */
+static void hw_d3d12_set_texture_fenced(void *handle, ID3D12Resource *texture,
+      DXGI_FORMAT format, ID3D12Fence *fence, UINT64 value)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   hw_slot_t *s;
+   if (!ring)
+      return;
+   s = &ring->slot[ring->index];
+   hw_d3d12_wait_queued(ring, ring->index);
+   hw_wait_slot(ring, ring->index);
+   hw_d3d12_slot_release_v2(s);
+   if (!texture)
+      return;
+   texture->lpVtbl->AddRef(texture);
+   if (fence)
+      fence->lpVtbl->AddRef(fence);
+   s->v2_texture = texture;
+   s->v2_fence   = fence;
+   s->v2_value   = value;
+   s->format     = (unsigned)format;
+   s->v2         = true;
+}
+#endif /* HAVE_D3D12 */
+
+#ifdef HAVE_D3D11
+/* --- Direct3D 11, interface version 2 ----------------------------------
+ * The lock is the driver's, and so is what it reports; the ring only
+ * stands where the core expects its handle and remembers the frame. */
+
+static bool hw_d3d11_lock_context(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_d3d11 *real = ring
+      ? (const struct retro_hw_render_interface_d3d11*)ring->real : NULL;
+   return real ? real->lock_context(real->handle) : false;
+}
+
+static void hw_d3d11_unlock_context(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_d3d11 *real = ring
+      ? (const struct retro_hw_render_interface_d3d11*)ring->real : NULL;
+   if (real)
+      real->unlock_context(real->handle);
+}
+
+static void hw_d3d11_set_texture(void *handle, ID3D11Texture2D *texture)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (ring)
+      ring->slot[ring->index].d3d11_texture = texture;
+}
+
+/* --- Direct3D 11, interface version 3 ----------------------------------
+ * The core keeps a present texture per ring slot, the driver reads it
+ * where it used to read the slot's copy, and the core waits here before
+ * it draws into one again. */
+
+static void hw_d3d11_slot_release_direct(hw_slot_t *s)
+{
+   if (s->d3d11_direct)
+      s->d3d11_direct->lpVtbl->Release(s->d3d11_direct);
+   s->d3d11_direct = NULL;
+}
+
+static unsigned hw_d3d11_get_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   return ring ? ring->index : 0;
+}
+
+static unsigned hw_d3d11_get_sync_index_mask(void *handle)
+{
+   (void)handle;
+   return (1u << VIDEO_THREAD_HW_RING) - 1;
+}
+
+/* Until no queued frame names the slot, and the video thread has issued
+ * its read of the one that did: see hw_wait_queued. The slot's fence is
+ * a CPU event the video thread sets once its frame call has returned,
+ * and on one context that is all "done" has to mean. */
+static void hw_d3d11_wait_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (!ring)
+      return;
+   hw_wait_queued(ring, ring->index);
+   hw_wait_slot(ring, ring->index);
+}
+#endif /* HAVE_D3D11 */
+
+#ifdef VIDEO_THREAD_HW_D3D9
+/* --- Direct3D 9 --------------------------------------------------------
+ * The turns on the device are the driver's; the ring gives the core its
+ * sync index and remembers each slot's texture. */
+
+static bool hw_d3d9_lock_context(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_d3d9 *real = ring
+      ? (const struct retro_hw_render_interface_d3d9*)ring->real : NULL;
+   return real ? real->lock_context(real->handle) : false;
+}
+
+static void hw_d3d9_unlock_context(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_d3d9 *real = ring
+      ? (const struct retro_hw_render_interface_d3d9*)ring->real : NULL;
+   if (real)
+      real->unlock_context(real->handle);
+}
+
+/* Called holding the device, so it must not wait for the video thread */
+static void hw_d3d9_set_texture(void *handle, IDirect3DTexture9 *texture)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (ring)
+      ring->slot[ring->index].d3d9_texture = texture;
+}
+
+static unsigned hw_d3d9_get_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   return ring ? ring->index : 0;
+}
+
+static unsigned hw_d3d9_get_sync_index_mask(void *handle)
+{
+   (void)handle;
+   return (1u << VIDEO_THREAD_HW_RING) - 1;
+}
+
+static void hw_d3d9_wait_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (!ring)
+      return;
+   hw_wait_queued(ring, ring->index);
+   hw_wait_slot(ring, ring->index);
+}
+#endif /* VIDEO_THREAD_HW_D3D9 */
+
+/* --- the wrapper's side ---------------------------------------------- */
+
+static bool hw_ring_setup(thread_video_t *thr, hw_ring_t **out)
+{
+   hw_ring_t *ring;
+   unsigned i;
+   if ((ring = (hw_ring_t*)thr->frame.hw_ring))
+   {
+      *out = ring;
+      return true;
+   }
+   if (!(ring = (hw_ring_t*)calloc(1, sizeof(*ring))))
+      return false;
+   ring->thr            = thr;
+   retro_atomic_int_init(&ring->last_presented, -1);
+   retro_atomic_int_init(&ring->ctx_owner, HW_CTX_FREE);
+   retro_eventcount_init(&ring->ctx_free);
+   for (i = 0; i < VIDEO_THREAD_HW_RING; i++)
+      hw_fence_init(&ring->slot[i].fence);
+   for (i = 0; i < VIDEO_THREAD_HW_RING * HW_FENCE_CELLS; i++)
+   {
+      if (!thr->poke->hw_ring_fence_new(thr->driver_data,
+               &ring->slot[i / HW_FENCE_CELLS].fence.cell[i % HW_FENCE_CELLS]))
+      {
+         unsigned j;
+         for (j = 0; j < i; j++)
+            thr->poke->hw_ring_fence_free(thr->driver_data,
+                  ring->slot[j / HW_FENCE_CELLS].fence.cell[j % HW_FENCE_CELLS]);
+         free(ring);
+         return false;
+      }
+   }
+   thr->frame.hw_ring = ring;
+   RARCH_LOG("[Video] Threaded video: hardware core on a %u-slot ring.\n",
+         VIDEO_THREAD_HW_RING);
+   *out = ring;
+   return true;
+}
+
+bool video_thread_get_hw_render_interface(void *data,
+      const struct retro_hw_render_interface **iface)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   const struct retro_hw_render_interface *real = NULL;
+#if defined(HAVE_VULKAN) || defined(HAVE_D3D12) || defined(HAVE_D3D11) \
+   || defined(VIDEO_THREAD_HW_D3D9)
+   hw_ring_t *ring;
+#endif
+
+   if (!thr || !iface)
+      return false;
+   if (!thr->poke || !thr->poke->get_hw_render_interface
+         || !thr->poke->hw_ring_fence_new
+         || !thr->poke->hw_ring_fence_wait
+         || !thr->poke->hw_ring_fence_signal)
+      return false;
+   if (!thr->poke->get_hw_render_interface(thr->driver_data, &real) || !real)
+      return false;
+
+   switch (real->interface_type)
+   {
+#ifdef HAVE_VULKAN
+      case RETRO_HW_RENDER_INTERFACE_VULKAN:
+         if (!thr->poke->hw_ring_install)
+            return false;
+         if (!hw_ring_setup(thr, &ring))
+            return false;
+         ring->api                           = HW_API_VULKAN;
+         ring->real                          = real;
+         /* The driver's interface, with the bookkeeping redirected
+          * here. The handle the core sees is the wrapper. */
+         ring->iface.vk                      = *(const struct retro_hw_render_interface_vulkan*)real;
+         ring->iface.vk.handle               = thr;
+         ring->iface.vk.set_image            = hw_set_image;
+         ring->iface.vk.get_sync_index       = hw_get_sync_index;
+         ring->iface.vk.get_sync_index_mask  = hw_get_sync_index_mask;
+         ring->iface.vk.wait_sync_index      = hw_wait_sync_index;
+         ring->iface.vk.set_command_buffers  = hw_set_command_buffers;
+         ring->iface.vk.lock_queue           = hw_lock_queue;
+         ring->iface.vk.unlock_queue         = hw_unlock_queue;
+         ring->iface.vk.set_signal_semaphore = hw_set_signal_semaphore;
+         if (ring->iface.vk.get_device_proc_addr)
+            ring->queue_submit = (PFN_vkQueueSubmit)
+               ring->iface.vk.get_device_proc_addr(ring->iface.vk.device,
+                     "vkQueueSubmit");
+         /* What the core holds: see hw_vk_core_iface. */
+         hw_vk_core_iface = ring->iface.vk;
+         *iface = (const struct retro_hw_render_interface*)&hw_vk_core_iface;
+         return true;
+#endif
+#ifdef HAVE_D3D12
+      case RETRO_HW_RENDER_INTERFACE_D3D12:
+         if (!thr->poke->hw_ring_capture || !thr->poke->hw_ring_present_slot)
+            return false;
+         if (!hw_ring_setup(thr, &ring))
+            return false;
+         ring->api                     = HW_API_D3D12;
+         ring->real                    = real;
+         /* Device, queue and compiler pass straight through; only the
+          * texture handoff is redirected. */
+         ring->iface.d3d12             = *(const struct retro_hw_render_interface_d3d12*)real;
+         ring->iface.d3d12.handle      = thr;
+         ring->iface.d3d12.set_texture = hw_d3d12_set_texture;
+         /* Version 2 for a core that asked for it, and only if the
+          * driver can take the core's texture as it is. Everything the
+          * struct copy above brought along from the driver's own version
+          * 2 is replaced: the ring answers for the sync index. */
+         ring->iface.d3d12.interface_version   = RETRO_HW_RENDER_INTERFACE_D3D12_VERSION;
+         ring->iface.d3d12.get_sync_index      = NULL;
+         ring->iface.d3d12.get_sync_index_mask = NULL;
+         ring->iface.d3d12.wait_sync_index     = NULL;
+         ring->iface.d3d12.set_texture_fenced  = NULL;
+         if (     thr->poke->hw_ring_install
+               && d3d12_hw_interface_negotiated_version()
+                  >= RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2)
+         {
+            ring->iface.d3d12.interface_version   = RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2;
+            ring->iface.d3d12.get_sync_index      = hw_d3d12_get_sync_index;
+            ring->iface.d3d12.get_sync_index_mask = hw_d3d12_get_sync_index_mask;
+            ring->iface.d3d12.wait_sync_index     = hw_d3d12_wait_sync_index;
+            ring->iface.d3d12.set_texture_fenced  = hw_d3d12_set_texture_fenced;
+            if (ring->logged_version != RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2)
+            {
+               ring->logged_version = RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2;
+               RARCH_LOG("[Video] Threaded video: D3D12 hardware render interface version 2, no frame copy.\n");
+            }
+         }
+         *iface = (const struct retro_hw_render_interface*)&ring->iface.d3d12;
+         return true;
+#endif
+#ifdef HAVE_D3D11
+      case RETRO_HW_RENDER_INTERFACE_D3D11:
+         if (!thr->poke->hw_ring_capture || !thr->poke->hw_ring_present_slot
+               || !thr->poke->hw_ring_context_new)
+            return false;
+         if (!hw_ring_setup(thr, &ring))
+            return false;
+         /* hw_ring_install is how the texture is handed over without a
+          * copy, which is all version 2 is; without it the core gets
+          * version 1. */
+         if (     thr->poke->hw_ring_install
+               && ((const struct retro_hw_render_interface_d3d11*)real)->interface_version
+                  >= RETRO_HW_RENDER_INTERFACE_D3D11_VERSION_2
+               && d3d11_hw_interface_negotiated_version()
+                  >= RETRO_HW_RENDER_INTERFACE_D3D11_VERSION_2)
+         {
+            /* Version 2: the core gets the immediate context itself and
+             * takes turns on it with the driver. No deferred context, no
+             * proxy, no command list to replay - and everything a
+             * deferred context cannot do, reading back above all, works. */
+            ring->api                          = HW_API_D3D11;
+            ring->real                         = real;
+            ring->d3d11_v2                     = true;
+            ring->iface.d3d11                  = *(const struct retro_hw_render_interface_d3d11*)real;
+            ring->iface.d3d11.handle           = thr;
+            ring->iface.d3d11.lock_context     = hw_d3d11_lock_context;
+            ring->iface.d3d11.unlock_context   = hw_d3d11_unlock_context;
+            ring->iface.d3d11.set_texture      = hw_d3d11_set_texture;
+            ring->iface.d3d11.interface_version   = RETRO_HW_RENDER_INTERFACE_D3D11_VERSION_2;
+            ring->iface.d3d11.get_sync_index      = hw_d3d11_get_sync_index;
+            ring->iface.d3d11.get_sync_index_mask = hw_d3d11_get_sync_index_mask;
+            ring->iface.d3d11.wait_sync_index     = hw_d3d11_wait_sync_index;
+            *iface = (const struct retro_hw_render_interface*)&ring->iface.d3d11;
+            if (ring->logged_version != ring->iface.d3d11.interface_version)
+            {
+               ring->logged_version = ring->iface.d3d11.interface_version;
+               RARCH_LOG("[Video] Threaded video: D3D11 hardware render interface version %u, the core keeps the immediate context%s.\n",
+                     ring->iface.d3d11.interface_version,
+                     ", no frame copy");
+            }
+            return true;
+         }
+         if (!ring->core_ctx
+               && !thr->poke->hw_ring_context_new(thr->driver_data, &ring->core_ctx))
+            return false;
+         ring->api                 = HW_API_D3D11;
+         ring->real                = real;
+         /* Device and compiler pass through; the context is the proxy
+          * over the core's own deferred one, never the video thread's
+          * immediate one. */
+         ring->iface.d3d11         = *(const struct retro_hw_render_interface_d3d11*)real;
+         ring->iface.d3d11.handle  = thr;
+         ring->iface.d3d11.context = (ID3D11DeviceContext*)ring->core_ctx;
+         /* Version 1, whatever the driver's own interface says. */
+         ring->iface.d3d11.interface_version = RETRO_HW_RENDER_INTERFACE_D3D11_VERSION;
+         ring->iface.d3d11.lock_context      = NULL;
+         ring->iface.d3d11.unlock_context    = NULL;
+         ring->iface.d3d11.set_texture       = NULL;
+         *iface = (const struct retro_hw_render_interface*)&ring->iface.d3d11;
+         return true;
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+      case RETRO_HW_RENDER_INTERFACE_D3D9:
+         if (!thr->poke->hw_ring_install)
+            return false;
+         if (!hw_ring_setup(thr, &ring))
+            return false;
+         ring->api                            = HW_API_D3D9;
+         ring->real                           = real;
+         ring->iface.d3d9                     = *(const struct retro_hw_render_interface_d3d9*)real;
+         ring->iface.d3d9.handle              = thr;
+         ring->iface.d3d9.lock_context        = hw_d3d9_lock_context;
+         ring->iface.d3d9.unlock_context      = hw_d3d9_unlock_context;
+         ring->iface.d3d9.set_texture         = hw_d3d9_set_texture;
+         ring->iface.d3d9.get_sync_index      = hw_d3d9_get_sync_index;
+         ring->iface.d3d9.get_sync_index_mask = hw_d3d9_get_sync_index_mask;
+         ring->iface.d3d9.wait_sync_index     = hw_d3d9_wait_sync_index;
+         if (!ring->logged_version)
+         {
+            ring->logged_version = ring->iface.d3d9.interface_version;
+            RARCH_LOG("[Video] Threaded video: D3D9 hardware render interface version %u, the core takes turns on the device, no frame copy.\n",
+                  ring->iface.d3d9.interface_version);
+         }
+         *iface = (const struct retro_hw_render_interface*)&ring->iface.d3d9;
+         return true;
+#endif
+      default:
+         return false;
+   }
+}
+
+/* OpenGL: there is no interface to interpose - the core renders into a
+ * framebuffer the driver hands it, on the context that is current. The
+ * single-context ring is prepared on the video thread; shared rings
+ * are set up when the main thread takes the core's context, before
+ * the core's context_reset runs there. */
+/* Video thread, before the poke-install command replies. Establish the
+ * token for init's current context. The normal end-of-pass release gives
+ * it up after any remaining uploads or frame work on this pass. */
+void video_thread_hw_prepare_context(thread_video_t *thr)
+{
+   gfx_ctx_flags_t flags;
+   hw_ring_t *ring;
+   video_driver_state_t *video_st = video_state_get_ptr();
+
+   if (!thr || !thr->driver_data || !thr->poke)
+      return;
+   switch (video_st->hw_render.context_type)
+   {
+      case RETRO_HW_CONTEXT_OPENGL:
+      case RETRO_HW_CONTEXT_OPENGL_CORE:
+      case RETRO_HW_CONTEXT_OPENGLES2:
+      case RETRO_HW_CONTEXT_OPENGLES3:
+      case RETRO_HW_CONTEXT_OPENGLES_VERSION:
+         break;
+      default:
+         return;
+   }
+   flags.flags = 0;
+   if (!thr->poke->hw_ring_context_new || !thr->poke->hw_ring_framebuffer
+         || !thr->poke->hw_ring_capture || !thr->poke->hw_ring_present_slot
+         || !thr->poke->hw_ring_fence_new
+         || !video_context_driver_get_flags(&flags)
+         || !BIT32_GET(flags.flags, GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+      return;
+   if (!hw_ring_setup(thr, &ring) || ring->handoff)
+      return;
+   ring->handoff = true;
+   retro_atomic_store_release_int(&ring->ctx_owner, HW_CTX_VIDEO);
+   retro_atomic_store_release_int(&thr->frame.hw_handoff, 1);
+}
+
+bool video_thread_hw_bind_core_context(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   hw_ring_t *ring;
+   video_driver_state_t *video_st = video_state_get_ptr();
+
+   if (!thr || !thr->poke)
+      return false;
+   switch (video_st->hw_render.context_type)
+   {
+      case RETRO_HW_CONTEXT_OPENGL:
+      case RETRO_HW_CONTEXT_OPENGL_CORE:
+      case RETRO_HW_CONTEXT_OPENGLES2:
+      case RETRO_HW_CONTEXT_OPENGLES3:
+      case RETRO_HW_CONTEXT_OPENGLES_VERSION:
+         break;
+      default:
+         return false;
+   }
+   if (!thr->poke->hw_ring_context_new || !thr->poke->hw_ring_framebuffer
+         || !thr->poke->hw_ring_capture || !thr->poke->hw_ring_present_slot
+         || !thr->poke->hw_ring_fence_new)
+      return false;
+   if (!hw_ring_setup(thr, &ring))
+      return false;
+   if (!ring->core_ctx)
+   {
+      gfx_ctx_flags_t flags;
+      flags.flags = 0;
+      /* The poke-install command prepared the single-context token
+       * before replying. Never bind a context still current on the
+       * video thread if preparation failed. */
+      if (     video_context_driver_get_flags(&flags)
+            && BIT32_GET(flags.flags, GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+      {
+         if (!ring->handoff)
+            return false;
+         RARCH_LOG("[Video] Threaded video: one GL context, handed between "
+               "the core's thread and the video thread.\n");
+      }
+      if (!thr->poke->hw_ring_context_new(thr->driver_data, &ring->core_ctx))
+      {
+         RARCH_ERR("[Video] Threaded video: the core's GL context could not be "
+               "taken on the main thread; the core will have no context.\n");
+         return false;
+      }
+      if (ring->handoff)
+         video_thread_hw_ctx_take(thr, false);
+   }
+   ring->api = HW_API_GL;
+   return true;
+}
+
+/* thread_poke.get_current_framebuffer: the framebuffer for the slot the
+ * core is filling. Main thread. */
+uintptr_t video_thread_hw_get_current_framebuffer(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   hw_ring_t *ring     = hw_ring_of(data);
+   if (!ring || ring->api != HW_API_GL || !thr->poke->hw_ring_framebuffer)
+      return 0;
+   ring->gl_fbo_slot = ring->index;
+   ring->gl_queried  = true;
+   return thr->poke->hw_ring_framebuffer(thr->driver_data, ring->index);
+}
+
+#define HW_RING_DUPE_WAIT_US 32000
+
+/* True while a dupe sits in the frame ring or is the frame being drawn,
+ * given the ring word: pending slots are tail (and tail ^ 1 when two
+ * are pending); the busy one is tail ^ 1. The slots' dupe flags are
+ * this thread's own writes. */
+static bool hw_dupe_queued(thread_video_t *thr, int st)
+{
+   unsigned tail    = VIDEO_THREAD_RING_TAIL_OF(st);
+   unsigned pending = VIDEO_THREAD_RING_PENDING_OF(st);
+   if (pending >= 1 && thr->frame.slot[tail].dupe)
+      return true;
+   if ((pending == 2 || VIDEO_THREAD_RING_BUSY_OF(st))
+         && thr->frame.slot[tail ^ 1].dupe)
+      return true;
+   return false;
+}
+
+void video_thread_hw_note_claim(thread_video_t *thr, int hw_slot)
+{
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   if (ring && hw_slot >= 0 && hw_slot < VIDEO_THREAD_HW_RING)
+      retro_atomic_store_release_int(&ring->last_presented, hw_slot);
+}
+
+int video_thread_hw_dupe_slot(thread_video_t *thr, bool dupe)
+{
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   /* The Vulkan driver draws the core's last image for any frame. */
+   if (!ring || !(dupe || ring->api == HW_API_VULKAN))
+      return -1;
+   return retro_atomic_load_acquire_int(&ring->last_presented);
+}
+
+int video_thread_hw_publish(thread_video_t *thr, unsigned *taken_back)
+{
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   unsigned published;
+   bool stay;
+   *taken_back     = 0;
+   if (!ring)
+      return -1;
+#ifdef HAVE_TEMPORAL_UPSCALER
+   {
+      /* The push is the core's call: its inputs for this frame go with
+       * the frame, not to whichever frame the video thread draws next */
+      const struct retro_hw_upscaler_inputs *inputs = video_upscaler_take_set_inputs();
+      hw_slot_t *s   = &ring->slot[ring->index];
+      s->has_upscaler = inputs != NULL;
+      if (inputs)
+         s->upscaler = *inputs;
+   }
+#endif
+   /* A core that did not ask for its framebuffer rendered into the one
+    * it has: that slot is the frame, and the ring stays on it */
+   stay = (ring->api == HW_API_GL && !ring->gl_queried);
+   if (stay)
+      ring->index = ring->gl_fbo_slot;
+   ring->gl_queried = false;
+   published = ring->index;
+#ifdef HAVE_D3D11
+   if (ring->api == HW_API_D3D11)
+   {
+      /* Close the core's recording into the slot; the slot must not be
+       * mid-replay on the video thread. */
+      hw_wait_slot(ring, published);
+      if (ring->d3d11_v2)
+      {
+         /* Version 2: the driver copies the texture the core named into
+          * the slot, now, on the immediate context the core's thread
+          * holds the lock for. */
+         hw_slot_t *s            = &ring->slot[published];
+         ID3D11Texture2D *texture = s->d3d11_texture;
+         s->d3d11_texture        = NULL;
+         if (!texture)
+            return -1;
+         /* Nothing to do with the texture on this thread but keep it
+          * alive. The core waited for this slot before it drew into the
+          * texture, so what the slot held is free. */
+         hw_d3d11_slot_release_direct(s);
+         texture->lpVtbl->AddRef(texture);
+         s->d3d11_direct = texture;
+      }
+      else if (!thr->poke->hw_ring_capture(thr->driver_data, published,
+               ring->core_ctx, 0))
+         return -1;
+   }
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+   if (ring->api == HW_API_D3D9)
+   {
+      if (!ring->slot[published].d3d9_texture)
+         return -1;
+   }
+#endif
+   if (ring->api == HW_API_GL)
+   {
+      /* Fence the core's rendering into the slot, on its context. */
+      if (!thr->poke->hw_ring_capture(thr->driver_data, published, NULL, 0))
+         return -1;
+      /* One context: the present needs it from here, and the waits
+       * below are for the video thread's work - which needs it too.
+       * Handed to the video thread before any of them: the push queues
+       * this frame, and a queued frame always brings a pass of its
+       * loop, which takes the grant. The push takes it back after
+       * that pass. */
+      if (ring->handoff)
+         hw_ctx_hand(ring, HW_CTX_MAIN, true);
+   }
+#ifdef HAVE_D3D12
+   if (ring->api == HW_API_D3D12)
+   {
+      /* The slot's copy is taken now, on this thread, so the copy is
+       * queued before the core's next frame: the slot must be free of
+       * the video thread first. */
+      hw_slot_t *s = &ring->slot[published];
+      hw_wait_slot(ring, published);
+      if (s->v2)
+      {
+         /* Version 2: nothing to do on this thread. The video thread
+          * reads the core's texture itself, behind the core's fence. */
+         if (!s->v2_texture)
+            return -1;
+      }
+      else if (!s->texture || !thr->poke->hw_ring_capture(thr->driver_data,
+               published, s->texture, s->format))
+         return -1;
+   }
+#endif
+   if (!stay)
+      ring->index = (ring->index + 1) % VIDEO_THREAD_HW_RING;
+#ifdef HAVE_VULKAN
+   if (ring->api == HW_API_VULKAN)
+      ring->index = hw_vk_next_slot(ring, published, taken_back);
+#endif
+   /* A dupe still queued in the frame ring, or being drawn, re-reads
+    * the slot last presented. If that is the slot the core takes next,
+    * its fence does not cover the dupe's read yet (the video thread
+    * re-signals it only once the dupe is drawn), so wait for the dupe
+    * to clear the ring first. Bounded: on a stalled presenter the core
+    * proceeds as it did before this wait existed. Vulkan never takes
+    * that slot. */
+   {
+      int st = retro_atomic_load_acquire_int(&thr->frame.state);
+      if (     ring->api != HW_API_VULKAN
+            && (int)ring->index
+            == retro_atomic_load_acquire_int(&ring->last_presented)
+            && hw_dupe_queued(thr, st))
+      {
+         int key = retro_eventcount_prepare_wait(&thr->frame.ring);
+         if (retro_atomic_load_acquire_int(&thr->frame.state) != st)
+            retro_eventcount_cancel_wait(&thr->frame.ring);
+         else
+            retro_eventcount_commit_wait_timeout(&thr->frame.ring, key,
+                  HW_RING_DUPE_WAIT_US);
+      }
+   }
+   /* The slot the core fills next was last driven two frames ago;
+    * normally long done, and if not this is where the core waits. */
+#ifdef HAVE_D3D12
+   if (ring->api == HW_API_D3D12)
+      hw_d3d12_wait_queued(ring, ring->index);
+#endif
+#ifdef HAVE_D3D11
+   if (ring->api == HW_API_D3D11 && ring->d3d11_v2)
+      hw_wait_queued(ring, ring->index);
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+   if (ring->api == HW_API_D3D9)
+      hw_wait_queued(ring, ring->index);
+#endif
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+   /* One context: its commands run in order, the video thread's draw
+    * of the next slot ahead of what the core puts there after its
+    * turn; and the fences are the video thread's to wait, on the
+    * context this thread no longer holds. */
+   if (ring->api == HW_API_GL && ring->handoff)
+      return (int)published;
+   if (ring->api == HW_API_GL)
+      hw_wait_queued(ring, ring->index);
+#endif
+   hw_wait_slot(ring, ring->index);
+   return (int)published;
+}
+
+void video_thread_hw_before_frame(thread_video_t *thr, int hw_slot,
+      bool reread)
+{
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   if (!ring || hw_slot < 0 || hw_slot >= VIDEO_THREAD_HW_RING)
+      return;
+#ifdef HAVE_TEMPORAL_UPSCALER
+   /* (a frame reading the slot again shows the upscaler's last output
+    * as a dupe does) */
+   video_upscaler_carry_inputs(!reread && ring->slot[hw_slot].has_upscaler
+         ? &ring->slot[hw_slot].upscaler : NULL);
+#endif
+   switch (ring->api)
+   {
+#ifdef HAVE_VULKAN
+      case HW_API_VULKAN:
+      {
+         /* Semaphores are waited once and command buffers run once: a
+          * frame that reads the slot again takes only its image. */
+         hw_slot_t *s = &ring->slot[hw_slot];
+         if (reread)
+            thr->poke->hw_ring_install(thr->driver_data,
+                  s->has_image ? &s->image : NULL, NULL, 0,
+                  VK_QUEUE_FAMILY_IGNORED, NULL, 0);
+         else
+         {
+            thr->poke->hw_ring_install(thr->driver_data,
+                  s->has_image ? &s->image : NULL,
+                  s->semaphores, s->num_semaphores, s->src_queue_family,
+                  s->cmd, s->num_cmd);
+            /* The driver has its copies. A second push of the slot
+             * with no set_image or set_command_buffers between, which
+             * the interface allows, must not wait or run them again. */
+            s->num_semaphores = 0;
+            s->num_cmd        = 0;
+         }
+         break;
+      }
+#endif
+#ifdef HAVE_D3D12
+      case HW_API_D3D12:
+      {
+         hw_slot_t *s = &ring->slot[hw_slot];
+         if (s->v2)
+         {
+            d3d12_hw_ring_frame_t f;
+            f.texture = s->v2_texture;
+            f.format  = (DXGI_FORMAT)s->format;
+            f.fence   = s->v2_fence;
+            f.value   = s->v2_value;
+            thr->poke->hw_ring_install(thr->driver_data, &f, NULL, 0, 0, NULL, 0);
+         }
+         else
+            thr->poke->hw_ring_present_slot(thr->driver_data, (unsigned)hw_slot);
+         break;
+      }
+#endif
+#ifdef HAVE_D3D11
+      case HW_API_D3D11:
+         if (ring->d3d11_v2)
+            thr->poke->hw_ring_install(thr->driver_data,
+                  ring->slot[hw_slot].d3d11_direct, NULL, 0, 0, NULL, 0);
+         else
+            thr->poke->hw_ring_present_slot(thr->driver_data, (unsigned)hw_slot);
+         break;
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+      case HW_API_D3D9:
+         thr->poke->hw_ring_install(thr->driver_data,
+               ring->slot[hw_slot].d3d9_texture, NULL, 0, 0, NULL, 0);
+         break;
+#endif
+      case HW_API_GL:
+         thr->poke->hw_ring_present_slot(thr->driver_data, (unsigned)hw_slot);
+         break;
+      default:
+         break;
+   }
+}
+
+void video_thread_hw_after_frame(thread_video_t *thr, int hw_slot)
+{
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   hw_slot_t *s;
+   if (!ring || hw_slot < 0 || hw_slot >= VIDEO_THREAD_HW_RING)
+      return;
+   s = &ring->slot[hw_slot];
+   /* Signalled after the submission the frame call just made, on a
+    * fence nobody else holds: a dupe arms a slot that is armed already. */
+   hw_fence_arm(&s->fence, thr->poke->hw_ring_fence_signal,
+         thr->poke->hw_ring_fence_wait, thr->driver_data,
+         HW_RING_WAIT_FOREVER);
+}
+
+#ifdef HAVE_VULKAN
+/* The arm's signal for a dropped frame: the one submission that waits
+ * the frame's semaphores also carries the slot's fence. */
+typedef struct
+{
+   thread_video_t *thr;
+   hw_slot_t      *s;
+} hw_drop_arm_t;
+
+static void hw_drop_signal(void *data, void *fence)
+{
+   hw_drop_arm_t *d = (hw_drop_arm_t*)data;
+   hw_ring_t *ring  = (hw_ring_t*)d->thr->frame.hw_ring;
+   VkSubmitInfo info;
+   memset(&info, 0, sizeof(info));
+   info.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+   info.waitSemaphoreCount = d->s->num_semaphores;
+   info.pWaitSemaphores    = d->s->semaphores;
+   info.pWaitDstStageMask  = d->s->wait_stages;
+   hw_lock_queue(d->thr);
+   ring->queue_submit(ring->iface.vk.queue, 1, &info,
+         (VkFence)(uintptr_t)fence);
+   hw_unlock_queue(d->thr);
+   GFX_INSTR_INC(GFX_INSTR_HW_DROP_SUBMIT);
+}
+
+static bool hw_drop_wait(void *data, void *fence, unsigned timeout_us)
+{
+   hw_drop_arm_t *d = (hw_drop_arm_t*)data;
+   return d->thr->poke->hw_ring_fence_wait(d->thr->driver_data, fence,
+         timeout_us);
+}
+#endif
+
+/* A binary semaphore the core signalled must be waited before the core
+ * signals it again, and a replaced frame is never drawn: its semaphores
+ * are waited here, on the queue, as a core would, by the submission
+ * that arms the slot's fence. The core's wait on the slot then covers
+ * them before it reuses or destroys the semaphores. The video thread
+ * does not arm the slot meanwhile: a frame it never claimed is not the
+ * one it presented last. */
+void video_thread_hw_drop(thread_video_t *thr, int hw_slot)
+{
+#ifdef HAVE_VULKAN
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   hw_slot_t *s;
+   hw_drop_arm_t d;
+   if (     !ring || ring->api != HW_API_VULKAN || !ring->queue_submit
+         || hw_slot < 0 || hw_slot >= VIDEO_THREAD_HW_RING)
+      return;
+   s = &ring->slot[hw_slot];
+   /* With command buffers the driver ignores them, and so does this.
+    * The buffers are not the next frame's to run. */
+   if (!s->num_semaphores || s->num_cmd)
+   {
+      s->num_semaphores = 0;
+      s->num_cmd        = 0;
+      return;
+   }
+   GFX_INSTR_INC(GFX_INSTR_HW_DROP);
+   /* An earlier arming is waited out first, in slices where that
+    * matters, so the arm below finds none to wait itself. */
+   hw_wait_slot(ring, (unsigned)hw_slot);
+   d.thr = thr;
+   d.s   = s;
+   hw_fence_arm(&s->fence, hw_drop_signal, hw_drop_wait, &d,
+         HW_RING_WAIT_FOREVER);
+   s->num_semaphores = 0;
+#else
+   (void)thr;
+   (void)hw_slot;
+#endif
+}
+
+bool video_thread_hw_holds_frame(thread_video_t *thr)
+{
+#if defined(HAVE_VULKAN) || defined(VIDEO_THREAD_HW_D3D9)
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   unsigned i;
+   if (!ring)
+      return false;
+#ifdef HAVE_VULKAN
+   if (ring->api == HW_API_VULKAN)
+   {
+      if (retro_atomic_load_acquire_int(&ring->last_presented) >= 0)
+         return true;
+      for (i = 0; i < VIDEO_THREAD_HW_RING; i++)
+      {
+         if (ring->slot[i].has_image)
+            return true;
+      }
+   }
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+   if (ring->api == HW_API_D3D9)
+   {
+      if (retro_atomic_load_acquire_int(&ring->last_presented) >= 0)
+         return true;
+      for (i = 0; i < VIDEO_THREAD_HW_RING; i++)
+      {
+         if (ring->slot[i].d3d9_texture)
+            return true;
+      }
+   }
+#endif
+#else
+   (void)thr;
+#endif
+   return false;
+}
+
+void video_thread_hw_forget(thread_video_t *thr)
+{
+#if defined(HAVE_VULKAN) || defined(VIDEO_THREAD_HW_D3D9)
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   unsigned i;
+   if (!ring)
+      return;
+   switch (ring->api)
+   {
+#ifdef HAVE_VULKAN
+      case HW_API_VULKAN:
+         for (i = 0; i < VIDEO_THREAD_HW_RING; i++)
+         {
+            hw_slot_t *s      = &ring->slot[i];
+            /* The empty submission behind the slot's last frame. */
+            hw_wait_slot(ring, i);
+            s->has_image      = false;
+            s->num_semaphores = 0;
+            s->num_cmd        = 0;
+         }
+         break;
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+      case HW_API_D3D9:
+         for (i = 0; i < VIDEO_THREAD_HW_RING; i++)
+         {
+            hw_wait_slot(ring, i);
+            ring->slot[i].d3d9_texture = NULL;
+         }
+         break;
+#endif
+      default:
+         return;
+   }
+   /* A dupe has no slot to re-read until the core presents again. */
+   retro_atomic_store_release_int(&ring->last_presented, -1);
+#else
+   (void)thr;
+#endif
+}
+
+static void hw_context_free_cb(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   hw_ring_t *ring     = (hw_ring_t*)thr->frame.hw_ring;
+   thr->poke->hw_ring_context_free(thr->driver_data, ring->core_ctx);
+   ring->core_ctx = NULL;
+}
+
+void video_thread_hw_free(thread_video_t *thr)
+{
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   unsigned i;
+#ifdef HAVE_VULKAN
+   /* A core that is not told of this goes on calling: into nothing,
+    * until the next wrapper takes the interface over. */
+   if (hw_vk_core_iface.handle == thr)
+      hw_vk_core_iface.handle = NULL;
+#endif
+   if (!ring)
+      return;
+   for (i = 0; i < VIDEO_THREAD_HW_RING; i++)
+   {
+      hw_slot_t *s = &ring->slot[i];
+      /* Wait anything in flight before its fence goes. */
+      hw_wait_slot(ring, i);
+      if (thr->poke && thr->poke->hw_ring_fence_free)
+      {
+         unsigned c;
+         for (c = 0; c < HW_FENCE_CELLS; c++)
+            thr->poke->hw_ring_fence_free(thr->driver_data, s->fence.cell[c]);
+      }
+#ifdef HAVE_VULKAN
+      free(s->semaphores);
+      free(s->wait_stages);
+      free(s->cmd);
+#endif
+#ifdef HAVE_D3D12
+      /* The references a version 2 handoff took. */
+      if (ring->api == HW_API_D3D12)
+         hw_d3d12_slot_release_v2(s);
+#endif
+#ifdef HAVE_D3D11
+      if (ring->api == HW_API_D3D11)
+         hw_d3d11_slot_release_direct(s);
+#endif
+   }
+   if (ring->core_ctx && thr->poke && thr->poke->hw_ring_context_free)
+   {
+      /* The core's context is the main thread's, and giving it up
+       * must happen there: this runs on the video thread, inside the
+       * free command the main thread is waiting on. */
+      video_thread_call_on_waiter(hw_context_free_cb, thr);
+   }
+   /* The main thread is parked in the free command this runs under;
+    * nothing reads the ring after the word says there is no handoff. */
+   retro_atomic_store_release_int(&thr->frame.hw_handoff, 0);
+   retro_eventcount_free(&ring->ctx_free);
+#ifdef HAVE_TEMPORAL_UPSCALER
+   /* (a carry still pending points into the ring) */
+   video_upscaler_drop_carry();
+#endif
+   free(ring);
+   thr->frame.hw_ring = NULL;
+}
+
+/* --- the single-context handoff --------------------------------------- */
+
+bool video_thread_hw_handoff(thread_video_t *thr)
+{
+   return hw_handoff_ring(thr) != NULL;
+}
+
+/* The ring, for the handoff entries: the video thread goes by the
+ * published word, since the ring is the main thread's to set up. */
+static hw_ring_t *hw_handoff_ring(thread_video_t *thr)
+{
+   hw_ring_t *ring;
+   if (!thr || !retro_atomic_load_acquire_int(&thr->frame.hw_handoff))
+      return NULL;
+   ring = (hw_ring_t*)thr->frame.hw_ring;
+   return (ring && ring->handoff) ? ring : NULL;
+}
+
+/* Take the one context on the calling thread and bind it - the core's
+ * thread off the window surface, the video thread with it. A thread
+ * that holds it already keeps it. Held by the other thread, the wait
+ * asks for it and ends at that thread's next release, which hands it
+ * over: the wait is one hold of the other thread long. */
+void video_thread_hw_ctx_take(thread_video_t *thr, bool video_thread)
+{
+   hw_ring_t *ring = hw_handoff_ring(thr);
+   int me;
+   if (!ring)
+      return;
+   me = video_thread ? HW_CTX_VIDEO : HW_CTX_MAIN;
+   for (;;)
+   {
+      int key;
+      int v = retro_atomic_load_acquire_int(&ring->ctx_owner);
+      if ((v & HW_CTX_HOLDER) == me)
+      {
+         if (!(v & HW_CTX_GRANT))
+            return;
+         /* Handed over: unbound by the releasing thread. The other
+          * thread's ask, if it made one since, stays on the word. */
+         if (retro_atomic_cas_int(&ring->ctx_owner, v, v & ~HW_CTX_GRANT))
+            break;
+         continue;
+      }
+      if ((v & HW_CTX_HOLDER) == HW_CTX_FREE)
+      {
+         if (retro_atomic_cas_int(&ring->ctx_owner, v, me))
+            break;
+         continue;
+      }
+      if (     !(v & HW_CTX_WANT(me))
+            && !retro_atomic_cas_int(&ring->ctx_owner, v, v | HW_CTX_WANT(me)))
+         continue;
+      key = retro_eventcount_prepare_wait(&ring->ctx_free);
+      if (retro_atomic_load_acquire_int(&ring->ctx_owner) != (v | HW_CTX_WANT(me)))
+      {
+         retro_eventcount_cancel_wait(&ring->ctx_free);
+         continue;
+      }
+      retro_eventcount_commit_wait(&ring->ctx_free, key);
+   }
+   video_context_driver_bind_hw_render(!video_thread);
+}
+
+/* Whether the main thread holds the context. */
+bool video_thread_hw_ctx_held(thread_video_t *thr)
+{
+   hw_ring_t *ring = hw_handoff_ring(thr);
+   return ring && (retro_atomic_load_acquire_int(&ring->ctx_owner)
+         & (HW_CTX_HOLDER | HW_CTX_GRANT)) == HW_CTX_MAIN;
+}
+
+/* Give the context up on the calling thread, if it holds it; to the
+ * other thread if that one is waiting for it. True when it was held. */
+bool video_thread_hw_ctx_release(thread_video_t *thr, bool video_thread)
+{
+   hw_ring_t *ring = hw_handoff_ring(thr);
+   if (!ring)
+      return false;
+   return hw_ctx_hand(ring, video_thread ? HW_CTX_VIDEO : HW_CTX_MAIN, false);
+}
+
+/* Hardware cores run under the wrapper whenever the wrapper runs, where
+ * a ring exists for their API: the ring gives them what the swapchain
+ * gave them unthreaded, and a core that honoured the interface there
+ * honours it here. Other contexts have no ring yet and stay unthreaded. */
+bool video_thread_hw_allowed(void)
+{
+   settings_t *settings           = config_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   if (!settings)
+      return false;
+   switch (video_st->hw_render.context_type)
+   {
+#ifdef HAVE_VULKAN
+      case RETRO_HW_CONTEXT_VULKAN:
+         return string_is_equal(settings->arrays.video_driver, "vulkan");
+#endif
+#ifdef HAVE_D3D12
+      case RETRO_HW_CONTEXT_D3D12:
+         return string_is_equal(settings->arrays.video_driver, "d3d12");
+#endif
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+      case RETRO_HW_CONTEXT_OPENGL:
+      case RETRO_HW_CONTEXT_OPENGL_CORE:
+      case RETRO_HW_CONTEXT_OPENGLES2:
+      case RETRO_HW_CONTEXT_OPENGLES3:
+      case RETRO_HW_CONTEXT_OPENGLES_VERSION:
+#ifdef __APPLE__
+         /* The ring needs the core's context to share objects with the
+          * driver's - textures, framebuffers' attachments, sync objects.
+          * The Cocoa GL context driver creates its hardware context with
+          * no share group, so on the ring a core there rendered into
+          * objects the video thread could not see, and locked up. Until
+          * that driver shares the two, OpenGL cores stay unthreaded on
+          * Apple, and threaded video is declined for them rather than
+          * installed with a ring that cannot work. */
+         return false;
+#else
+         return string_is_equal(settings->arrays.video_driver, "gl")
+             || string_is_equal(settings->arrays.video_driver, "glcore");
+#endif
+#endif
+#ifdef HAVE_D3D11
+      case RETRO_HW_CONTEXT_D3D11:
+         return string_is_equal(settings->arrays.video_driver, "d3d11");
+#endif
+#ifdef VIDEO_THREAD_HW_D3D9
+      case RETRO_HW_CONTEXT_D3D9:
+         return string_is_equal(settings->arrays.video_driver, "d3d9_hlsl");
+#endif
+      default:
+         return false;
+   }
+}
+
+#else /* !VIDEO_THREAD_HW_ANY */
+
+bool video_thread_get_hw_render_interface(void *data,
+      const struct retro_hw_render_interface **iface)
+{
+   (void)data; (void)iface;
+   return false;
+}
+int  video_thread_hw_publish(thread_video_t *thr, unsigned *taken_back) { (void)thr; *taken_back = 0; return -1; }
+void video_thread_hw_note_claim(thread_video_t *thr, int hw_slot) { (void)thr; (void)hw_slot; }
+int  video_thread_hw_dupe_slot(thread_video_t *thr, bool dupe) { (void)thr; (void)dupe; return -1; }
+void video_thread_hw_before_frame(thread_video_t *thr, int hw_slot, bool reread) { (void)thr; (void)hw_slot; (void)reread; }
+void video_thread_hw_after_frame(thread_video_t *thr, int hw_slot)  { (void)thr; (void)hw_slot; }
+void video_thread_hw_drop(thread_video_t *thr, int hw_slot) { (void)thr; (void)hw_slot; }
+void video_thread_hw_free(thread_video_t *thr) { (void)thr; }
+bool video_thread_hw_allowed(void) { return false; }
+void video_thread_hw_prepare_context(thread_video_t *thr) { (void)thr; }
+bool video_thread_hw_bind_core_context(void *data) { (void)data; return false; }
+bool video_thread_hw_handoff(thread_video_t *thr) { (void)thr; return false; }
+void video_thread_hw_ctx_take(thread_video_t *thr, bool video_thread) { (void)thr; (void)video_thread; }
+bool video_thread_hw_ctx_held(thread_video_t *thr) { (void)thr; return false; }
+bool video_thread_hw_ctx_release(thread_video_t *thr, bool video_thread) { (void)thr; (void)video_thread; return false; }
+uintptr_t video_thread_hw_get_current_framebuffer(void *data) { (void)data; return 0; }
+bool video_thread_hw_holds_frame(thread_video_t *thr) { (void)thr; return false; }
+void video_thread_hw_forget(thread_video_t *thr) { (void)thr; }
+
+#endif /* VIDEO_THREAD_HW_ANY */
+
+#endif /* HAVE_THREADS */

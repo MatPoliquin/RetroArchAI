@@ -1,0 +1,67 @@
+include ../../sample_objdir.mk
+
+TARGET       := data_transfer_source_test
+TARGET_TEST2 := data_transfer_prefix_test
+TARGET_TEST3 := data_transfer_window_test
+TARGET_TEST4 := data_transfer_pool_scrub_test
+
+LIBRETRO_COMM_DIR := ../../..
+
+COMMON_SOURCES := \
+	$(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+	$(LIBRETRO_COMM_DIR)/file/file_path.c \
+	$(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+	$(LIBRETRO_COMM_DIR)/formats/data_transfer.c \
+	$(LIBRETRO_COMM_DIR)/memmap/memmap.c \
+	$(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+	$(LIBRETRO_COMM_DIR)/string/rstrtod.c \
+	$(LIBRETRO_COMM_DIR)/time/rtime.c \
+	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+
+COMMON_OBJS := $(call sample_objs,$(COMMON_SOURCES:.c=.o))
+OBJS        := data_transfer_source_test.o data_transfer_prefix_test.o \
+	data_transfer_window_test.o data_transfer_pool_scrub_test.o \
+	$(COMMON_OBJS)
+
+CFLAGS += -Wall -pedantic -std=gnu99 -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include
+
+ifneq ($(SANITIZER),)
+   CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
+   LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
+endif
+
+all: $(TARGET) $(TARGET_TEST2) $(TARGET_TEST3) $(TARGET_TEST4)
+
+%.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(TARGET): data_transfer_source_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST2): data_transfer_prefix_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+ifeq ($(COUNT_IO),1)
+data_transfer_prefix_test.o: CFLAGS += -DDT_COUNT_IO
+$(TARGET_TEST2): LDFLAGS += -Wl,--wrap=filestream_read
+data_transfer_window_test.o: CFLAGS += -DDT_COUNT_IO
+$(TARGET_TEST3): LDFLAGS += -Wl,--wrap=filestream_seek -Wl,--wrap=filestream_read
+endif
+
+$(TARGET_TEST3): data_transfer_window_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST4): data_transfer_pool_scrub_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+clean:
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(TARGET) $(TARGET_TEST2) $(TARGET_TEST3) $(TARGET_TEST4) $(OBJS)
+
+.PHONY: clean

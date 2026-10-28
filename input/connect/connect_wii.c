@@ -22,7 +22,7 @@
 
 #include <retro_endianness.h>
 #include <retro_miscellaneous.h>
-#include <retro_timers.h>
+#include <features/features_cpu.h>
 
 #include "joypad_connection.h"
 #include "../input_defines.h"
@@ -143,9 +143,14 @@ typedef struct connect_wii_wiimote_t
 {
    /* User specified ID. */
    int unid;
+   /* the player its lights show: from 1, -1 for none, 0 not yet told -
+    * then its slot's */
+   int player;
+   bool leds_due;
 
    struct pad_connection* connection;
    hid_driver_t *driver;
+   bool ids_first;      /* the driver wants no HIDP header: see wiimote_send */
 
    /* Various state flags. */
    uint32_t state;
@@ -155,10 +160,14 @@ typedef struct connect_wii_wiimote_t
    float battery_level;
    /* The state of the connection handshake. */
    uint8_t handshake_state;
+   /* When the register write the handshake is waiting on went out;
+    * see wiimote_handshake_write_settled(). */
+   retro_time_t handshake_write_time;
    /* Wiimote expansion device. */
    struct connect_wii_expansion_t exp;
    /* What buttons have just been pressed. */
    uint16_t btns;
+   input_pad_view_t view;
 } connect_wii_wiimote;
 
 /* Macro to manage states */
@@ -187,7 +196,10 @@ static int wiimote_send(struct connect_wii_wiimote_t* wm,
 
    memcpy(buf+2, msg, len);
 
-   wm->driver->send_control(wm->connection, buf, len + 2);
+   if (wm->ids_first)
+      wm->driver->send_control(wm->connection, buf + 1, len + 1);
+   else
+      wm->driver->send_control(wm->connection, buf, len + 2);
    return 1;
 }
 
@@ -243,14 +255,21 @@ static void wiimote_set_leds(struct connect_wii_wiimote_t* wm, int leds)
    wiimote_send(wm, WM_CMD_LED, &buf, 1);
 }
 
+/* One light for players 1 to 4, as the console lights them. */
+static void wiimote_player_leds(struct connect_wii_wiimote_t* wm)
+{
+   int player   = wm->player ? wm->player : wm->unid + 1;
+   wm->leds_due = false;
+   wiimote_set_leds(wm, player > 0
+         ? WIIMOTE_LED_1 << ((player - 1) % 4) : WIIMOTE_LED_NONE);
+}
+
 /* Find what buttons are pressed. */
 static void wiimote_pressed_buttons(struct connect_wii_wiimote_t* wm, uint8_t* msg)
 {
-   /* Convert to big endian. */
-   int16_t *val = (int16_t*)msg;
-   int16_t now  = swap_if_little16(*val) & WIIMOTE_BUTTON_ALL;
-
-   wm->btns     = now;
+   /* Big-endian, and not necessarily aligned: assembled from bytes
+    * rather than loaded through a cast. */
+   wm->btns = (uint16_t)(((msg[0] << 8) | msg[1]) & WIIMOTE_BUTTON_ALL);
 }
 
 static int wiimote_classic_ctrl_handshake(struct connect_wii_wiimote_t* wm,
@@ -299,7 +318,7 @@ static void classic_ctrl_event(struct connect_wii_classic_ctrl_t* cc, uint8_t* m
    if (!cc)
       return;
 
-   cc->btns = ~swap_if_little16(*(int16_t*)(msg + 4)) & CLASSIC_CTRL_BUTTON_ALL;
+   cc->btns = (uint16_t)(~((msg[4] << 8) | msg[5]) & CLASSIC_CTRL_BUTTON_ALL);
 
    wiimote_process_axis(&cc->ljs.x, (msg[0] & 0x3F));
    wiimote_process_axis(&cc->ljs.y, (msg[1] & 0x3F));
@@ -324,7 +343,6 @@ static int wiimote_write_data(struct connect_wii_wiimote_t* wm,
       uint32_t addr, uint8_t* data, uint8_t len)
 {
    uint8_t buf[21] = {0};		/* the payload is always 23 */
-   int32_t *buf32  = (int32_t*)buf;
 
    if (!wm || !wiimote_is_connected(wm))
       return 0;
@@ -332,7 +350,10 @@ static int wiimote_write_data(struct connect_wii_wiimote_t* wm,
       return 0;
 
    /* the offset is in big endian */
-   *buf32 = swap_if_little32(addr);
+   buf[0] = (uint8_t)(addr >> 24);
+   buf[1] = (uint8_t)(addr >> 16);
+   buf[2] = (uint8_t)(addr >> 8);
+   buf[3] = (uint8_t)addr;
 
    /* length */
    *(uint8_t*)(buf + 4) = len;
@@ -359,8 +380,6 @@ static int wiimote_read_data(struct connect_wii_wiimote_t* wm, uint32_t addr,
       uint16_t len)
 {
    uint8_t buf[6] = {0};
-   int32_t *buf32 = (int32_t*)buf;
-   int16_t *buf16 = (int16_t*)(buf + 4);
 
    /* No puden ser mas de 16 lo leido o vendra en trozos! */
 
@@ -368,8 +387,12 @@ static int wiimote_read_data(struct connect_wii_wiimote_t* wm, uint32_t addr,
       return 0;
 
    /* the offsets are in big endian */
-   *buf32         = swap_if_little32(addr);
-   *buf16         = swap_if_little16(len);
+   buf[0] = (uint8_t)(addr >> 24);
+   buf[1] = (uint8_t)(addr >> 16);
+   buf[2] = (uint8_t)(addr >> 8);
+   buf[3] = (uint8_t)addr;
+   buf[4] = (uint8_t)(len >> 8);
+   buf[5] = (uint8_t)len;
 
    wiimote_send(wm, WM_CMD_READ_DATA, buf, 6);
 
@@ -385,6 +408,38 @@ static int wiimote_read_data(struct connect_wii_wiimote_t* wm, uint32_t addr,
  *	The handshake will be concluded when the wiimote responds
  *	with this data.
  */
+
+/* Handshake states past the protocol's own: waiting for the
+ * acknowledgement of each of the two extension-init writes. */
+#define WIIMOTE_HS_AWAIT_INIT1_ACK 7
+#define WIIMOTE_HS_AWAIT_INIT2_ACK 8
+
+/* How long a write used to be given to settle, when this slept. */
+#define WIIMOTE_HS_WRITE_SETTLE_US 100000
+
+/* The extension-init sequence used to sleep 100 ms after each of its
+ * two register writes and before reading the calibration, on whatever
+ * thread delivered the packet - the main thread under iohidmanager,
+ * btstack's packet callback, and libusb's single event thread, which
+ * every libusb pad now shares. The sleeps stood in for the Wiimote's
+ * answer: it acknowledges every register write with report 0x22,
+ * which nothing handled.
+ *
+ * So the handshake now sends a write and returns, and goes on when
+ * that write is acknowledged. A remote that never sends the
+ * acknowledgement, as some clones may not, is not left stuck: any
+ * later packet that arrives once the old 100 ms have passed moves it on
+ * as the sleep used to. Nothing waits; the read before the calibration
+ * needs no delay at all, as it follows the answer to the previous
+ * read. */
+static bool wiimote_handshake_write_settled(
+      struct connect_wii_wiimote_t *wm, uint8_t event, const uint8_t *data)
+{
+   if (event == WM_RPT_WRITE)
+      return data && data[2] == WM_CMD_WRITE_DATA;
+   return cpu_features_get_time_usec() - wm->handshake_write_time
+      >= WIIMOTE_HS_WRITE_SETTLE_US;
+}
 
 static int wiimote_handshake(struct connect_wii_wiimote_t* wm,
       uint8_t event, uint8_t* data, uint16_t len)
@@ -451,21 +506,12 @@ static int wiimote_handshake(struct connect_wii_wiimote_t* wm,
 #endif
 
                   /* NEW WAY 0x55 to 0x(4)A400F0, then writing
-                   * 0x00 to 0x(4)A400FB. (support clones) */
+                   * 0x00 to 0x(4)A400FB. (support clones) - each once
+                   * the previous write has settled. */
                   buf = 0x55;
                   wiimote_write_data(wm, 0x04A400F0, &buf, 1);
-                  retro_sleep(100);
-                  buf = 0x00;
-                  wiimote_write_data(wm, 0x04A400FB, &buf, 1);
-
-                  /* check extension type! */
-                  retro_sleep(100);
-                  wiimote_read_data(wm, WM_EXP_MEM_CALIBR + 220, 4);
-#if 0
-                  wiimote_read_data(wm, WM_EXP_MEM_CALIBR, EXP_HANDSHAKE_LEN);
-#endif
-
-                  wm->handshake_state = 4;
+                  wm->handshake_write_time = cpu_features_get_time_usec();
+                  wm->handshake_state      = WIIMOTE_HS_AWAIT_INIT1_ACK;
                   return 0;
                }
                else if (!attachment && WIIMOTE_IS_SET(wm, WIIMOTE_STATE_EXP))
@@ -504,17 +550,16 @@ static int wiimote_handshake(struct connect_wii_wiimote_t* wm,
          case 4:
             {
                uint32_t id;
-               int32_t *ptr = (int32_t*)data;
 
                if (event != WM_RPT_READ)
                   return 0;
 
-               id = swap_if_little32(*ptr);
+               id =   ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16)
+                    | ((uint32_t)data[2] << 8)  |  (uint32_t)data[3];
 
                switch (id)
                {
                   case IDENT_CC:
-                     retro_sleep(100);
                      /* pedimos datos de calibracion del JOY! */
                      wiimote_read_data(wm, WM_EXP_MEM_CALIBR, 16);
                      wm->handshake_state = 5;
@@ -528,6 +573,26 @@ static int wiimote_handshake(struct connect_wii_wiimote_t* wm,
                }
             }
             return 0;
+         case WIIMOTE_HS_AWAIT_INIT1_ACK:
+            {
+               uint8_t buf = 0x00;
+               if (!wiimote_handshake_write_settled(wm, event, data))
+                  return 0;
+               wiimote_write_data(wm, 0x04A400FB, &buf, 1);
+               wm->handshake_write_time = cpu_features_get_time_usec();
+               wm->handshake_state      = WIIMOTE_HS_AWAIT_INIT2_ACK;
+            }
+            return 0;
+         case WIIMOTE_HS_AWAIT_INIT2_ACK:
+            if (!wiimote_handshake_write_settled(wm, event, data))
+               return 0;
+            /* check extension type! */
+            wiimote_read_data(wm, WM_EXP_MEM_CALIBR + 220, 4);
+#if 0
+            wiimote_read_data(wm, WM_EXP_MEM_CALIBR, EXP_HANDSHAKE_LEN);
+#endif
+            wm->handshake_state = 4;
+            return 0;
          case 5:
             if (event !=  WM_RPT_READ)
                return 0;
@@ -540,25 +605,21 @@ static int wiimote_handshake(struct connect_wii_wiimote_t* wm,
             WIIMOTE_ENABLE_STATE(wm, WIIMOTE_STATE_HANDSHAKE_COMPLETE);
             wm->handshake_state = 1;
 
-            switch (wm->unid)
-            {
-               case 0:
-                  wiimote_set_leds(wm, WIIMOTE_LED_1);
-                  break;
-               case 1:
-                  wiimote_set_leds(wm, WIIMOTE_LED_2);
-                  break;
-               case 2:
-                  wiimote_set_leds(wm, WIIMOTE_LED_3);
-                  break;
-               case 3:
-                  wiimote_set_leds(wm, WIIMOTE_LED_4);
-                  break;
-            }
+            wiimote_player_leds(wm);
             return 1;
          default:
             break;
       }
+   }
+}
+
+static void hidpad_wii_set_player(void *data, unsigned player)
+{
+   struct connect_wii_wiimote_t* device = (struct connect_wii_wiimote_t*)data;
+   if (device)
+   {
+      device->player   = player ? (int)player : -1;
+      device->leds_due = true;
    }
 }
 
@@ -588,6 +649,7 @@ static void* hidpad_wii_init(void *data, uint32_t slot,
    device->state      = WIIMOTE_STATE_CONNECTED;
    device->exp.type   = EXP_NONE;
    device->driver     = driver;
+   device->ids_first  = PAD_CONNECTION_IDS_FIRST(driver);
 
    wiimote_handshake(device, -1, NULL, -1);
 
@@ -598,59 +660,84 @@ error:
    return NULL;
 }
 
+/* The remote's state into its view, at the end of each packet. */
+static void wiimote_view_update(struct connect_wii_wiimote_t* wm)
+{
+   const struct connect_wii_classic_ctrl_t *cc = &wm->exp.cc.classic;
+
+   /* TODO/FIXME - Broken? this doesn't match retropad! */
+   pad_view_set_buttons(&wm->view,
+         wm->btns | ((uint32_t)(uint16_t)cc->btns << 16), false);
+   if (wm->exp.type == EXP_CLASSIC)
+   {
+      wm->view.axes[0] = (int16_t)(cc->ljs.x.value * 0x7FFF);
+      wm->view.axes[1] = (int16_t)(cc->ljs.y.value * 0x7FFF);
+      wm->view.axes[2] = (int16_t)(cc->rjs.x.value * 0x7FFF);
+      wm->view.axes[3] = (int16_t)(cc->rjs.y.value * 0x7FFF);
+   }
+   else
+      wm->view.axes[0] = wm->view.axes[1] =
+      wm->view.axes[2] = wm->view.axes[3] = 0;
+}
+
 static int16_t hidpad_wii_get_axis(void *data, unsigned axis)
 {
    struct connect_wii_wiimote_t* device = (struct connect_wii_wiimote_t*)data;
 
-   if (device)
-   {
-      switch (device->exp.type)
-      {
-         case EXP_CLASSIC:
-            switch (axis)
-            {
-               case 0:
-                  return device->exp.cc.classic.ljs.x.value * 0x7FFF;
-               case 1:
-                  return device->exp.cc.classic.ljs.y.value * 0x7FFF;
-               case 2:
-                  return device->exp.cc.classic.rjs.x.value * 0x7FFF;
-               case 3:
-                  return device->exp.cc.classic.rjs.y.value * 0x7FFF;
-            }
-            break;
-         default:
-            break;
-      }
-   }
-
-   return 0;
+   if (!device || axis >= INPUT_PAD_VIEW_AXES)
+      return 0;
+   return device->view.axes[axis];
 }
 
 static void hidpad_wii_get_buttons(void *data, input_bits_t *state)
 {
    struct connect_wii_wiimote_t* device = (struct connect_wii_wiimote_t*)data;
-   if ( device )
-   {
-      /* TODO/FIXME - Broken? this doesn't match retropad! */
-      uint32_t b = device->btns | (device->exp.cc.classic.btns << 16);
-      BITS_COPY32_PTR(state, b);
-   }
+   if (device)
+      *state = device->view.buttons;
+}
+
+static const input_pad_view_t *hidpad_wii_view(void *data)
+{
+   return &((struct connect_wii_wiimote_t*)data)->view;
 }
 
 static void hidpad_wii_packet_handler(void *data,
       uint8_t *packet, uint16_t size)
 {
    struct connect_wii_wiimote_t* device = (struct connect_wii_wiimote_t*)data;
-   uint8_t             *msg = packet + 1;
+   uint8_t             *msg;
 
-   if (!device)
+   if (!device || !packet)
       return;
+   /* a Bluetooth stack's DATA | INPUT header */
+   if (size && packet[0] == 0xa1)
+   {
+      packet++;
+      size--;
+   }
+   if (!size)
+      return;
+   msg = packet + 1;
+
+   if (     device->leds_due
+         && WIIMOTE_IS_SET(device, WIIMOTE_STATE_HANDSHAKE_COMPLETE))
+      wiimote_player_leds(device);
 
    switch (packet[0])
    {
       case WM_RPT_BTN:
          wiimote_pressed_buttons(device, msg);
+         /* Also the fallback that moves a handshake on past a write
+          * whose acknowledgement never came. */
+         if (     device->handshake_state == WIIMOTE_HS_AWAIT_INIT1_ACK
+               || device->handshake_state == WIIMOTE_HS_AWAIT_INIT2_ACK)
+            wiimote_handshake(device, WM_RPT_BTN, msg, -1);
+         break;
+      case WM_RPT_WRITE:
+         /* Acknowledgement of an output report: msg[2] is the report
+          * it answers, msg[3] the error code. */
+         wiimote_pressed_buttons(device, msg);
+         wiimote_handshake(device, WM_RPT_WRITE, msg, -1);
          break;
       case WM_RPT_READ:
          wiimote_pressed_buttons(device, msg);
@@ -666,6 +753,7 @@ static void hidpad_wii_packet_handler(void *data,
          wiimote_handle_expansion(device, msg+2);
          break;
    }
+   wiimote_view_update(device);
 }
 
 static void hidpad_wii_set_rumble(void *data,
@@ -682,5 +770,12 @@ pad_connection_interface_t pad_connection_wii = {
    hidpad_wii_get_axis,
    NULL, /* get_name */
    NULL, /* button */
-   false,
+   false, /* multi_pad */
+   0,     /* max_pad */
+   NULL,  /* pad_init */
+   NULL,  /* pad_deinit */
+   NULL,  /* status */
+   NULL,  /* joypad */
+   hidpad_wii_set_player,
+   hidpad_wii_view
 };

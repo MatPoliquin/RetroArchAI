@@ -17,11 +17,109 @@
 #define _WAYLAND_COMMON_H
 
 #include <stdint.h>
+#include <time.h>
 #include <boolean.h>
+#include <retro_inline.h>
 
+/* Button and key codes (BTN_LEFT, KEY_ENTER, ...).  FreeBSD ships them in
+ * base under dev/evdev/ - do not require the evdev-proto port for them. */
+#if defined(__FreeBSD__)
+#include <dev/evdev/input.h>
+#else
 #include <linux/input.h>
+#endif
+
+#ifdef HAVE_WAYLAND_BACKPORT
+#include "../../gfx/common/wayland_common_backport.h"
+#endif
+
 #include <wayland-client.h>
 #include <wayland-cursor.h>
+
+/* Seat v5 headers from scanners that emit no event macros still have
+ * the v5 pointer events; its release request gives them away. */
+#if !defined(WL_POINTER_FRAME_SINCE_VERSION) && defined(WL_SEAT_RELEASE_SINCE_VERSION)
+#define WL_POINTER_FRAME_SINCE_VERSION 5
+#endif
+
+/* Highest version of each core global whose events the listeners here
+ * handle, limited to what the libwayland headers declare. The bind
+ * also caps at the runtime library's own interface version. */
+#if defined(WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION)
+#define WL_SEAT_VERSION_MAX       9
+#elif defined(WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+#define WL_SEAT_VERSION_MAX       8
+#elif defined(WL_TOUCH_SHAPE_SINCE_VERSION)
+#define WL_SEAT_VERSION_MAX       7
+#elif defined(WL_POINTER_FRAME_SINCE_VERSION)
+#define WL_SEAT_VERSION_MAX       5
+#else
+#define WL_SEAT_VERSION_MAX       4
+#endif
+
+#if defined(WL_OUTPUT_NAME_SINCE_VERSION)
+#define WL_OUTPUT_VERSION_MAX     4
+#elif defined(WL_OUTPUT_RELEASE_SINCE_VERSION)
+#define WL_OUTPUT_VERSION_MAX     3
+#else
+#define WL_OUTPUT_VERSION_MAX     2
+#endif
+
+#if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+#define WL_COMPOSITOR_VERSION_MAX 6
+#elif defined(WL_SURFACE_OFFSET_SINCE_VERSION)
+#define WL_COMPOSITOR_VERSION_MAX 5
+#elif defined(WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
+#define WL_COMPOSITOR_VERSION_MAX 4
+#else
+#define WL_COMPOSITOR_VERSION_MAX 3
+#endif
+
+/* Release where the bound version has it, so the compositor frees its
+ * side too; destroy otherwise. */
+static INLINE void wayland_pointer_release(struct wl_pointer *p)
+{
+   if (wl_pointer_get_version(p) >= WL_POINTER_RELEASE_SINCE_VERSION)
+      wl_pointer_release(p);
+   else
+      wl_pointer_destroy(p);
+}
+
+static INLINE void wayland_keyboard_release(struct wl_keyboard *k)
+{
+   if (wl_keyboard_get_version(k) >= WL_KEYBOARD_RELEASE_SINCE_VERSION)
+      wl_keyboard_release(k);
+   else
+      wl_keyboard_destroy(k);
+}
+
+static INLINE void wayland_touch_release(struct wl_touch *t)
+{
+   if (wl_touch_get_version(t) >= WL_TOUCH_RELEASE_SINCE_VERSION)
+      wl_touch_release(t);
+   else
+      wl_touch_destroy(t);
+}
+
+static INLINE void wayland_output_release(struct wl_output *o)
+{
+#ifdef WL_OUTPUT_RELEASE_SINCE_VERSION
+   if (wl_output_get_version(o) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
+      wl_output_release(o);
+   else
+#endif
+      wl_output_destroy(o);
+}
+
+static INLINE void wayland_seat_release(struct wl_seat *s)
+{
+#ifdef WL_SEAT_RELEASE_SINCE_VERSION
+   if (wl_seat_get_version(s) >= WL_SEAT_RELEASE_SINCE_VERSION)
+      wl_seat_release(s);
+   else
+#endif
+      wl_seat_destroy(s);
+}
 
 #include "../input_driver.h"
 
@@ -40,11 +138,24 @@
 #include "../../gfx/common/wayland/idle-inhibit-unstable-v1.h"
 #include "../../gfx/common/wayland/pointer-constraints-unstable-v1.h"
 #include "../../gfx/common/wayland/relative-pointer-unstable-v1.h"
+#include "../../gfx/common/wayland/presentation-time.h"
 #include "../../gfx/common/wayland/single-pixel-buffer-v1.h"
+#include "../../gfx/common/wayland/tearing-control-v1.h"
+#include "../../gfx/common/wayland_color.h"
+#include "../../gfx/common/wayland_present.h"
+
+struct string_list;
 #include "../../gfx/common/wayland/viewporter.h"
 #include "../../gfx/common/wayland/xdg-decoration-unstable-v1.h"
 #include "../../gfx/common/wayland/xdg-shell.h"
 #include "../../gfx/common/wayland/xdg-toplevel-icon-v1.h"
+#include "../../gfx/common/wayland/xdg-toplevel-tag-v1.h"
+
+#ifdef WEBOS
+#include "wayland_common_webos.h"
+#endif
+
+#define WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION 3
 
 #define FRACTIONAL_SCALE_V1_DEN 120
 #define FRACTIONAL_SCALE_MULT(v, scale_num) \
@@ -84,10 +195,8 @@ typedef struct output_info
    struct wl_output *output;
    int refresh_rate;
    uint32_t global_id;
-   unsigned width;
-   unsigned height;
-   unsigned physical_width;
-   unsigned physical_height;
+   /* The mode the output is running, packed. */
+   unsigned dims;
    unsigned scale;
    char *make;
    char *model;
@@ -112,6 +221,17 @@ typedef struct input_ctx_wayland_data
    struct wl_display *dpy;
    const input_device_driver_t *joypad;
    struct gfx_ctx_wayland_data *gfx;
+   /* The event queue of the seat and of what comes from it - the
+    * keyboard, the pointer, touch, relative motion. Only the input
+    * driver's poll dispatches it (wayland_input_dispatch()), so those
+    * events reach their handlers on the frontend's thread, whichever
+    * thread read them off the connection. NULL: the seat is on the
+    * default queue with everything else, as it used to be. */
+   struct wl_event_queue *queue;
+   /* events handled, and how many of them on a thread that is not the
+    * frontend's; logged when the connection is closed */
+   unsigned events;
+   unsigned events_elsewhere;
 
    int fd;
 
@@ -122,9 +242,15 @@ typedef struct input_ctx_wayland_data
    struct
    {
       struct wl_surface *surface;
-      int last_x, last_y;
-      int x, y;
-      int delta_x, delta_y;
+      uint32_t last_pos;   /* VIDEO_POS_PACK */
+      uint32_t pos;        /* VIDEO_POS_PACK */
+      uint32_t delta;      /* VIDEO_POS_PACK */
+      /* Scroll of the current wl_pointer frame (seat v5+) */
+      int axis_120[2];
+      int axis_ticks[2];
+      wl_fixed_t axis_value[2];
+      uint32_t axis_source;
+      bool axis_discrete;
       bool last_valid;
       bool focus;
       bool left, right, middle, side, extra;
@@ -144,6 +270,29 @@ typedef struct data_offer_ctx
   enum wl_data_device_manager_dnd_action supported_actions;
 } data_offer_ctx;
 
+/* Per-backend hook invoked from the common shell-surface configure
+ * handlers, between the shared configure processing and the clearing
+ * of 'configured'.  EGL uses it to resize/create the wl_egl_window;
+ * Vulkan needs no additional action and passes NULL. */
+/* Not on webOS, whose Wayland library is an older one, without proxy
+ * wrappers or wl_display_roundtrip_queue(): its own code puts the seat
+ * on the input queue with what it has (wayland_common_webos.c), and
+ * the input driver's poll dispatches it the same way
+ * (WAYLAND_HAVE_QUEUE_DISPATCH, which needs only reads of one queue -
+ * and the backport, where it is built, falls back to the default queue
+ * on a library without them). */
+#ifndef WEBOS
+#define WAYLAND_HAVE_INPUT_QUEUE 1
+#endif
+#define WAYLAND_HAVE_QUEUE_DISPATCH 1
+
+/* The input driver's poll: dispatch the input queue, reading the
+ * connection if nothing else has. Where there is no input queue it is
+ * flush_wayland_fd(), which dispatches everything. */
+void wayland_input_dispatch(input_ctx_wayland_data_t *wl);
+
+typedef void (*driver_configure_handler_t)(struct gfx_ctx_wayland_data *wl);
+
 typedef struct gfx_ctx_wayland_data
 {
 #ifdef HAVE_EGL
@@ -160,8 +309,16 @@ typedef struct gfx_ctx_wayland_data
    struct wp_fractional_scale_v1 *fractional_scale;
    struct xdg_wm_base *xdg_shell;
    struct xdg_toplevel *xdg_toplevel;
-   struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
    struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager;
+   struct xdg_toplevel_tag_manager_v1 *xdg_toplevel_tag_manager;
+   struct wp_tearing_control_manager_v1 *tearing_control_manager;
+   struct wp_tearing_control_v1 *tearing_control;
+   /* The compositor's colour management, for an HDR GL surface */
+   wl_color_t color;
+   wl_present_t present;
+   wl_frame_t frame;
+   /* The GPUs the GL GPU index chooses from, as published to the menu */
+   struct string_list *gl_gpu_list;
    struct wl_keyboard *wl_keyboard;
    struct wl_pointer  *wl_pointer;
    struct zwp_relative_pointer_v1 *wl_relative_pointer;
@@ -171,11 +328,21 @@ typedef struct gfx_ctx_wayland_data
    struct wl_shm *shm;
    struct wl_data_device_manager *data_device_manager;
    struct wl_data_device *data_device;
+#ifdef WEBOS
+   struct wl_shell *shell;
+   struct wl_shell_surface *shell_surface;
+   struct wl_webos_shell *webos_shell;
+   struct wl_webos_shell_surface *webos_shell_surface;
+#ifdef HAVE_WEBOS_EXTRA_PROTOS
+   struct wl_webos_foreign *webos_foreign;
+   struct wl_webos_surface_group_compositor *webos_surface_group_compositor;
+   struct wl_webos_input_manager *webos_input_manager;
+#endif
+#endif
    data_offer_ctx *current_drag_offer;
 #ifdef HAVE_LIBDECOR_H
    struct libdecor *libdecor_context;
    struct libdecor_frame *libdecor_frame;
-   struct xdg_toplevel_icon_v1 *libdecor_icon;
 #ifdef HAVE_DYLIB
    dylib_t libdecor;
 #define RA_WAYLAND_SYM(rc,fn,params) rc (*fn) params;
@@ -201,40 +368,68 @@ typedef struct gfx_ctx_wayland_data
    struct wl_list all_outputs;
    struct wl_list current_outputs;
 
+#ifdef WEBOS
+   struct wl_list all_seats;
+#endif
    struct
    {
       struct wl_cursor *default_cursor;
       struct wl_cursor_theme *theme;
       struct wl_surface *surface;
       uint32_t serial;
+      unsigned scale;   /* the scale the theme was loaded at */
       bool visible;
    } cursor;
 
    int num_active_touches;
    int swap_interval;
    touch_pos_t active_touch_positions[MAX_TOUCHES]; /* int32_t alignment */
-   unsigned width;
-   unsigned height;
-   unsigned buffer_width;
-   unsigned buffer_height;
-   unsigned floating_width;
-   unsigned floating_height;
+   /* The surface's size, the buffer behind it, and the size to go
+    * back to when the compositor lets the window float again, each
+    * packed. */
+   unsigned dims;
+   unsigned buffer_dims;
+   unsigned floating_dims;
+   /* Taken when the context is made, which a change of the setting
+    * redoes: swap_buffers runs on the thread that draws */
+   unsigned max_swapchain_images;
    unsigned last_buffer_scale;
    unsigned pending_buffer_scale;
    unsigned buffer_scale;
+   unsigned preferred_buffer_scale; /* wl_surface v6; 0 until sent */
    unsigned last_fractional_scale_num;
    unsigned pending_fractional_scale_num;
    unsigned fractional_scale_num;
-
+#ifdef WEBOS
+   uint32_t webos_surface_state;
+#endif
    bool core_hw_context_enable;
    bool fullscreen;
+   bool fullscreen_requested;
+   bool fullscreen_pending;
    bool maximized;
    bool resize;
    bool configured;
+   bool suspended;
    bool ignore_configuration;
+   driver_configure_handler_t driver_configure_handler;
+   /* State from xdg_toplevel.configure, held until the compositor's
+    * xdg_surface.configure marks it current (xdg-shell latching). */
+   struct
+   {
+      /* The size asked for, packed; a zero axis leaves the choice
+       * to us. */
+      unsigned dims;
+      bool fullscreen;
+      bool maximized;
+      bool resizing;
+      bool activated;
+      bool floating;
+      bool suspended;
+      bool pending;
+   } cfg_pending;
    bool activated;
    bool reported_display_size;
-   bool swap_complete;
 } gfx_ctx_wayland_data_t;
 
 #ifdef HAVE_XKBCOMMON
@@ -247,6 +442,10 @@ void free_xkb(void);
 #endif
 
 void gfx_ctx_wl_show_mouse(void *data, bool state);
+
+/* Loads the cursor theme at the scale the surface is drawn at; does
+ * nothing while the loaded one still fits. */
+void gfx_ctx_wl_cursor_load(gfx_ctx_wayland_data_t *wl);
 
 void flush_wayland_fd(void *data);
 
@@ -268,7 +467,6 @@ extern const struct wl_surface_listener wl_surface_listener;
 
 extern const struct xdg_wm_base_listener xdg_shell_listener;
 
-extern const struct xdg_surface_listener xdg_surface_listener;
 
 extern const struct wl_output_listener output_listener;
 
@@ -279,5 +477,10 @@ extern const struct wl_buffer_listener shm_buffer_listener;
 extern const struct wl_data_device_listener data_device_listener;
 
 extern const struct wl_data_offer_listener data_offer_listener;
+
+#ifdef WEBOS
+extern void wl_keyboard_handle_key_webos(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+   uint32_t time, uint32_t key, uint32_t state);
+#endif
 
 #endif

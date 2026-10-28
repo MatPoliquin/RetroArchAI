@@ -3,6 +3,7 @@
  *  Copyright (C) 2011-2017 - Daniel De Matteis
  *  Copyright (C) 2012-2015 - Michael Lelli
  *  Copyright (C) 2013-2014 - Steven Crowe
+ *  Copyright (C) 2026      - Adam "TideGear" Milecki
  *
  *  RetroArch is free software: you can redistribute it and/or modify it under the terms *  of the GNU General Public License as published by the Free Software Found-
  *  ation, either version 3 of the License, or (at your option) any later version.
@@ -63,10 +64,11 @@ static int32_t android_joypad_button_state(
 static int32_t android_joypad_button(unsigned port, uint16_t joykey)
 {
    struct android_app *android_app = (struct android_app*)g_android;
-   uint8_t *buf                    = android_keyboard_state_get(port);
+   uint8_t *buf;
 
    if (port >= DEFAULT_MAX_PADS)
       return 0;
+   buf = android_keyboard_state_get(port);
 
    return android_joypad_button_state(android_app, buf, port, joykey);
 }
@@ -93,40 +95,46 @@ static int16_t android_joypad_axis_state(
 static int16_t android_joypad_axis(unsigned port, uint32_t joyaxis)
 {
    struct android_app *android_app = (struct android_app*)g_android;
+
+   if (port >= DEFAULT_MAX_PADS)
+      return 0;
+
    return android_joypad_axis_state(android_app, port, joyaxis);
 }
 
 static int16_t android_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
-   unsigned i;
+   int i;
    int16_t ret                          = 0;
    struct android_app *android_app      = (struct android_app*)g_android;
-   uint8_t *buf                         = android_keyboard_state_get(port);
+   uint8_t *buf;
    uint16_t port_idx                    = joypad_info->joy_idx;
 
    if (port_idx >= DEFAULT_MAX_PADS)
       return 0;
 
+   buf = android_keyboard_state_get(port_idx);
+
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
-      if ((uint16_t)joykey != NO_BTN 
+      const uint64_t joykey = joykeys[i];
+
+      const uint32_t joyaxis = joyaxes[i];
+
+      if ((uint16_t)joykey != NO_BTN
             && android_joypad_button_state(
                android_app,
                buf,
                port_idx, (uint16_t)joykey))
-         ret |= ( 1 << i);
-      else if (joyaxis != AXIS_NONE &&
-            ((float)abs(android_joypad_axis_state(
-                  android_app, port_idx, joyaxis)) 
-             / 0x8000) > joypad_info->axis_threshold)
+         ret |= (1 << i);
+      else if (joyaxis != AXIS_NONE
+            && ((float)abs(android_joypad_axis_state(
+               android_app, port_idx, joyaxis))
+               / 0x8000) > joypad_info->axis_threshold)
          ret |= (1 << i);
    }
 
@@ -142,7 +150,7 @@ static bool android_joypad_query_pad(unsigned pad)
 
 static void android_joypad_destroy(void)
 {
-   unsigned i, j;
+   int i, j;
    struct android_app *android_app = (struct android_app*)g_android;
 
    for (i = 0; i < DEFAULT_MAX_PADS; i++)
@@ -167,46 +175,120 @@ static void android_input_set_rumble_internal(
       uint16_t *last_strength_strong,
       uint16_t *last_strength_weak,
       uint16_t *last_strength,
-      int8_t   id,
-      enum retro_rumble_effect effect
-      )
+      int      id,
+      enum retro_rumble_effect effect)
 {
-   JNIEnv *env           = (JNIEnv*)jni_thread_getenv();
-   uint16_t new_strength = 0;
+   JNIEnv *env = (JNIEnv*)jni_thread_getenv();
 
    if (!env)
       return;
 
+   /* Update the per-channel state independently. */
    if (effect == RETRO_RUMBLE_STRONG)
-   {
-      new_strength          = strength | *last_strength_weak;
       *last_strength_strong = strength;
-   }
    else if (effect == RETRO_RUMBLE_WEAK)
-   {
-      new_strength         = strength | *last_strength_strong;
       *last_strength_weak  = strength;
+
+   /* USB HID raw-output path.
+    *
+    * doVibrateUSB sends an output report directly to the controller via
+    * UsbManager, bypassing the Android HID driver stack. This is required
+    * for USB-connected DS4/DualSense controllers where the HID driver exposes
+    * only 1 vibrator instead of the 2 the hardware has.
+    *
+    * Returns true if the HID report was sent successfully, in which case we
+    * skip the VibratorManager path. Falls back gracefully on unknown VID/PID,
+    * permission denial, or transfer failure.
+    *
+    * id == -1 is the device-vibration sentinel (not a controller); skip it. */
+   if (id != -1 && g_android->doVibrateUSB)
+   {
+      int      strong_usb;
+      int      weak_usb;
+      uint16_t new_combined_usb;
+      jboolean usb_handled;
+
+      strong_usb      = (int)((255.0f / 65535.0f) * (float)*last_strength_strong);
+      weak_usb        = (int)((255.0f / 65535.0f) * (float)*last_strength_weak);
+      new_combined_usb = (uint16_t)((strong_usb << 8) | weak_usb);
+
+      if (new_combined_usb != *last_strength)
+      {
+         CALL_BOOLEAN_METHOD_PARAM(env, usb_handled,
+               g_android->activity->clazz,
+               g_android->doVibrateUSB,
+               (jint)id, (jint)strong_usb, (jint)weak_usb);
+
+         if (usb_handled != JNI_FALSE)
+         {
+            *last_strength = new_combined_usb;
+            return;
+         }
+      }
+      else
+         return; /* No change; assume last USB send is still active. */
+      /* Fall through to VibratorManager path. */
    }
 
-   if (new_strength != *last_strength)
+   /* Controller dual-motor path (Android 12+):
+    *
+    * doVibrateJoypad receives both channels separately so the Java side
+    * can drive each controller motor independently via VibratorManager.
+    *
+    * The old code OR-merged strong | weak into a single amplitude before
+    * calling doVibrate, which destroyed motor separation and made the
+    * weak (small/high-freq) and strong (large/low-freq) motors feel
+    * identical. */
+   if (id >= 0 && g_android->doVibrateJoypad)
    {
-      /* trying to send this value as a JNI param without 
-       * storing it first was causing 0 to be seen on the other side ?? */
-      int strength_final   = (255.0f / 65535.0f) * (float)new_strength;
+      /* Normalize the 0–65535 libretro range into 0–255 Android amplitude.
+       * Storing first avoids the JNI zero-value bug noted below. */
+      int strong_final = (int)((255.0f / 65535.0f) * (float)*last_strength_strong);
+      int weak_final   = (int)((255.0f / 65535.0f) * (float)*last_strength_weak);
 
-      CALL_VOID_METHOD_PARAM(env, g_android->activity->clazz,
-            g_android->doVibrate, (jint)id, (jint)RETRO_RUMBLE_STRONG, (jint)strength_final, (jint)0);
+      /* Pack both 0–255 amplitudes into the uint16_t for change detection:
+       * high byte = strong amplitude, low byte = weak amplitude. */
+      uint16_t new_combined = (uint16_t)((strong_final << 8) | weak_final);
 
-      *last_strength = new_strength;
+      if (new_combined != *last_strength)
+      {
+         CALL_VOID_METHOD_PARAM(env, g_android->activity->clazz,
+               g_android->doVibrateJoypad, (jint)id,
+               (jint)strong_final, (jint)weak_final, (jint)0);
+
+         *last_strength = new_combined;
+      }
+      return;
+   }
+
+   /* Legacy single-vibrator fallback:
+    * - Device vibration path (id == -1)
+    * - Android < 12 builds where doVibrateJoypad is unavailable
+    * OR-merge preserves the original behavior for these cases so that
+    * controllers still rumble rather than going completely silent. */
+   {
+      uint16_t new_strength = *last_strength_strong | *last_strength_weak;
+
+      if (new_strength != *last_strength)
+      {
+         /* trying to send this value as a JNI param without
+          * storing it first was causing 0 to be seen on the other side ?? */
+         int strength_final   = (255.0f / 65535.0f) * (float)new_strength;
+
+         CALL_VOID_METHOD_PARAM(env, g_android->activity->clazz,
+               g_android->doVibrate, (jint)id, (jint)RETRO_RUMBLE_STRONG,
+               (jint)strength_final, (jint)0);
+
+         *last_strength = new_strength;
+      }
    }
 }
 
 static bool android_joypad_rumble(unsigned port,
       enum retro_rumble_effect type, uint16_t strength)
 {
-   settings_t *settings            = config_get_ptr();
    struct android_app *android_app = (struct android_app*)g_android;
-   bool enable_device_vibration    = settings->bools.enable_device_vibration;
+   bool enable_device_vibration    = input_config_get_device_vibration();
 
    if (!android_app || !android_app->doVibrate)
       return false;
@@ -229,7 +311,6 @@ static bool android_joypad_rumble(unsigned port,
             type);
    }
    else
-   {
       android_input_set_rumble_internal(
             strength,
             &android_app->rumble_last_strength_strong[port],
@@ -237,7 +318,6 @@ static bool android_joypad_rumble(unsigned port,
             &android_app->rumble_last_strength[port],
             android_app->id[port],
             type);
-   }
 
    return true;
 }

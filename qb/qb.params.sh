@@ -2,14 +2,12 @@
 # $1 = HAVE_$1
 # $2 = value ['auto', 'no' or 'yes', checked only if non-empty]
 add_opt()
-{	setval="$(eval "printf %s \"\$USER_$1\"")"
+{	eval "setval=\${USER_$1}"
 	[ "${2:-}" ] && ! match "$setval" no yes && eval "HAVE_$1=\"$2\""
 
-	for opt in $(printf %s "$CONFIG_OPTS"); do
-		case "$opt" in
-			"$1") return 0 ;;
-		esac
-	done
+	case " $CONFIG_OPTS " in
+		*" $1 "*) return 0 ;;
+	esac
 
 	CONFIG_OPTS="${CONFIG_OPTS} $1"
 }
@@ -56,8 +54,10 @@ EOF
 	print_help_option 'Both options are shown:'  'Default is auto (included if the necessary library is present)'
 	printf %s\\n '' 'Custom options:'
 
-	while read -r VAR _ COMMENT; do
+	while read -r VAR SEP COMMENT; do
 		case "$VAR" in
+			'') continue;;
+			'#') printf '\n %s:\n' "$SEP${COMMENT:+ $COMMENT}"; continue;;
 			'C89_'*|'CXX_'*) continue;;
 			*)
 			TMPVAR="${VAR%=*}"
@@ -92,7 +92,19 @@ parse_input() # Parse stuff :V
 	CONFIG_OPTS=''
 	config_opts='./configure'
 
-	while read -r VAR _; do
+	while read -r VAR _ || [ -n "$VAR" ]; do
+		# Skip blank lines and comment-only lines.  Only HAVE_* or
+		# bare-name=VALUE assignments are meaningful here; anything
+		# else (like "# comment") would produce a broken eval such
+		# as 'USER_#=auto'.
+		#
+		# The `|| [ -n "$VAR" ]` lets us process the final line even
+		# when config.params.sh has no trailing newline; otherwise
+		# `read` returns non-zero at EOF and the loop body is skipped,
+		# silently dropping whichever option happens to be last.
+		case "$VAR" in
+			''|'#'*) continue ;;
+		esac
 		TMPVAR="${VAR%=*}"
 		NEWVAR="${TMPVAR##HAVE_}"
 		OPTS="${OPTS} $NEWVAR"

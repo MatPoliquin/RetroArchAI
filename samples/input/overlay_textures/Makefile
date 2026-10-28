@@ -1,0 +1,69 @@
+include ../../sample_objdir.mk
+
+TARGET := overlay_textures_test
+
+REPO_ROOT         := ../../..
+LIBRETRO_COMM_DIR := $(REPO_ROOT)/libretro-common
+
+# The real page/texture code and the real gfx_surface; the video
+# driver is the stub in stubs_retroarch.c. Built without HAVE_THREADS:
+# the synchronous upload is the path that regressed.
+SOURCES := \
+	overlay_textures_test.c \
+	stubs_retroarch.c \
+	$(REPO_ROOT)/input/input_overlay_textures.c \
+	$(REPO_ROOT)/input/input_overlay_alpha.c \
+	$(REPO_ROOT)/gfx/gfx_surface.c \
+	$(REPO_ROOT)/gfx/gfx_surface_player.c \
+	$(LIBRETRO_COMM_DIR)/formats/video_player.c \
+	$(REPO_ROOT)/libretro-common/formats/image/image_yuv_blit.c \
+	$(LIBRETRO_COMM_DIR)/formats/image_texture.c \
+	$(LIBRETRO_COMM_DIR)/formats/image_texture_set.c \
+	$(LIBRETRO_COMM_DIR)/formats/image_transfer.c \
+	$(LIBRETRO_COMM_DIR)/formats/dds/rdds.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \
+	$(LIBRETRO_COMM_DIR)/time/rtime.c
+
+
+# The DDS loader is the one decoder linked: the BCn lanes load a real
+# DXT1 file, and an image the driver cannot sample is decoded by it.
+CFLAGS  += -Wall -std=gnu99 -g1 -O1 -DHAVE_OVERLAY -DHAVE_RDDS -ffunction-sections \
+           -I$(REPO_ROOT) -I$(LIBRETRO_COMM_DIR)/include
+LDFLAGS += -Wl,--gc-sections -lm
+
+# THREADS=1 puts the threaded wrapper's stub in (stubs_retroarch.c) and
+# adds the lanes that decide the race between the posts and the poll.
+ifeq ($(THREADS),1)
+   CFLAGS += -DHAVE_THREADS
+   # the playbacks' decode worker
+   SOURCES += $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+              $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
+              $(LIBRETRO_COMM_DIR)/rthreads/tpool.c
+   LDFLAGS += -lpthread
+endif
+
+OBJS := $(call sample_objs,$(SOURCES:.c=.o))
+
+ifneq ($(SANITIZER),)
+   CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
+   LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
+endif
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $(OBJS) $(LDFLAGS)
+
+check: all
+	./$(TARGET)
+
+clean:
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(OBJS) $(TARGET)
+
+.PHONY: all check clean
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(COMPILE.c) $(OUTPUT_OPTION) $<

@@ -25,9 +25,10 @@
 struct hidpad_ps2adapter_data
 {
    struct pad_connection* connection;
-   uint8_t data[64];
    uint32_t slot;
    uint32_t buttons;
+   uint8_t axis[4];
+   input_pad_view_t view;  /* what the getters answer */
 };
 
 static void* hidpad_ps2adapter_init(void *data, uint32_t slot,
@@ -63,18 +64,22 @@ static void hidpad_ps2adapter_deinit(void *data)
 
 static void hidpad_ps2adapter_get_buttons(void *data, input_bits_t *state)
 {
-	struct hidpad_ps2adapter_data *device = 
-      (struct hidpad_ps2adapter_data*)data;
-
-	if (device)
-   {
-		BITS_COPY16_PTR(state, device->buttons);
-	}
+   struct hidpad_ps2adapter_data *device = (struct hidpad_ps2adapter_data*)data;
+   if (device)
+      *state = device->view.buttons;
    else
-		BIT256_CLEAR_ALL_PTR(state);
+      BIT256_CLEAR_ALL_PTR(state);
 }
 
 static int16_t hidpad_ps2adapter_get_axis(void *data, unsigned axis)
+{
+   struct hidpad_ps2adapter_data *device = (struct hidpad_ps2adapter_data*)data;
+   if (!device || axis >= INPUT_PAD_VIEW_AXES)
+      return 0;
+   return device->view.axes[axis];
+}
+
+static int16_t hidpad_ps2adapter_axis_of(void *data, unsigned axis)
 {
    int val                               = 0;
    struct hidpad_ps2adapter_data *device = (struct hidpad_ps2adapter_data*)data;
@@ -82,21 +87,7 @@ static int16_t hidpad_ps2adapter_get_axis(void *data, unsigned axis)
    if (!device || axis >= 4)
       return 0;
 
-   switch (axis)
-   {
-      case 0:
-         val = device->data[4];
-         break;
-      case 1:
-         val = device->data[5];
-         break;
-      case 2:
-         val = device->data[3];
-         break;
-      case 3:
-         val = device->data[2];
-         break;
-   }
+   val = device->axis[axis];
 
    val = (val << 8) - 0x8000;
 
@@ -136,7 +127,7 @@ static void hidpad_ps2adapter_packet_handler(void *data, uint8_t *packet, uint16
    };
    struct hidpad_ps2adapter_data *device = (struct hidpad_ps2adapter_data*)data;
 
-   if (!device)
+   if (!device || size < 8)
       return;
 
    /* Check if the data corresponds to the first controller, 
@@ -144,21 +135,31 @@ static void hidpad_ps2adapter_packet_handler(void *data, uint8_t *packet, uint16
    if (packet[1] != 1)
       return;
 
-   memcpy(device->data, packet, size);
+   device->axis[0] = packet[4];
+   device->axis[1] = packet[5];
+   device->axis[2] = packet[3];
+   device->axis[3] = packet[2];
 
    device->buttons = 0;
-   pressed_keys    = device->data[7] | (device->data[6] << 8);
+   pressed_keys    = packet[7] | (packet[6] << 8);
 
    for (i = 0; i < 16; i ++)
       if (button_mapping[i] != NO_BTN)
          device->buttons |= (pressed_keys & (1 << i)) ? (UINT64_C(1) << button_mapping[i]) : 0;
 
    /* Now process the hat values as if they were pad buttons */
-   hat_value = PS2_H_GET(device->data[6]);
+   hat_value = PS2_H_GET(packet[6]);
    device->buttons |= PS2_H_LEFT(hat_value)  ? (UINT64_C(1) << RETRO_DEVICE_ID_JOYPAD_LEFT) : 0;
    device->buttons |= PS2_H_RIGHT(hat_value) ? (UINT64_C(1) << RETRO_DEVICE_ID_JOYPAD_RIGHT) : 0;
    device->buttons |= PS2_H_UP(hat_value)    ? (UINT64_C(1) << RETRO_DEVICE_ID_JOYPAD_UP) : 0;
    device->buttons |= PS2_H_DOWN(hat_value)  ? (UINT64_C(1) << RETRO_DEVICE_ID_JOYPAD_DOWN) : 0;
+   /* the view, which the getters and the frontend read */
+   pad_view_set_buttons(&device->view, device->buttons & 0xffff, false);
+   {
+      unsigned a;
+      for (a = 0; a < 4; a++)
+         device->view.axes[a] = hidpad_ps2adapter_axis_of(device, a);
+   }
 }
 
 static void hidpad_ps2adapter_set_rumble(void *data,
@@ -175,7 +176,12 @@ static int32_t hidpad_ps2adapter_button(void *data, uint16_t joykey)
    struct hidpad_ps2adapter_data *pad = (struct hidpad_ps2adapter_data*)data;
    if (!pad || joykey > 31)
       return 0;
-   return pad->buttons & (1 << joykey);
+   return BIT256_GET(pad->view.buttons, joykey) ? 1 : 0;
+}
+
+static const input_pad_view_t *hidpad_ps2adapter_view(void *data)
+{
+   return &((struct hidpad_ps2adapter_data*)data)->view;
 }
 
 pad_connection_interface_t pad_connection_ps2adapter = {
@@ -187,5 +193,12 @@ pad_connection_interface_t pad_connection_ps2adapter = {
    hidpad_ps2adapter_get_axis,
    hidpad_ps2adapter_get_name,
    hidpad_ps2adapter_button,
-   false,
+   false, /* multi_pad */
+   0,     /* max_pad */
+   NULL,  /* pad_init */
+   NULL,  /* pad_deinit */
+   NULL,  /* status */
+   NULL,  /* joypad */
+   NULL,  /* set_player */
+   hidpad_ps2adapter_view
 };

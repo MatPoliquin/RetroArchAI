@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include <retro_inline.h>
+#include <memalign.h>
 #include <compat/strl.h>
 #include <compat/intrinsics.h>
 
@@ -44,6 +45,13 @@
 /* Keep it off unless you're chasing a core bug, it slows things down. */
 #define STRICT_BUF_SIZE 0
 
+/* A dirty run of this many words or more is copied with memcpy; a
+ * shorter one by the loop, which for the few-word runs that dominate
+ * a delta costs less than a call. */
+#ifndef STATE_MANAGER_MEMCPY_WORDS
+#define STATE_MANAGER_MEMCPY_WORDS 32
+#endif
+
 #ifndef UINT16_MAX
 #define UINT16_MAX 0xffff
 #endif
@@ -63,35 +71,249 @@
 
 #if __SSE2__
 #include <emmintrin.h>
+/* An AVX2 scanner doubles the bytes compared per iteration. It is selected at
+ * runtime, and is only built where the compiler can emit an AVX2 function
+ * without raising the baseline ISA for the whole file. */
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__))
+#include <immintrin.h>
+#include <features/features_cpu.h>
+#if defined(__clang__) && (defined(__SCE__) || defined(_MSC_VER))
+/* Clang's immintrin.h for PlayStation and clang-cl only declares the
+ * intrinsics of ISAs enabled for the whole build, so per-function
+ * targets cannot reach them; build a tier only when the baseline has it. */
+#ifdef __AVX2__
+#define STATE_MANAGER_HAVE_AVX2_SCAN 1
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#define STATE_MANAGER_HAVE_AVX512_SCAN 1
+#endif
+#else
+#define STATE_MANAGER_HAVE_AVX2_SCAN 1
+/* AVX-512BW intrinsics need GCC 5 or Clang 4. RETRO_SIMD_AVX512 promises
+ * BW, so the flag alone gates the scanner at runtime. */
+#if (defined(__clang__) && __clang_major__ >= 4) \
+   || (!defined(__clang__) && __GNUC__ >= 5)
+#define STATE_MANAGER_HAVE_AVX512_SCAN 1
+#endif
+#endif
+#endif
 #endif
 
-/* Format per frame (pseudocode): */
-#if 0
-size nextstart;
-repeat {
-   uint16 numchanged; /* everything is counted in units of uint16 */
-   if (numchanged)
-   {
-      uint16 numunchanged; /* skip these before handling numchanged */
-      uint16[numchanged] changeddata;
-   }
-   else
-   {
-      uint32 numunchanged;
-      if (!numunchanged)
-         break;
-   }
-}
-size thisstart;
+/* Tail padding on each block, in bytes. Must be >= the widest vector load
+ * find_change() or find_same() can issue (64 for AVX-512). */
+#define STATE_MANAGER_SCAN_PAD 64
+
+/* The scan tiers are compiled as whole copies of raw_compress (below), so
+ * the scans must inline into each copy: a call per scan costs more than
+ * the scan on a densely dirty state. */
+#ifdef STATE_MANAGER_HAVE_AVX2_SCAN
+#define STATE_MANAGER_SCAN_INLINE static INLINE __attribute__((always_inline))
+#else
+#define STATE_MANAGER_SCAN_INLINE static INLINE
 #endif
 
 /* There's no equivalent in libc, you'd think so ...
  * std::mismatch exists, but it's not optimized at all. */
-static size_t find_change(const uint16_t *a, const uint16_t *b)
+#ifdef STATE_MANAGER_HAVE_AVX2_SCAN
+__attribute__((target("avx2")))
+static INLINE size_t find_change_avx2(const uint16_t *a, const uint16_t *b)
+{
+   const __m256i *a256;
+   const __m256i *b256;
+   /* Dirty states call this every few words; a 16-byte look first keeps
+    * those short scans at SSE2 latency before going wide. */
+   uint32_t head = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_loadu_si128((const __m128i*)a),
+            _mm_loadu_si128((const __m128i*)b)));
+
+   if (head != 0xffff)
+      return (size_t)compat_ctz(~head & 0xffff) >> 1;
+   head = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+            _mm256_loadu_si256((const __m256i*)(a + 8)),
+            _mm256_loadu_si256((const __m256i*)(b + 8))));
+   if (head != 0xffffffffu)
+      return (16 + (size_t)compat_ctz(~head)) >> 1;
+
+   /* The first 48 bytes are equal; step back to the 32-byte boundary
+    * inside them so the loads below never straddle a line. */
+   a256 = (const __m256i*)((uintptr_t)(a + 24) & ~(uintptr_t)31);
+   b256 = (const __m256i*)((const uint8_t*)b
+         + ((const uint8_t*)a256 - (const uint8_t*)a));
+
+   for (;;)
+   {
+      __m256i v0    = _mm256_loadu_si256(a256);
+      __m256i v1    = _mm256_loadu_si256(b256);
+      __m256i c     = _mm256_cmpeq_epi8(v0, v1);
+      uint32_t mask = (uint32_t)_mm256_movemask_epi8(c);
+
+      if (mask != 0xffffffffu)
+      {
+         size_t ret = ((size_t)((const uint8_t*)a256 - (const uint8_t*)a)
+               + (size_t)compat_ctz(~mask));
+
+         return (ret >> 1);
+      }
+
+      a256++;
+      b256++;
+   }
+}
+
+/* Same scan for the first equal 32-bit word as the SSE2 loop in
+ * find_same(), eight words per step. */
+__attribute__((target("avx2")))
+static INLINE const uint32_t *find_same_avx2(const uint32_t *a, const uint32_t *b)
+{
+   /* A dirty run usually ends within a word or two: look at four first. */
+   unsigned head = (unsigned)_mm_movemask_ps(_mm_castsi128_ps(
+            _mm_cmpeq_epi32(_mm_loadu_si128((const __m128i*)a),
+               _mm_loadu_si128((const __m128i*)b))));
+
+   if (head)
+      return a + compat_ctz(head);
+
+   a += 4;
+   b += 4;
+
+   for (;;)
+   {
+      __m256i v0 = _mm256_loadu_si256((const __m256i*)a);
+      __m256i v1 = _mm256_loadu_si256((const __m256i*)b);
+      unsigned mask = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+               _mm256_cmpeq_epi32(v0, v1)));
+
+      if (mask)
+         return a + compat_ctz(mask);
+
+      a += 8;
+      b += 8;
+   }
+}
+
+#ifdef STATE_MANAGER_HAVE_AVX512_SCAN
+/* 64 bytes per compare, and the compare writes the mask directly: no
+ * movemask, and the first differing byte is the lowest set bit. */
+__attribute__((target("avx512f,avx512bw")))
+static INLINE size_t find_change_avx512(const uint16_t *a, const uint16_t *b)
+{
+   const uint8_t *a8 = (const uint8_t*)a + 80;
+   const uint8_t *b8 = (const uint8_t*)b + 80;
+   /* Widen as the scan proves long: 16 bytes, then two 32-byte steps, and
+    * only then 64. Most scans in a dirty state end in the first 80 bytes,
+    * where the narrow compares answer sooner than a 64-byte one. */
+   unsigned head = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_loadu_si128((const __m128i*)a),
+            _mm_loadu_si128((const __m128i*)b)));
+   uint32_t m32;
+
+   if (head != 0xffff)
+      return (size_t)compat_ctz(~head & 0xffff) >> 1;
+   m32 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+            _mm256_loadu_si256((const __m256i*)((const uint8_t*)a + 16)),
+            _mm256_loadu_si256((const __m256i*)((const uint8_t*)b + 16))));
+   if (m32 != 0xffffffffu)
+      return (16 + (size_t)compat_ctz(~m32)) >> 1;
+   m32 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+            _mm256_loadu_si256((const __m256i*)((const uint8_t*)a + 48)),
+            _mm256_loadu_si256((const __m256i*)((const uint8_t*)b + 48))));
+   if (m32 != 0xffffffffu)
+      return (48 + (size_t)compat_ctz(~m32)) >> 1;
+
+   /* The first 80 bytes are equal; step back to the line boundary inside
+    * them so every 64-byte load from here is a whole line. */
+   a8 = (const uint8_t*)((uintptr_t)a8 & ~(uintptr_t)63);
+   b8 = (const uint8_t*)b + (a8 - (const uint8_t*)a);
+
+   for (;;)
+   {
+      __mmask64 mask = _mm512_cmpneq_epi8_mask(
+            _mm512_loadu_si512((const void*)a8),
+            _mm512_loadu_si512((const void*)b8));
+
+      if (mask)
+         return ((size_t)(a8 - (const uint8_t*)a)
+               + compat_ctz_u64((uint64_t)mask)) >> 1;
+
+      a8 += 64;
+      b8 += 64;
+   }
+}
+
+__attribute__((target("avx512f,avx512bw")))
+static INLINE const uint32_t *find_same_avx512(const uint32_t *a, const uint32_t *b)
+{
+   /* Four words, then eight, then sixteen a step, as find_change_avx512. */
+   unsigned head = (unsigned)_mm_movemask_ps(_mm_castsi128_ps(
+            _mm_cmpeq_epi32(_mm_loadu_si128((const __m128i*)a),
+               _mm_loadu_si128((const __m128i*)b))));
+
+   if (head)
+      return a + compat_ctz(head);
+   head = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+            _mm256_cmpeq_epi32(_mm256_loadu_si256((const __m256i*)(a + 4)),
+               _mm256_loadu_si256((const __m256i*)(b + 4)))));
+   if (head)
+      return a + 4 + compat_ctz(head);
+
+   a += 12;
+   b += 12;
+
+   for (;;)
+   {
+      __mmask16 mask = _mm512_cmpeq_epi32_mask(
+            _mm512_loadu_si512((const void*)a),
+            _mm512_loadu_si512((const void*)b));
+
+      if (mask)
+         return a + compat_ctz((unsigned)mask);
+
+      a += 16;
+      b += 16;
+   }
+}
+#endif
+
+/* 0 = SSE2, 1 = AVX2, 2 = AVX-512BW. Read once; the CPU does not change.
+ * File scope so samples/state_rewind can pin each tier the CPU allows and
+ * check they all produce the same patch. */
+static int state_manager_scan_cached = -1;
+
+static int state_manager_scan_tier(void)
+{
+   if (state_manager_scan_cached < 0)
+   {
+      uint64_t cpu = cpu_features_get();
+      int tier     = 0;
+      if (cpu & RETRO_SIMD_AVX2)
+         tier = 1;
+#ifdef STATE_MANAGER_HAVE_AVX512_SCAN
+      if (cpu & RETRO_SIMD_AVX512)
+         tier = 2;
+#endif
+      state_manager_scan_cached = tier;
+   }
+   return state_manager_scan_cached;
+}
+#endif
+
+/* 'tier' is a constant in each copy of raw_compress, so the branches on
+ * it fold away. */
+STATE_MANAGER_SCAN_INLINE size_t find_change(const uint16_t *a,
+      const uint16_t *b, int tier)
 {
 #if __SSE2__
    const __m128i *a128 = (const __m128i*)a;
    const __m128i *b128 = (const __m128i*)b;
+
+#ifdef STATE_MANAGER_HAVE_AVX512_SCAN
+   if (tier == 2)
+      return find_change_avx512(a, b);
+#endif
+#ifdef STATE_MANAGER_HAVE_AVX2_SCAN
+   if (tier == 1)
+      return find_change_avx2(a, b);
+#endif
 
    for (;;)
    {
@@ -115,6 +337,7 @@ static size_t find_change(const uint16_t *a, const uint16_t *b)
    }
 #else
    const uint16_t *a_org = a;
+   (void)tier;
 #ifdef NO_UNALIGNED_MEM
    while (((uintptr_t)a & (sizeof(size_t) - 1)) && *a == *b)
    {
@@ -145,9 +368,11 @@ static size_t find_change(const uint16_t *a, const uint16_t *b)
 #endif
 }
 
-static size_t find_same(const uint16_t *a, const uint16_t *b)
+STATE_MANAGER_SCAN_INLINE size_t find_same(const uint16_t *a,
+      const uint16_t *b, int tier)
 {
    const uint16_t *a_org = a;
+   (void)tier;
 #ifdef NO_UNALIGNED_MEM
    if (((uintptr_t)a & (sizeof(uint32_t) - 1)) && *a != *b)
    {
@@ -168,11 +393,50 @@ static size_t find_same(const uint16_t *a, const uint16_t *b)
       const uint32_t *a_big = (const uint32_t*)a;
       const uint32_t *b_big = (const uint32_t*)b;
 
+#if __SSE2__
+      /* Four words per iteration. The granularity stays 32-bit -- the lane
+       * mask is per word, so this stops at exactly the word the scalar loop
+       * would, which the compressed output depends on. The wider scans keep
+       * that granularity. */
+#ifdef STATE_MANAGER_HAVE_AVX2_SCAN
+      if (tier)
+      {
+         const uint32_t *hit =
+#ifdef STATE_MANAGER_HAVE_AVX512_SCAN
+            (tier == 2) ? find_same_avx512(a_big, b_big) :
+#endif
+            find_same_avx2(a_big, b_big);
+         b_big += hit - a_big;
+         a_big  = hit;
+      }
+      else
+#endif
+      for (;;)
+      {
+         __m128i v0 = _mm_loadu_si128((const __m128i*)a_big);
+         __m128i v1 = _mm_loadu_si128((const __m128i*)b_big);
+         int mask   = _mm_movemask_ps(_mm_castsi128_ps(
+                  _mm_cmpeq_epi32(v0, v1)));
+
+         if (mask)
+         {
+            unsigned lane = (unsigned)compat_ctz((unsigned)mask);
+
+            a_big += lane;
+            b_big += lane;
+            break;
+         }
+
+         a_big += 4;
+         b_big += 4;
+      }
+#else
       while (*a_big != *b_big)
       {
          a_big++;
          b_big++;
       }
+#endif
       a = (const uint16_t*)a_big;
       b = (const uint16_t*)b_big;
 
@@ -185,58 +449,76 @@ static size_t find_same(const uint16_t *a, const uint16_t *b)
    return a - a_org;
 }
 
+/* Adds two sizes, or reports that the sum does not fit. */
+static bool state_manager_size_add(size_t a, size_t b, size_t *out)
+{
+   if (a > (size_t)-1 - b)
+      return false;
+   *out = a + b;
+   return true;
+}
+
+/* Multiplies two sizes, or reports that the product does not fit. */
+static bool state_manager_size_mul(size_t a, size_t b, size_t *out)
+{
+   if (b && a > (size_t)-1 / b)
+      return false;
+   *out = a * b;
+   return true;
+}
+
 /* Returns the maximum compressed size of a savestate.
- * It is very likely to compress to far less. */
+ * It is very likely to compress to far less.
+ *
+ * Every term derives from @uncomp, which reaches here from a core's
+ * retro_serialize_size(), so the roundings and the per-block overhead
+ * are added and multiplied under check. Returns 0 when the answer does
+ * not fit a size_t; a real answer always carries the three closing
+ * uint16_t and so is never 0. */
 static size_t state_manager_raw_maxsize(size_t uncomp)
 {
    /* bytes covered by a compressed block */
-   const int maxcblkcover = UINT16_MAX * sizeof(uint16_t);
+   const size_t maxcblkcover = UINT16_MAX * sizeof(uint16_t);
+   size_t uncomp16;
+   size_t maxcblks;
+   size_t overhead;
+   size_t total;
+
    /* uncompressed size, rounded to 16 bits */
-   size_t uncomp16        = (uncomp + sizeof(uint16_t) - 1) & -sizeof(uint16_t);
+   if (!state_manager_size_add(uncomp, sizeof(uint16_t) - 1, &uncomp16))
+      return 0;
+   uncomp16 &= -sizeof(uint16_t);
+
    /* number of blocks */
-   size_t maxcblks        = (uncomp + maxcblkcover - 1) / maxcblkcover;
-   return uncomp16 + maxcblks * sizeof(uint16_t) * 2 /* two u16 overhead per block */ + sizeof(uint16_t) *
-      3; /* three u16 to end it */
+   if (!state_manager_size_add(uncomp, maxcblkcover - 1, &maxcblks))
+      return 0;
+   maxcblks /= maxcblkcover;
+
+   /* two u16 overhead per block */
+   if (!state_manager_size_mul(maxcblks, sizeof(uint16_t) * 2, &overhead))
+      return 0;
+   if (!state_manager_size_add(uncomp16, overhead, &total))
+      return 0;
+   /* three u16 to end it */
+   if (!state_manager_size_add(total, sizeof(uint16_t) * 3, &total))
+      return 0;
+
+   return total;
 }
 
 /*
- * See state_manager_raw_compress for information about this.
- * When you're done with it, send it to free().
- */
-static void *state_manager_raw_alloc(size_t len, uint16_t uniq)
-{
-   size_t  _len  = (len + sizeof(uint16_t) - 1) & -sizeof(uint16_t);
-   uint16_t *ret = (uint16_t*)calloc(_len + sizeof(uint16_t) * 4 + 16, 1);
-
-   if (!ret)
-      return NULL;
-
-   /* Force in a different byte at the end, so we don't need to check
-    * bounds in the innermost loop (it's expensive).
-    *
-    * There is also a large amount of data that's the same, to stop
-    * the other scan.
-    *
-    * There is also some padding at the end. This is so we don't
-    * read outside the buffer end if we're reading in large blocks;
-    *
-    * It doesn't make any difference to us, but sacrificing 16 bytes to get
-    * Valgrind happy is worth it. */
-   ret[_len / sizeof(uint16_t) + 3] = uniq;
-
-   return ret;
-}
-
-/*
- * Takes two savestates and creates a patch that turns 'src' into 'dst'.
- * Both 'src' and 'dst' must be returned from state_manager_raw_alloc(),
- * with the same 'len', and different 'uniq'.
+ * A reverse delta. Takes two savestates, 'src' the older and 'dst' the
+ * newer, and creates a patch that, applied to a copy of 'dst', restores
+ * 'src': the patch stores the old words of every run that differs, so
+ * a rewind step applies it to the current state to get the previous
+ * one. The next push swaps the blocks, so the block that was 'dst'
+ * becomes 'src' for the following patch.
  *
  * 'patch' must be size 'state_manager_raw_maxsize(len)' or more.
  * Returns the number of bytes actually written to 'patch'.
  */
-static size_t state_manager_raw_compress(const void *src,
-      const void *dst, size_t len, void *patch)
+STATE_MANAGER_SCAN_INLINE size_t state_manager_raw_compress_tier(
+      const void *src, const void *dst, size_t len, void *patch, int tier)
 {
    const uint16_t  *old16 = (const uint16_t*)src;
    const uint16_t  *new16 = (const uint16_t*)dst;
@@ -247,7 +529,7 @@ static size_t state_manager_raw_compress(const void *src,
    while (num16s)
    {
       size_t i, changed;
-      size_t skip = find_change(old16, new16);
+      size_t skip = find_change(old16, new16, tier);
 
       if (skip >= num16s)
          break;
@@ -270,15 +552,21 @@ static size_t state_manager_raw_compress(const void *src,
          continue;
       }
 
-      changed = find_same(old16, new16);
+      changed = find_same(old16, new16, tier);
       if (changed > UINT16_MAX)
          changed = UINT16_MAX;
 
       *compressed16++ = changed;
       *compressed16++ = skip;
 
-      for (i = 0; i < changed; i++)
-         compressed16[i] = old16[i];
+      /* The typical dirty run is a few words, where a call costs more
+       * than the loop; a long one - a framebuffer, a redrawn tilemap -
+       * is a copy. */
+      if (changed >= STATE_MANAGER_MEMCPY_WORDS)
+         memcpy(compressed16, old16, changed * sizeof(uint16_t));
+      else
+         for (i = 0; i < changed; i++)
+            compressed16[i] = old16[i];
 
       old16        += changed;
       new16        += changed;
@@ -293,6 +581,45 @@ static size_t state_manager_raw_compress(const void *src,
    return (uint8_t*)(compressed16 + 3) - (uint8_t*)patch;
 }
 
+#ifdef STATE_MANAGER_HAVE_AVX2_SCAN
+/* flatten pulls the scans in: they share this target, but a plain
+ * always_inline cannot reach them through the baseline copy. */
+__attribute__((target("avx2"), flatten))
+static size_t state_manager_raw_compress_avx2(const void *src,
+      const void *dst, size_t len, void *patch)
+{
+   return state_manager_raw_compress_tier(src, dst, len, patch, 1);
+}
+#endif
+
+#ifdef STATE_MANAGER_HAVE_AVX512_SCAN
+__attribute__((target("avx512f,avx512bw"), flatten))
+static size_t state_manager_raw_compress_avx512(const void *src,
+      const void *dst, size_t len, void *patch)
+{
+   return state_manager_raw_compress_tier(src, dst, len, patch, 2);
+}
+#endif
+
+static size_t state_manager_raw_compress(const void *src,
+      const void *dst, size_t len, void *patch)
+{
+#ifdef STATE_MANAGER_HAVE_AVX2_SCAN
+   switch (state_manager_scan_tier())
+   {
+#ifdef STATE_MANAGER_HAVE_AVX512_SCAN
+      case 2:
+         return state_manager_raw_compress_avx512(src, dst, len, patch);
+#endif
+      case 1:
+         return state_manager_raw_compress_avx2(src, dst, len, patch);
+      default:
+         break;
+   }
+#endif
+   return state_manager_raw_compress_tier(src, dst, len, patch, 0);
+}
+
 /*
  * Takes 'patch' from a previous call to 'state_manager_raw_compress'
  * and applies it to 'data' ('src' from that call),
@@ -301,42 +628,89 @@ static size_t state_manager_raw_compress(const void *src,
  * If the given arguments do not match a previous call to
  * state_manager_raw_compress(), anything at all can happen.
  */
-static void state_manager_raw_decompress(const void *patch, void *data)
+/* Applies a patch to 'data', a block of 'len' bytes. Two passes: the
+ * first walks every token and checks that each run of changed words
+ * and each skip stays inside the block and that the record ends inside
+ * 'patch_len' bytes; the second writes. A record that fails the first
+ * pass changes nothing and returns false, so a corrupted ring cannot
+ * write past the block, nor leave it half-applied. */
+static bool state_manager_raw_decompress(const void *patch, size_t patch_len,
+      void *data, size_t len)
 {
-   uint16_t         *out16 = (uint16_t*)data;
    const uint16_t *patch16 = (const uint16_t*)patch;
+   const uint16_t *p       = patch16;
+   size_t patch_words      = patch_len / sizeof(uint16_t);
+   size_t words            = len / sizeof(uint16_t);
+   size_t at               = 0;
+   uint16_t *out16         = (uint16_t*)data;
 
    for (;;)
    {
-      uint16_t numchanged  = *(patch16++);
+      uint16_t numchanged;
+      if ((size_t)(p - patch16) >= patch_words)
+         return false;
+      numchanged = *p++;
+      if (numchanged)
+      {
+         uint16_t skip;
+         if ((size_t)(p - patch16) + 1 + numchanged > patch_words)
+            return false;
+         skip = *p++;
+         if (skip > words - at)
+            return false;
+         at += skip;
+         if (numchanged > words - at)
+            return false;
+         at += numchanged;
+         p  += numchanged;
+      }
+      else
+      {
+         uint32_t numunchanged;
+         if ((size_t)(p - patch16) + 2 > patch_words)
+            return false;
+         numunchanged = p[0] | ((uint32_t)p[1] << 16);
+         if (!numunchanged)
+            break;
+         p += 2;
+         if (numunchanged > words - at)
+            return false;
+         at += numunchanged;
+      }
+   }
+
+   for (p = patch16;;)
+   {
+      uint16_t numchanged = *(p++);
 
       if (numchanged)
       {
          uint16_t i;
 
-         out16       += *patch16++;
+         out16       += *p++;
 
-         /* We could do memcpy, but it seems that memcpy has a
-          * constant-per-call overhead that actually shows up.
-          *
-          * Our average size in here seems to be 8 or something.
-          * Therefore, we do something with lower overhead. */
-         for (i = 0; i < numchanged; i++)
-            out16[i]  = patch16[i];
+         /* The typical run is a few words, where a call costs more
+          * than the loop; a long one is a copy. */
+         if (numchanged >= STATE_MANAGER_MEMCPY_WORDS)
+            memcpy(out16, p, numchanged * sizeof(uint16_t));
+         else
+            for (i = 0; i < numchanged; i++)
+               out16[i]  = p[i];
 
-         patch16     += numchanged;
+         p           += numchanged;
          out16       += numchanged;
       }
       else
       {
-         uint32_t numunchanged = patch16[0] | (patch16[1] << 16);
+         uint32_t numunchanged = p[0] | ((uint32_t)p[1] << 16);
 
          if (!numunchanged)
             break;
-         patch16 += 2;
+         p       += 2;
          out16   += numunchanged;
       }
    }
+   return true;
 }
 
 /* The start offsets point to 'nextstart' of any given compressed frame.
@@ -381,10 +755,16 @@ static void state_manager_free(state_manager_t *state)
 
    if (state->data)
       free(state->data);
-   if (state->thisblock)
-      free(state->thisblock);
-   if (state->nextblock)
-      free(state->nextblock);
+   /* thisblock and nextblock share a single allocation;
+    * after pointer swaps, either could point to the base.
+    * Free whichever has the lower address. */
+   if (state->thisblock || state->nextblock)
+   {
+      uint8_t *base = state->thisblock;
+      if (state->nextblock && (!base || state->nextblock < base))
+         base = state->nextblock;
+      memalign_free(base);
+   }
 #if STRICT_BUF_SIZE
    if (state->debugblock)
       free(state->debugblock);
@@ -398,34 +778,75 @@ static void state_manager_free(state_manager_t *state)
 static state_manager_t *state_manager_new(
       size_t state_size, size_t buffer_size)
 {
-   size_t max_comp_size, block_size;
-   uint8_t *next_block    = NULL;
-   uint8_t *this_block    = NULL;
+   size_t max_comp_size, block_size, alloc_size, single_block_alloc;
+   uint8_t *block_buf     = NULL;
    uint8_t *state_data    = NULL;
    state_manager_t *state = (state_manager_t*)calloc(1, sizeof(*state));
 
    if (!state)
       return NULL;
 
-   block_size         = (state_size + sizeof(uint16_t) - 1) & -sizeof(uint16_t);
+   /* state_size is whatever the core answered retro_serialize_size()
+    * with. The block layout, the sentinel positions and the two-block
+    * doubling all derive from it, and an unchecked derivation wraps to
+    * an allocation smaller than the offsets computed from the same
+    * numbers, so each step is taken under check and a size that cannot
+    * be laid out is refused. */
+   if (!state_manager_size_add(state_size, sizeof(uint16_t) - 1, &block_size))
+      goto error;
+   block_size        &= -sizeof(uint16_t);
+
    /* the compressed data is surrounded by pointers to the other side */
-   max_comp_size      = state_manager_raw_maxsize(state_size) + sizeof(size_t) * 2;
+   if (!(max_comp_size = state_manager_raw_maxsize(state_size)))
+      goto error;
+   if (!state_manager_size_add(max_comp_size, sizeof(size_t) * 2,
+            &max_comp_size))
+      goto error;
+
    state_data         = (uint8_t*)malloc(buffer_size);
 
    if (!state_data)
       goto error;
 
-   this_block         = (uint8_t*)state_manager_raw_alloc(state_size, 0);
-   next_block         = (uint8_t*)state_manager_raw_alloc(state_size, 1);
-
-   if (!this_block || !next_block)
+   /* Combine thisblock and nextblock into a single allocation.
+    * Each block needs: block_size rounded to uint16_t alignment, plus the
+    * four sentinel uint16_t, plus STATE_MANAGER_SCAN_PAD.
+    *
+    * find_change() deliberately scans past the end of the logical data --
+    * the caller bounds the result afterwards -- and terminates only on the
+    * sentinel at byte block_size + 6. The final vector load may therefore
+    * begin at that sentinel and read a full vector beyond it, so the tail
+    * padding must be at least the widest load find_change can issue.
+    * Keep the two in step: widening the scanner means widening this. */
+   if (!state_manager_size_add(block_size,
+            sizeof(uint16_t) * 4 + STATE_MANAGER_SCAN_PAD,
+            &single_block_alloc))
       goto error;
+   /* Both blocks start on a 64-byte line, so a scan position sits at the
+    * same offset within a line in each: once the wide scans align one side
+    * their loads never straddle a line on either. */
+   if (!state_manager_size_add(single_block_alloc, 63, &single_block_alloc))
+      goto error;
+   single_block_alloc &= ~(size_t)63;
+   if (!state_manager_size_mul(single_block_alloc, 2, &alloc_size))
+      goto error;
+   block_buf          = (uint8_t*)memalign_alloc(64, alloc_size);
+
+   if (!block_buf)
+      goto error;
+   memset(block_buf, 0, alloc_size);
+
+   /* Set up sentinel bytes.
+    * thisblock gets uniq=0 (already zero from the memset).
+    * nextblock gets uniq=1. */
+   ((uint16_t*)block_buf)[block_size / sizeof(uint16_t) + 3] = 0;
+   ((uint16_t*)(block_buf + single_block_alloc))[block_size / sizeof(uint16_t) + 3] = 1;
 
    state->blocksize   = block_size;
    state->maxcompsize = max_comp_size;
    state->data        = state_data;
-   state->thisblock   = this_block;
-   state->nextblock   = next_block;
+   state->thisblock   = block_buf;
+   state->nextblock   = block_buf + single_block_alloc;
    state->capacity    = buffer_size;
 
    state->head        = state->data + sizeof(size_t);
@@ -441,7 +862,8 @@ static state_manager_t *state_manager_new(
 error:
    if (state_data)
       free(state_data);
-   state_manager_free(state);
+   if (block_buf)
+      memalign_free(block_buf);
    free(state);
 
    return NULL;
@@ -468,12 +890,24 @@ static bool state_manager_pop(state_manager_t *state, const void **data)
       return false;
 
    start                        = read_size_t(state->head - sizeof(size_t));
-   state->head                  = state->data + start;
+   /* start comes out of the buffer itself, so it is checked by
+    * subtracting from the capacity rather than adding to it: the
+    * addition wraps on a corrupt value and lets the bound pass. */
+   if (     state->capacity < sizeof(size_t)
+         || start > state->capacity - sizeof(size_t))
+      return false;
    compressed                   = state->data + start + sizeof(size_t);
    out                          = state->thisblock;
 
-   state_manager_raw_decompress(compressed, out);
+   /* The record runs from its start to the size_t that pointed here;
+    * a record that does not decode inside that, or inside the block,
+    * is the end of the ring's usable history. */
+   if (!state_manager_raw_decompress(compressed,
+            (size_t)(state->head - sizeof(size_t) - compressed), out,
+            state->blocksize))
+      return false;
 
+   state->head                  = state->data + start;
    state->entries--;
    return true;
 }
@@ -515,7 +949,8 @@ static void state_manager_push_do(state_manager_t *state)
       size_t headpos, tailpos, remaining;
       if (state->capacity < sizeof(size_t) + state->maxcompsize)
       {
-         RARCH_ERR("State capacity insufficient\n");
+         RARCH_ERR("[Rewind] %s.\n",
+               msg_hash_to_str(MSG_REWIND_BUFFER_CAPACITY_INSUFFICIENT));
          return;
       }
 
@@ -539,11 +974,18 @@ recheckcapacity:;
       compressed       += state_manager_raw_compress(oldb, newb,
             state->blocksize, compressed);
 
+      /* The next record must fit before the end of the ring without
+       * folding mid-record; if it will not, the head folds to the
+       * start now, and the record that starts there is dropped, as a
+       * record dropped for room anywhere else is. */
       if (compressed - state->data + state->maxcompsize > state->capacity)
       {
          compressed     = state->data;
          if (state->tail == state->data + sizeof(size_t))
+         {
             state->tail = state->data + read_size_t(state->tail);
+            state->entries--;
+         }
       }
       write_size_t(compressed, state->head-state->data);
       compressed       += sizeof(size_t);
@@ -560,24 +1002,6 @@ recheckcapacity:;
    state->entries++;
 }
 
-#if 0
-static void state_manager_capacity(state_manager_t *state,
-      unsigned *entries, size_t *bytes, bool *full)
-{
-   size_t headpos   = state->head - state->data;
-   size_t tailpos   = state->tail - state->data;
-   size_t remaining = (tailpos + state->capacity -
-         sizeof(size_t) - headpos - 1) % state->capacity + 1;
-
-   if (entries)
-      *entries      = state->entries;
-   if (bytes)
-      *bytes        = state->capacity-remaining;
-   if (full)
-      *full         = remaining <= state->maxcompsize * 2;
-}
-#endif
-
 void state_manager_event_init(
       struct state_manager_rewind_state *rewind_st,
       unsigned rewind_buffer_size)
@@ -585,12 +1009,15 @@ void state_manager_event_init(
    core_info_t *core_info = NULL;
    void *state            = NULL;
 
-   if (  !rewind_st
-       || (rewind_st->flags & STATE_MGR_REWIND_ST_FLAG_INIT_ATTEMPTED)
-       || rewind_st->state)
+   if (!rewind_st)
+      return;
+   rewind_st->flags &= ~STATE_MGR_REWIND_ST_FLAG_INIT_PENDING;
+   if (     (rewind_st->flags & STATE_MGR_REWIND_ST_FLAG_INIT_ATTEMPTED)
+         || rewind_st->state)
       return;
 
    rewind_st->size               = 0;
+   retro_atomic_store_release_int(&rewind_st->frame_reversed_atomic, 0);
    rewind_st->flags             &= ~(
                                    STATE_MGR_REWIND_ST_FLAG_FRAME_IS_REVERSED
                                  | STATE_MGR_REWIND_ST_FLAG_HOTKEY_WAS_CHECKED
@@ -609,13 +1036,15 @@ void state_manager_event_init(
 
    if (!core_info_current_supports_rewind())
    {
-      RARCH_ERR("%s\n", msg_hash_to_str(MSG_REWIND_UNSUPPORTED));
+      RARCH_ERR("[Rewind] %s.\n",
+            msg_hash_to_str(MSG_REWIND_UNSUPPORTED));
       return;
    }
 
    if (audio_driver_has_callback())
    {
-      RARCH_ERR("%s.\n", msg_hash_to_str(MSG_REWIND_INIT_FAILED_THREADED_AUDIO));
+      RARCH_ERR("[Rewind] %s.\n",
+            msg_hash_to_str(MSG_REWIND_INIT_FAILED_THREADED_AUDIO));
       return;
    }
 
@@ -623,12 +1052,12 @@ void state_manager_event_init(
 
    if (!rewind_st->size)
    {
-      RARCH_ERR("%s.\n",
+      RARCH_ERR("[Rewind] %s.\n",
             msg_hash_to_str(MSG_REWIND_INIT_FAILED));
       return;
    }
 
-   RARCH_LOG("%s: %u MB\n",
+   RARCH_LOG("[Rewind] %s: %u MB\n",
          msg_hash_to_str(MSG_REWIND_INIT),
          (unsigned)(rewind_buffer_size / 1000000));
 
@@ -636,7 +1065,11 @@ void state_manager_event_init(
          rewind_buffer_size);
 
    if (!rewind_st->state)
-      RARCH_WARN("%s.\n", msg_hash_to_str(MSG_REWIND_INIT_FAILED));
+   {
+      RARCH_WARN("[Rewind] %s.\n",
+            msg_hash_to_str(MSG_REWIND_INIT_FAILED));
+      return;
+   }
 
    state_manager_push_where(rewind_st->state, &state);
 
@@ -667,11 +1100,13 @@ void state_manager_event_deinit(
 
    rewind_st->state  = NULL;
    rewind_st->size   = 0;
+   retro_atomic_store_release_int(&rewind_st->frame_reversed_atomic, 0);
    rewind_st->flags &= ~(
                           STATE_MGR_REWIND_ST_FLAG_FRAME_IS_REVERSED
                         | STATE_MGR_REWIND_ST_FLAG_HOTKEY_WAS_CHECKED
                         | STATE_MGR_REWIND_ST_FLAG_HOTKEY_WAS_PRESSED
                         | STATE_MGR_REWIND_ST_FLAG_INIT_ATTEMPTED
+                        | STATE_MGR_REWIND_ST_FLAG_INIT_PENDING
                         );
 
    /* Restore regular (non-rewind) core audio
@@ -739,6 +1174,7 @@ bool state_manager_check_rewind(
       was_reversed = true;
 #endif
       audio_driver_frame_is_reverse();
+      retro_atomic_store_release_int(&rewind_st->frame_reversed_atomic, 0);
       rewind_st->flags &= ~STATE_MGR_REWIND_ST_FLAG_FRAME_IS_REVERSED;
    }
 
@@ -755,6 +1191,8 @@ bool state_manager_check_rewind(
             return false;
 #endif
 
+         retro_atomic_store_release_int(
+               &rewind_st->frame_reversed_atomic, 1);
          rewind_st->flags |= STATE_MGR_REWIND_ST_FLAG_FRAME_IS_REVERSED;
 
          audio_driver_setup_rewind();
@@ -767,12 +1205,24 @@ bool state_manager_check_rewind(
          content_deserialize_state(buf, rewind_st->size);
 
 #ifdef HAVE_BSV_MOVIE
-         bsv_movie_frame_rewind();
+         bsv_movie_frame_rewind(input_state_get_ptr());
 #endif
       }
       else
       {
-         content_deserialize_state(buf, rewind_st->size);
+#ifdef HAVE_BSV_MOVIE
+         input_driver_state_t *input_st = input_state_get_ptr();
+         /* Don't end reversing during playback or recording */
+         if(BSV_MOVIE_IS_PLAYBACK_ON() || BSV_MOVIE_IS_RECORDING())
+         {
+            retro_atomic_store_release_int(
+                  &rewind_st->frame_reversed_atomic, 1);
+            rewind_st->flags |= STATE_MGR_REWIND_ST_FLAG_FRAME_IS_REVERSED;
+            bsv_movie_frame_rewind(input_state_get_ptr());
+         }
+         else
+#endif
+            content_deserialize_state(buf, rewind_st->size);
 
 #ifdef HAVE_NETWORKING
          /* Tell netplay we're done */

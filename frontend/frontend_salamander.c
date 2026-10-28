@@ -42,7 +42,7 @@ struct defaults g_defaults;
  */
 static void find_first_libretro_core(char *first_file,
    size_t size_of_first_file, const char *dir,
-   const char * ext)
+   const char * ext, const char *skip)
 {
    size_t i;
    bool                 ret = false;
@@ -71,13 +71,18 @@ static void find_first_libretro_core(char *first_file,
 
       fill_pathname_base(fname, libretro_elem, sizeof(fname));
 
+      if (skip && string_is_equal(fname, skip))
+         continue;
+
       if (!frontend_driver_get_salamander_basename(
                salamander_name, sizeof(salamander_name)))
          break;
 
       if (!strncmp(fname, salamander_name, sizeof(fname)))
       {
-         if (list->size == (i + 1))
+         /* Not when a core was passed over: launching salamander
+          * itself would only come back here. */
+         if (!skip && list->size == (i + 1))
          {
             RARCH_WARN("Entry is RetroArch Salamander itself, "
                   "but is last entry. No choice but to set it.\n");
@@ -99,21 +104,21 @@ static void find_first_libretro_core(char *first_file,
  * we can find in the RetroArch cores directory.
  */
 static void find_and_set_first_file(char *s, size_t len,
-      const char *ext)
+      const char *ext, const char *skip)
 {
 
    char first_file[PATH_MAX_LENGTH] = {0};
    find_first_libretro_core(first_file, sizeof(first_file),
-         g_defaults.dirs[DEFAULT_DIR_CORE], ext);
+         g_defaults.dirs[DEFAULT_DIR_CORE], ext, skip);
 
-   if (string_is_empty(first_file))
+   if (!*first_file)
    {
       RARCH_ERR("Failed last fallback - RetroArch Salamander will exit.\n");
       return;
    }
 
    fill_pathname_join(s, g_defaults.dirs[DEFAULT_DIR_CORE], first_file, len);
-   RARCH_LOG("libretro_path now set to: %s.\n", s);
+   RARCH_LOG("libretro_path now set to: \"%s\".\n", s);
 }
 
 static void salamander_init(char *s, size_t len)
@@ -124,11 +129,13 @@ static void salamander_init(char *s, size_t len)
    bool config_valid             = false;
    char config_path[PATH_MAX_LENGTH];
    char config_dir[DIR_MAX_LENGTH];
+   char failed[NAME_MAX_LENGTH];
 
    config_dir[0]  = '\0';
+   failed[0]      = '\0';
 
    /* Get salamander config file path */
-   if (!string_is_empty(rarch_config_path))
+   if (rarch_config_path && *rarch_config_path)
       fill_pathname_resolve_relative(config_path,
             rarch_config_path,
             FILE_PATH_SALAMANDER_CONFIG,
@@ -138,56 +145,77 @@ static void salamander_init(char *s, size_t len)
 
    /* Ensure that config directory exists */
    fill_pathname_parent_dir(config_dir, config_path, sizeof(config_dir));
-   if (!string_is_empty(config_dir) &&
-       !path_is_directory(config_dir))
+   if (*config_dir && !path_is_directory(config_dir))
       path_mkdir(config_dir);
 
    /* Attempt to open config file */
    if ((config = config_file_new_from_path_to_string(config_path)))
    {
       char libretro_path[PATH_MAX_LENGTH];
+      char pending[PATH_MAX_LENGTH];
 
       libretro_path[0] = '\0';
+      pending[0]       = '\0';
 
       if (config_get_path(config, "libretro_path",
-            libretro_path, sizeof(libretro_path)) &&
-          !string_is_empty(libretro_path) &&
-          !string_is_equal(libretro_path, "builtin"))
+            libretro_path, sizeof(libretro_path))
+          && *libretro_path
+          && !string_is_equal(libretro_path, "builtin"))
       {
-         strlcpy(s, libretro_path, len);
-         config_valid = true;
+         /* Launched last time and never started: launching it again
+          * would end the same way on every boot. */
+         if (   config_get_path(config, SALAMANDER_CONFIG_PENDING_KEY,
+                  pending, sizeof(pending))
+             && string_is_equal(pending, libretro_path))
+         {
+            fill_pathname_base(failed, libretro_path, sizeof(failed));
+            RARCH_WARN("\"%s\" did not start when last launched; "
+                  "looking for another core.\n", libretro_path);
+         }
+         else
+         {
+            strlcpy(s, libretro_path, len);
+            config_valid = true;
+         }
       }
-
-      config_file_free(config);
-      config = NULL;
    }
 
    if (!config_valid)
    {
       char core_ext[16];
-      /* No config file - search filesystem for
+      /* No usable entry - search filesystem for
        * first available core */
       frontend_driver_get_core_extension(
             core_ext, sizeof(core_ext));
-      find_and_set_first_file(s, len, core_ext);
-
-      /* Save result to new config file */
-      if (!string_is_empty(s))
-      {
-         config = config_file_new_alloc();
-
-         if (config)
-         {
-            config_set_path(config, "libretro_path", s);
-            config_file_write(config, config_path, false);
-            RARCH_DBG("Salamander config file written to \"%s\".\n", config_path);
-            config_file_free(config);
-         }
-      }
+      find_and_set_first_file(s, len, core_ext,
+            *failed ? failed : NULL);
    }
    else
-      RARCH_LOG("Start [%s] found in %s.\n", s,
+      RARCH_LOG("Start \"%s\" found in \"%s\".\n", s,
             FILE_PATH_SALAMANDER_CONFIG);
+
+   if (!config)
+      config = config_file_new_alloc();
+
+   if (config)
+   {
+      /* The core to start, marked until its frontend comes up. With
+       * none left, both entries go, so the next boot looks again. */
+      if (*s)
+      {
+         config_set_path(config, "libretro_path", s);
+         config_set_path(config, SALAMANDER_CONFIG_PENDING_KEY, s);
+      }
+      else
+      {
+         config_unset(config, "libretro_path");
+         config_unset(config, SALAMANDER_CONFIG_PENDING_KEY);
+      }
+      if (!config_file_write(config, config_path, false))
+         RARCH_ERR("Failed to write salamander config file to \"%s\".\n",
+               config_path);
+      config_file_free(config);
+   }
 }
 
 #ifdef HAVE_MAIN
@@ -199,9 +227,12 @@ int main(int argc, char *argv[])
    char libretro_path[PATH_MAX_LENGTH] = {0};
    void *args                          = NULL;
    struct rarch_main_wrap *wrap_args   = NULL;
-   frontend_ctx_driver_t *frontend_ctx = (frontend_ctx_driver_t*)frontend_ctx_init_first();
+   frontend_ctx_driver_t *frontend_ctx = NULL;
 
-   if (!frontend_ctx)
+   /* File access for the config parser (see config_file.h). */
+   config_file_set_io_default(config_file_io_filestream());
+
+   if (!(frontend_ctx = (frontend_ctx_driver_t*)frontend_ctx_init_first()))
       return 0;
 
    if (frontend_ctx && frontend_ctx->init)

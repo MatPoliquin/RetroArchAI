@@ -80,12 +80,10 @@ void platform_emscripten_command_reply(const char *msg, size_t len);
 size_t platform_emscripten_command_read(char **into, size_t max_len);
 
 /**
- * Get the real screen dimensions of the canvas on the page.
- *
- * @param width Pointer to store canvas width
- * @param height Pointer to store canvas height
+ * Get the real screen dimensions of the canvas on the page, packed
+ * with VIDEO_SCALE_PACK.
  */
-void platform_emscripten_get_canvas_size(int *width, int *height);
+unsigned platform_emscripten_get_canvas_dims(void);
 
 /**
  * Get the ratio of CSS pixels to real screen pixels. Useful for input scaling.
@@ -119,7 +117,7 @@ bool platform_emscripten_is_window_hidden(void);
 
 /**
  * Whether the frame should be dropped.
- * Currently returns true if the window is hidden and vsync is on.
+ * Currently returns true if the window is hidden or the GL context is lost.
  *
  * @return True if the frame should be dropped.
  */
@@ -145,6 +143,13 @@ void platform_emscripten_enter_fake_block(int ms);
  * !PROXY_TO_PTHREAD only.
  */
 void platform_emscripten_exit_fake_block(void);
+
+/**
+ * Sleep before the next frame.
+ *
+ * @param ms Milliseconds to sleep.
+ */
+void platform_emscripten_deferred_sleep(int ms);
 
 /**
  * Set the vsync interval for the main loop.
@@ -179,9 +184,22 @@ void platform_emscripten_set_wake_lock(bool state);
  * Try to set the real screen dimensions of the canvas.
  * Will only work if explicitly enabled by the embedder.
  *
- * @param width New width
- * @param height New height
+ * @param dims New size, packed with VIDEO_SCALE_PACK
  */
-void platform_emscripten_set_canvas_size(int width, int height);
+void platform_emscripten_set_canvas_size(unsigned dims);
+
+/**
+ * Get the browser that the program is running in.
+ *
+ * @return enum platform_emscripten_browser
+ */
+enum platform_emscripten_browser platform_emscripten_get_browser(void);
+
+/**
+ * Get the OS that the program is running in.
+ *
+ * @return enum platform_emscripten_os
+ */
+enum platform_emscripten_os platform_emscripten_get_os(void);
 
 #endif

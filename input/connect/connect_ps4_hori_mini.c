@@ -27,7 +27,8 @@ struct hidpad_ps4_hori_mini_data
    struct pad_connection* connection;
    uint32_t slot;
    uint32_t buttons;
-   uint8_t data[512];
+   uint8_t axis[4];
+   input_pad_view_t view;  /* what the getters answer */
 };
 
 static void* hidpad_ps4_hori_mini_init(void *data, uint32_t slot,
@@ -62,22 +63,24 @@ static void hidpad_ps4_hori_mini_deinit(void *data)
       free(device);
 }
 
-static void hidpad_ps4_hori_mini_get_buttons(
-      void *data, input_bits_t *state)
+static void hidpad_ps4_hori_mini_get_buttons(void *data, input_bits_t *state)
 {
-	struct hidpad_ps4_hori_mini_data *device = 
-      (struct hidpad_ps4_hori_mini_data*)data;
-
-	if ( device )
-	{
-		/* copy 32 bits : needed for PS button? */
-		BITS_COPY32_PTR(state, device->buttons);
-	}
-	else
+   struct hidpad_ps4_hori_mini_data *device = (struct hidpad_ps4_hori_mini_data*)data;
+   if (device)
+      *state = device->view.buttons;
+   else
       BIT256_CLEAR_ALL_PTR(state);
 }
 
 static int16_t hidpad_ps4_hori_mini_get_axis(void *data, unsigned axis)
+{
+   struct hidpad_ps4_hori_mini_data *device = (struct hidpad_ps4_hori_mini_data*)data;
+   if (!device || axis >= INPUT_PAD_VIEW_AXES)
+      return 0;
+   return device->view.axes[axis];
+}
+
+static int16_t hidpad_ps4_hori_mini_axis_of(void *data, unsigned axis)
 {
    int val;
    struct hidpad_ps4_hori_mini_data *device = 
@@ -86,7 +89,7 @@ static int16_t hidpad_ps4_hori_mini_get_axis(void *data, unsigned axis)
    if (!device || axis >= 4)
       return 0;
 
-   val = (device->data[1 + axis] << 8) - 0x8000;
+   val = (device->axis[axis] << 8) - 0x8000;
 
    if (abs(val) > 0x1000)
       return val;
@@ -119,14 +122,14 @@ static void hidpad_ps4_hori_mini_packet_handler(void *data,
    struct hidpad_ps4_hori_mini_data *device = 
       (struct hidpad_ps4_hori_mini_data*)data;
 
-   if (!device)
+   if (!device || size < 8)
       return;
 
-   memcpy(device->data, packet, size);
+   memcpy(device->axis, packet + 1, sizeof(device->axis));
 
    device->buttons = 0;
 
-   dpad            = device->data[5] & 0xF;
+   dpad            = packet[5] & 0xF;
 
    switch(dpad)
    {
@@ -161,13 +164,20 @@ static void hidpad_ps4_hori_mini_packet_handler(void *data,
    }
 
    pressed_keys           = (
-                          (device->data[5] & 0xF0) >> 4)
-                        | (device->data[6] << 4)
-                        | (device->data[7] << 12);
+                          (packet[5] & 0xF0) >> 4)
+                        | (packet[6] << 4)
+                        | (packet[7] << 12);
 
    for (i = 0; i < 15; i++)
       device->buttons |= (pressed_keys & (1 << i)) ?
          (1 << button_mapping[i]) : 0;
+   /* the view, which the getters and the frontend read */
+   pad_view_set_buttons(&device->view, device->buttons, false);
+   {
+      unsigned a;
+      for (a = 0; a < 4; a++)
+         device->view.axes[a] = hidpad_ps4_hori_mini_axis_of(device, a);
+   }
 }
 
 static void hidpad_ps4_hori_mini_set_rumble(void *data,
@@ -185,7 +195,12 @@ static int32_t hidpad_ps4_hori_mini_button(void *data, uint16_t joykey)
       (struct hidpad_ps4_hori_mini_data*)data;
    if (!pad || joykey > 31)
       return 0;
-   return pad->buttons & (1 << joykey);
+   return BIT256_GET(pad->view.buttons, joykey) ? 1 : 0;
+}
+
+static const input_pad_view_t *hidpad_ps4_hori_mini_view(void *data)
+{
+   return &((struct hidpad_ps4_hori_mini_data*)data)->view;
 }
 
 pad_connection_interface_t pad_connection_ps4_hori_mini = {
@@ -197,5 +212,12 @@ pad_connection_interface_t pad_connection_ps4_hori_mini = {
    hidpad_ps4_hori_mini_get_axis,
    hidpad_ps4_hori_mini_get_name,
    hidpad_ps4_hori_mini_button, /* button */
-   false
+   false, /* multi_pad */
+   0,     /* max_pad */
+   NULL,  /* pad_init */
+   NULL,  /* pad_deinit */
+   NULL,  /* status */
+   NULL,  /* joypad */
+   NULL,  /* set_player */
+   hidpad_ps4_hori_mini_view
 };

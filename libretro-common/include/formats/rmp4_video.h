@@ -1,0 +1,316 @@
+/* rmp4_video -- MP4 video-to-image glue for libretro-common.
+ *
+ * Combines the rmp4 demuxer with the rvp8/rvp9 decoders to present an
+ * MP4 file's video track through the same two interfaces the image
+ * formats use, so the menu thumbnail pipeline can treat a .mp4 exactly
+ * like a .webm or an animated .webp:
+ *
+ *   - Still image: rmp4_video_alloc / set_buf_ptr / process_image
+ *     decode the first displayed frame (the rwebp_t-style contract that
+ *     image_transfer.c drives for the initial texture upload).
+ *
+ *   - Streaming animation: rmp4_video_stream_* decode one displayed
+ *     frame per call, in stream order, with per-frame durations derived
+ *     from the container's sample timestamps (the rwebp_anim_stream_t
+ *     contract that gfx_thumbnail_animate() drives).
+ *
+ * VP8 ('vp08') tracks require the rvp8 decoder (built with HAVE_RWEBP
+ * or HAVE_RWEBM); VP9 ('vp09') tracks additionally require HAVE_RVP9.
+ * Tracks whose codec is not compiled in (AVC, HEVC, AV1, ...) are
+ * skipped.  Audio tracks are ignored: output is always opaque.
+ *
+ * Frames are returned as w*h uint32 pixels. The animation stream emits
+ * ABGR words (memory order R,G,B,A on little-endian), matching the
+ * animated WebP stream; the still-image path honours supports_rgba the
+ * same way rwebp_process_image does (ARGB words when false).
+ */
+#ifndef __LIBRETRO_SDK_FORMAT_RMP4_VIDEO_H__
+#define __LIBRETRO_SDK_FORMAT_RMP4_VIDEO_H__
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include <boolean.h>
+#include <retro_common_api.h>
+
+#include <formats/video_hw_frame.h>
+
+RETRO_BEGIN_DECLS
+
+/* ---- Still image (first displayed frame) ---- */
+
+typedef struct rmp4_video rmp4_video_t;
+
+rmp4_video_t *rmp4_video_alloc(void);
+
+void rmp4_video_free(rmp4_video_t *mp4);
+
+bool rmp4_video_set_buf_ptr(rmp4_video_t *mp4, void *data, size_t len);
+
+/* Request packed XRGB2101010 (10-bit) output for 10-bit HDR sources; 8-bit
+ * sources are unaffected. Off by default. */
+void rmp4_video_set_want_10bit(rmp4_video_t *mp4, int want);
+
+/* Partial-read support for the still decode: declare how many leading
+ * bytes of the buffer are valid (monotonic; 0 means fully resident).
+ * With a short avail, rmp4_video_process_image returns
+ * IMAGE_PROCESS_WAIT instead of failing when it needs bytes that have
+ * not arrived: the moov (for a trailing moov or a fragmented movie
+ * this effectively means the whole file) or the first displayed
+ * frame's sample. */
+void rmp4_video_set_avail(rmp4_video_t *mp4, size_t avail);
+
+/* True if the last rmp4_video_process_image() produced XRGB2101010. */
+bool rmp4_video_is_10bit(const rmp4_video_t *mp4);
+
+/* Half floats for an HDR still: with want set, a PQ or HLG source's
+ * first frame - VP9, H.264 or H.265 - is rendered as linear scRGB
+ * (rwebm_video_blit_i420_fp16) straight into the frame process hands
+ * out, 8 bytes a pixel; is_fp16 says whether the last one came out so.
+ * Any other source decodes as it always did. */
+void rmp4_video_set_want_fp16(rmp4_video_t *mp4, int want);
+bool rmp4_video_is_fp16(const rmp4_video_t *mp4);
+
+/* Decodes the first displayed frame of the first supported video track
+ * into a freshly malloc'd buffer at *buf. Returns IMAGE_PROCESS_END on
+ * success, IMAGE_PROCESS_ERROR on failure (no supported video track,
+ * malformed stream, or out of memory). */
+int rmp4_video_process_image(rmp4_video_t *mp4, void **buf,
+      size_t len, unsigned *width, unsigned *height, bool supports_rgba);
+
+/* ---- Streaming animation ---- */
+
+typedef struct rmp4_video_stream rmp4_video_stream_t;
+
+/* Take ownership of the stream a successful rmp4_video_process_image
+ * left open, positioned just past the first displayed frame, so the
+ * caller can continue the video as an animation without re-opening
+ * (and re-pre-scanning) the file.  Returns NULL if no stream is held
+ * (no process call yet, it failed, or the stream was already
+ * detached).  The stream borrows the buffer given via
+ * rmp4_video_set_buf_ptr, which must outlive it; close it with
+ * rmp4_video_stream_close.  10-bit output requested for the still is
+ * dropped: detached streams emit 8-bit frames. */
+rmp4_video_stream_t *rmp4_video_detach_stream(rmp4_video_t *mp4);
+
+/* The buffer is BORROWED and must remain valid and unmodified until
+ * rmp4_video_stream_close. Returns NULL when the data is not an MP4
+ * stream, has no video track with a compiled-in codec, or contains no
+ * video packets. */
+rmp4_video_stream_t *rmp4_video_stream_open(const uint8_t *buf,
+      size_t len);
+
+/* Open against a partially-read buffer: 'avail' leading bytes are
+ * valid (raise later with the stream set_avail).  On NULL, *need_more
+ * distinguishes "feed more bytes and retry" from malformed data. */
+/* need_lo/need_hi: see rmp4_open_memory_avail. */
+rmp4_video_stream_t *rmp4_video_stream_open_avail(const uint8_t *buf,
+      size_t len, size_t avail, int *need_more,
+      size_t *need_lo, size_t *need_hi);
+
+/* Also admit hardware-only AV1 candidates. Call set_hw before decoding;
+ * failure has no software AV1 fallback. No CPU canvas is allocated for AV1.
+ * Current AV1 hardware admission requires an av1C sequence header. */
+rmp4_video_stream_t *rmp4_video_stream_open_hw_avail(const uint8_t *buf,
+      size_t len, size_t avail, int *need_more,
+      size_t *need_lo, size_t *need_hi);
+
+void rmp4_video_stream_close(rmp4_video_stream_t *stream);
+
+/* num_frames is the number of coded video samples accepted by the
+ * demuxer, an upper bound on displayed frames (some may be non-shown).
+ * loop_count is always 0: video loops indefinitely. */
+void rmp4_video_stream_get_info(const rmp4_video_stream_t *stream,
+      unsigned *width, unsigned *height, int *num_frames, int *loop_count);
+
+/* Decode the next displayed frame. Returns the frame pixels (valid until
+ * the next call on this stream) and writes its display duration in ms
+ * (0 when unknown; the caller applies its default), or NULL at the end
+ * of one pass; call rmp4_video_stream_rewind to loop.  Pixels are in
+ * memory order R,G,B,A by default; see rmp4_video_stream_set_argb. */
+const uint32_t *rmp4_video_stream_next(rmp4_video_stream_t *stream,
+      int *duration_ms);
+/* A retry can need input bytes or decoder/output capacity. */
+enum rmp4_video_wait_reason
+{
+   RMP4_VIDEO_WAIT_NONE = 0,
+   RMP4_VIDEO_WAIT_INPUT,
+   RMP4_VIDEO_WAIT_DECODER
+};
+int rmp4_video_stream_waiting(const rmp4_video_stream_t *stream);
+enum rmp4_video_wait_reason rmp4_video_stream_wait_reason(
+      const rmp4_video_stream_t *stream);
+
+/* Select the channel order of subsequent frames: non-zero emits ARGB
+ * words (memory order B,G,R,A on little-endian), zero restores the
+ * default R,G,B,A memory order.  Applies to the 8-bit output paths;
+ * 10-bit XRGB2101010 output is unaffected.  The order is baked by the
+ * blit, so this costs nothing per frame - it exists so a caller whose
+ * upload format is ARGB does not need its own full-frame swizzle pass.
+ * Takes effect from the next decoded frame; may be changed between
+ * frames.  A stream detached from a still-image transfer starts at
+ * the default order. */
+void rmp4_video_stream_set_argb(rmp4_video_stream_t *stream, int argb);
+
+/* Blit decoded frames into @out - width * height words, the caller's,
+ * which then comes back from rmp4_video_stream_next and _render -
+ * instead of the stream's own frame, so a caller uploading from its
+ * own buffer needs no copy out of the stream. NULL restores the
+ * stream's frame, allocated on its first software render. Takes effect
+ * from the next rendered frame; @out must
+ * stay valid until the next call that renders has returned. */
+/* While @behind is set, pictures nothing references are consumed
+ * without being decoded and their presentation slots pass, so the
+ * stream catches up with a caller that has fallen behind its clock;
+ * what is shown is decoded exactly as before. Clear it once caught
+ * up. */
+void rmp4_video_stream_set_catchup(rmp4_video_stream_t *stream, int behind);
+
+/* The stream's H.264 decoder, for a bench to ask about, or NULL. */
+void *rmp4_video_stream_h264(rmp4_video_stream_t *stream);
+void *rmp4_video_stream_h265(rmp4_video_stream_t *stream);
+
+void rmp4_video_stream_set_output(rmp4_video_stream_t *stream,
+      uint32_t *out);
+
+/* As set_output, with rows @stride pixels apart (0: width), including
+ * FP16 pixels. NULL restores the canvas. False leaves output unchanged
+ * if the stride is too short or its frame extent overflows size_t. */
+int rmp4_video_stream_set_output_stride(rmp4_video_stream_t *stream,
+      uint32_t *out, unsigned stride);
+
+/* H.264/HEVC/VP9/AV1 on the hardware backend: true when the
+ * frames will come from it, false when they stay in software - another
+ * codec, a colour the GPU frame cannot carry, or a backend that will
+ * not take the stream. A stream already under way starts over from
+ * its first frame. Each shown frame is then taken with
+ * rmp4_video_stream_hw_frame after _next; _next returns a pointer
+ * that only says a frame came, its pixels untouched. */
+int rmp4_video_stream_set_hw(rmp4_video_stream_t *stream, int enable);
+/* Close hardware sessions and rewind without decoding. Restore the
+ * playback position before resuming. */
+void rmp4_video_stream_stop_hw(rmp4_video_stream_t *stream);
+/* The hardware frame of the frame _next just showed, handed over: 1,
+ * and the caller reads or abandons it (video_hw_frame_abandon); 0 when
+ * that frame is not one. One not taken by the next step is abandoned
+ * by the stream. */
+int rmp4_video_stream_hw_frame(rmp4_video_stream_t *stream,
+      struct video_hw_frame *out);
+
+/* Linear scRGB half floats for an HDR source: a 10-bit PQ or HLG
+ * frame - VP9, H.264 or H.265 - decoded into the caller's frame
+ * (rmp4_video_stream_set_output), which then holds 8 bytes a pixel,
+ * through rwebm_video_blit_i420_fp16 - no tone map. Every other frame,
+ * and every frame without a caller's output, takes the paths it always
+ * did. is_fp16 answers for the last frame decoded; is_hdr for the
+ * source, from its colr or HEVC SPS VUI transfer. */
+void rmp4_video_stream_set_want_fp16(rmp4_video_stream_t *stream,
+      int want);
+int rmp4_video_stream_is_fp16(const rmp4_video_stream_t *stream);
+int rmp4_video_stream_is_hdr(const rmp4_video_stream_t *stream);
+
+/* Convert decoded frames in @bands row bands on @pool (an rthreads
+ * tpool_t of at least bands - 1 threads; the calling thread takes one
+ * band and joins the rest), and decode a VP9 frame's tile columns on
+ * the same threads (rvp9_set_tile_pool). NULL or bands <= 1 keeps
+ * everything on the calling thread. The pool is the caller's and must
+ * outlive every decode call made while it is set. */
+void rmp4_video_stream_set_blit_pool(rmp4_video_stream_t *stream,
+      void *pool, unsigned bands);
+
+/* Advance past the next displayed frame without colour-converting it:
+ * the picture stays inside the decoder and no work is spent on its
+ * pixels.  Returns 1 when a frame was consumed (its display duration
+ * written as for _next), 2 on input/decoder backpressure, -1 at end
+ * or error. For a caller pacing through several frames per tick, skip the passed-over
+ * frames and render only the one presented.  rmp4_video_stream_next
+ * is exactly skip followed by render. */
+int rmp4_video_stream_skip(rmp4_video_stream_t *stream, int *duration_ms);
+/* Consume a displayed frame without AV1 GPU export. Retry/end match skip;
+ * a discarded frame is not renderable. */
+int rmp4_video_stream_discard(rmp4_video_stream_t *stream, int *duration_ms);
+
+/* Colour-convert the most recently consumed displayed frame (from
+ * _next or _skip) into the stream canvas and return it - the planes
+ * stay valid inside the decoder until the next decode, so this can be
+ * called at any point after the frame was consumed, and repeatedly
+ * (idempotent).  NULL when no frame is pending (before the first
+ * frame, after rewind or seek, or at end of stream). */
+const uint32_t *rmp4_video_stream_render(rmp4_video_stream_t *stream);
+
+/* Partial-read support: raise the number of leading buffer bytes that
+ * are valid (monotonic).  A blocked skip/next (return 2 / NULL after
+ * a step that returned 2) resumes once the needed sample's bytes are
+ * inside the window. Hardware streams may also need decoder capacity. */
+void rmp4_video_stream_set_avail(rmp4_video_stream_t *stream,
+      size_t avail);
+
+/* Bounded-memory streaming support (see rmp4_media_floor/consumed). */
+size_t rmp4_video_stream_media_floor(rmp4_video_stream_t *s);
+size_t rmp4_video_stream_consumed(rmp4_video_stream_t *s);
+void rmp4_video_stream_read_span(const rmp4_video_stream_t *s,
+      size_t *lo, size_t *hi);
+/* Exact input range while seeking through AV1 metadata; 0 otherwise. */
+int rmp4_video_stream_seek_span(rmp4_video_stream_t *s,
+      size_t *lo, size_t *hi);
+/* Container duration in nanoseconds (mvhd), 0 when absent. */
+int64_t rmp4_video_stream_duration_ns(rmp4_video_stream_t *s);
+
+/* Last advance exhausted input and drained output without failure. */
+int rmp4_video_stream_completed(const rmp4_video_stream_t *stream);
+
+void rmp4_video_stream_rewind(rmp4_video_stream_t *stream);
+
+/* Seek to the display position at or before 'ms' milliseconds: the
+ * stream restarts at the preceding key frame and decodes forward,
+ * discarding pictures, so the next rmp4_video_stream_next call
+ * returns the frame at the position. Returns the position in
+ * ms actually reached (the next slot's timestamp), or -1 on a
+ * stream without timing. */
+/* Resumable owner-thread seek. Begin selects a presentation target;
+ * each step examines at most 256 key flags or decodes one packet.
+ * Step returns -1 failed, 0 retry (feed the consumed byte frontier if
+ * waiting for input), 1 ready for next(). The target picture is not
+ * consumed. A new begin or rewind cancels an unfinished request. */
+int rmp4_video_stream_seek_begin_ns(rmp4_video_stream_t *stream, int64_t ns);
+int rmp4_video_stream_seek_step(rmp4_video_stream_t *stream,
+      int64_t *position_us);
+
+int64_t rmp4_video_stream_seek_ms(rmp4_video_stream_t *stream, int64_t ms);
+
+/* Seek to a zero-based display slot, clamped to the timeline. The next
+ * decode returns that frame. As seek_ms, returns its timestamp in ms. */
+int64_t rmp4_video_stream_seek_frame(rmp4_video_stream_t *stream, int frame);
+
+/* Zero-based ordinal of the next displayed picture, including pictures
+ * consumed while seeking. Returns -1 for a null stream. */
+int rmp4_video_stream_frame_index(const rmp4_video_stream_t *stream);
+
+/* Timestamp span of the display timeline: last frame's presentation
+ * time minus the first's, in ms.  (frames-1)/span is the stream's true
+ * mean rate; the track duration also counts the final frame's own
+ * duration, which skews a rate derived from it. */
+int64_t rmp4_video_stream_span_ms(const rmp4_video_stream_t *stream);
+
+/* Leading empty edit before this video track, in movie nanoseconds.
+ * Zero for a stream without such an edit, or a NULL stream. Durations
+ * and raw decoder seek coordinates remain relative to the video track. */
+int64_t rmp4_video_stream_presentation_delay_ns(const rmp4_video_stream_t *stream);
+
+/* Movie-relative timestamp of the most recently decoded display frame,
+ * including the leading empty edit. Query only on the decoder owner,
+ * after a successful next/skip. -1 before a frame, after rewind, or
+ * when no timestamp is available. Decoder-relative seek APIs are unchanged. */
+int64_t rmp4_video_stream_frame_time_ns(const rmp4_video_stream_t *stream);
+
+/* Movie-relative bounded seek, including leading and trailing empty
+ * video intervals. The decoder-relative APIs below remain unchanged. */
+int rmp4_video_stream_seek_movie_begin_ns(rmp4_video_stream_t *stream, int64_t ns);
+int rmp4_video_stream_seek_movie_step(rmp4_video_stream_t *stream,
+      int64_t *position_us);
+
+
+
+RETRO_END_DECLS
+
+#endif

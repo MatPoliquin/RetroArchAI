@@ -109,8 +109,6 @@
 		96AFAE2D16C1D4EA009DE44C /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		96AFAE2F16C1D4EA009DE44C /* GLKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = GLKit.framework; path = System/Library/Frameworks/GLKit.framework; sourceTree = SDKROOT; };
 		96AFAE3116C1D4EA009DE44C /* OpenGLES.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = OpenGLES.framework; path = System/Library/Frameworks/OpenGLES.framework; sourceTree = SDKROOT; };
-		96AFAF4516C1E00A009DE44C /* bitmap.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = bitmap.bin; sourceTree = "<group>"; };
-		96AFAF4616C1E00A009DE44C /* bitmap.bmp */ = {isa = PBXFileReference; lastKnownFileType = image.bmp; path = bitmap.bmp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -321,8 +319,6 @@
 		96AFAF4416C1E00A009DE44C /* drivers_font_renderer */ = {
 			isa = PBXGroup;
 			children = (
-				96AFAF4516C1E00A009DE44C /* bitmap.bin */,
-				96AFAF4616C1E00A009DE44C /* bitmap.bmp */,
 			);
 			path = drivers_font_renderer;
 			sourceTree = "<group>";
@@ -455,7 +451,7 @@
 				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";
 				CODE_SIGN_RESOURCE_RULES_PATH = "$(SDKROOT)/ResourceRules.plist";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1.21.0;
+				CURRENT_PROJECT_VERSION = 1.22.2;
 				DEVELOPMENT_TEAM = UK699V5ZS8;
 				ENABLE_BITCODE = NO;
 				GCC_PRECOMPILE_PREFIX_HEADER = NO;
@@ -463,7 +459,6 @@
 				HEADER_SEARCH_PATHS = (
 					../../,
 					"../../libretro-common/include",
-					"../../libretro-common/include/compat/zlib",
 					../../deps/stb,
 					../../deps/rcheevos/include,
 					../../deps,
@@ -473,26 +468,28 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 6.0;
 				LD_NO_PIE = YES;
 				LIBRARY_SEARCH_PATHS = "";
-				MARKETING_VERSION = 1.21.0;
+				MARKETING_VERSION = 1.22.2;
 				ONLY_ACTIVE_ARCH = NO;
 				OTHER_CFLAGS = (
 					"-DHAVE_NETWORKGAMEPAD",
 					"-DHAVE_STB_FONT",
 					"-DHAVE_HID",
 					"-DHAVE_NETWORKING",
+					"-DHAVE_SSL",
+					"-DHAVE_CRYPTO",
+					"-DHAVE_RETROSSL",
 					"-DHAVE_IFINFO",
 					"-DHAVE_NETPLAYDISCOVERY",
 					"-DHAVE_BSV_MOVIE",
 					"-DHAVE_RUNAHEAD",
 					"-DHAVE_TRANSLATE",
 					"-DHAVE_GRIFFIN",
-					"-DHAVE_STB_VORBIS",
+					"-DHAVE_RVORBIS",
 					"-DHAVE_UPDATE_ASSETS",
 					"-DHAVE_ONLINE_UPDATER",
 					"-DHAVE_LANGEXTRA",
 					"-DHAVE_CHEEVOS",
 					"-DRC_DISABLE_LUA",
-					"-DHAVE_IMAGEVIEWER",
 					"-DHAVE_RGUI",
 					"-DHAVE_CONFIGFILE",
 					"-DHAVE_PATCH",
@@ -520,8 +517,9 @@
 					"-DHAVE_COREAUDIO",
 					"-DHAVE_DYNAMIC",
 					"-DHAVE_OVERLAY",
-					"-DHAVE_ZLIB",
 					"-DHAVE_RPNG",
+					"-DHAVE_RWEBP",
+					"-DHAVE_RDDS",
 					"-DHAVE_RJPEG",
 					"-DHAVE_RBMP",
 					"-DHAVE_RTGA",
@@ -556,7 +554,7 @@
 				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";
 				CODE_SIGN_RESOURCE_RULES_PATH = "$(SDKROOT)/ResourceRules.plist";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1.21.0;
+				CURRENT_PROJECT_VERSION = 1.22.2;
 				DEVELOPMENT_TEAM = UK699V5ZS8;
 				ENABLE_BITCODE = NO;
 				GCC_PRECOMPILE_PREFIX_HEADER = NO;
@@ -564,7 +562,6 @@
 				HEADER_SEARCH_PATHS = (
 					../../,
 					"../../libretro-common/include",
-					"../../libretro-common/include/compat/zlib",
 					../../deps/stb,
 					../../deps/rcheevos/include,
 					../../deps,
@@ -574,7 +571,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 6.0;
 				LD_NO_PIE = YES;
 				LIBRARY_SEARCH_PATHS = "";
-				MARKETING_VERSION = 1.21.0;
+				MARKETING_VERSION = 1.22.2;
 				OTHER_CFLAGS = (
 					"-DNS_BLOCK_ASSERTIONS=1",
 					"-DNDEBUG",
@@ -582,19 +579,21 @@
 					"-DHAVE_STB_FONT",
 					"-DHAVE_HID",
 					"-DHAVE_NETWORKING",
+					"-DHAVE_SSL",
+					"-DHAVE_CRYPTO",
+					"-DHAVE_RETROSSL",
 					"-DHAVE_IFINFO",
 					"-DHAVE_NETPLAYDISCOVERY",
 					"-DHAVE_BSV_MOVIE",
 					"-DHAVE_RUNAHEAD",
 					"-DHAVE_TRANSLATE",
 					"-DHAVE_GRIFFIN",
-					"-DHAVE_STB_VORBIS",
+					"-DHAVE_RVORBIS",
 					"-DHAVE_UPDATE_ASSETS",
 					"-DHAVE_ONLINE_UPDATER",
 					"-DHAVE_LANGEXTRA",
 					"-DHAVE_CHEEVOS",
 					"-DRC_DISABLE_LUA",
-					"-DHAVE_IMAGEVIEWER",
 					"-DHAVE_RGUI",
 					"-DHAVE_CONFIGFILE",
 					"-DHAVE_PATCH",
@@ -622,8 +621,9 @@
 					"-DHAVE_COREAUDIO",
 					"-DHAVE_DYNAMIC",
 					"-DHAVE_OVERLAY",
-					"-DHAVE_ZLIB",
 					"-DHAVE_RPNG",
+					"-DHAVE_RWEBP",
+					"-DHAVE_RDDS",
 					"-DHAVE_RJPEG",
 					"-DHAVE_RBMP",
 					"-DHAVE_RTGA",
@@ -633,7 +633,6 @@
 					"-DHAVE_THREADS",
 					"-DHAVE_FILTERS_BUILTIN",
 					"-DHAVE_7ZIP",
-					"-D_7ZIP_ST",
 					"-DHAVE_MATERIALUI",
 					"-DHAVE_XMB",
 					"-DHAVE_OZONE",
@@ -647,19 +646,21 @@
 					"-DHAVE_STB_FONT",
 					"-DHAVE_HID",
 					"-DHAVE_NETWORKING",
+					"-DHAVE_SSL",
+					"-DHAVE_CRYPTO",
+					"-DHAVE_RETROSSL",
 					"-DHAVE_IFINFO",
 					"-DHAVE_NETPLAYDISCOVERY",
 					"-DHAVE_BSV_MOVIE",
 					"-DHAVE_RUNAHEAD",
 					"-DHAVE_TRANSLATE",
 					"-DHAVE_GRIFFIN",
-					"-DHAVE_STB_VORBIS",
+					"-DHAVE_RVORBIS",
 					"-DHAVE_UPDATE_ASSETS",
 					"-DHAVE_ONLINE_UPDATER",
 					"-DHAVE_LANGEXTRA",
 					"-DHAVE_CHEEVOS",
 					"-DRC_DISABLE_LUA",
-					"-DHAVE_IMAGEVIEWER",
 					"-DHAVE_RGUI",
 					"-DHAVE_CONFIGFILE",
 					"-DHAVE_PATCH",
@@ -688,8 +689,9 @@
 					"-DHAVE_DYNAMIC",
 					"-DRARCH_INTERNAL",
 					"-DHAVE_OVERLAY",
-					"-DHAVE_ZLIB",
 					"-DHAVE_RPNG",
+					"-DHAVE_RWEBP",
+					"-DHAVE_RDDS",
 					"-DHAVE_RJPEG",
 					"-DHAVE_RBMP",
 					"-DHAVE_RTGA",
@@ -698,7 +700,6 @@
 					"-DHAVE_THREADS",
 					"-DHAVE_FILTERS_BUILTIN",
 					"-DHAVE_7ZIP",
-					"-D_7ZIP_ST",
 					"-DHAVE_MATERIALUI",
 					"-DHAVE_XMB",
 					"-DHAVE_OZONE",
@@ -746,19 +747,21 @@
 					"-DHAVE_STB_FONT",
 					"-DHAVE_HID",
 					"-DHAVE_NETWORKING",
+					"-DHAVE_SSL",
+					"-DHAVE_CRYPTO",
+					"-DHAVE_RETROSSL",
 					"-DHAVE_IFINFO",
 					"-DHAVE_NETPLAYDISCOVERY",
 					"-DHAVE_BSV_MOVIE",
 					"-DHAVE_RUNAHEAD",
 					"-DHAVE_TRANSLATE",
 					"-DHAVE_GRIFFIN",
-					"-DHAVE_STB_VORBIS",
+					"-DHAVE_RVORBIS",
 					"-DHAVE_UPDATE_ASSETS",
 					"-DHAVE_ONLINE_UPDATER",
 					"-DHAVE_LANGEXTRA",
 					"-DHAVE_CHEEVOS",
 					"-DRC_DISABLE_LUA",
-					"-DHAVE_IMAGEVIEWER",
 					"-DHAVE_RGUI",
 					"-DHAVE_CONFIGFILE",
 					"-DHAVE_PATCH",
@@ -788,8 +791,9 @@
 					"-std=gnu99",
 					"-DHAVE_COREAUDIO",
 					"-DHAVE_OVERLAY",
-					"-DHAVE_ZLIB",
 					"-DHAVE_RPNG",
+					"-DHAVE_RWEBP",
+					"-DHAVE_RDDS",
 					"-DHAVE_RJPEG",
 					"-DHAVE_RBMP",
 					"-DHAVE_RTGA",
@@ -830,19 +834,21 @@
 					"-DHAVE_STB_FONT",
 					"-DHAVE_HID",
 					"-DHAVE_NETWORKING",
+					"-DHAVE_SSL",
+					"-DHAVE_CRYPTO",
+					"-DHAVE_RETROSSL",
 					"-DHAVE_IFINFO",
 					"-DHAVE_NETPLAYDISCOVERY",
 					"-DHAVE_BSV_MOVIE",
 					"-DHAVE_RUNAHEAD",
 					"-DHAVE_TRANSLATE",
 					"-DHAVE_GRIFFIN",
-					"-DHAVE_STB_VORBIS",
+					"-DHAVE_RVORBIS",
 					"-DHAVE_UPDATE_ASSETS",
 					"-DHAVE_ONLINE_UPDATER",
 					"-DHAVE_LANGEXTRA",
 					"-DHAVE_CHEEVOS",
 					"-DRC_DISABLE_LUA",
-					"-DHAVE_IMAGEVIEWER",
 					"-DHAVE_RGUI",
 					"-DHAVE_CONFIGFILE",
 					"-DHAVE_PATCH",
@@ -872,8 +878,9 @@
 					"-std=gnu99",
 					"-DHAVE_COREAUDIO",
 					"-DHAVE_OVERLAY",
-					"-DHAVE_ZLIB",
 					"-DHAVE_RPNG",
+					"-DHAVE_RWEBP",
+					"-DHAVE_RDDS",
 					"-DHAVE_RJPEG",
 					"-DHAVE_RBMP",
 					"-DHAVE_RTGA",

@@ -22,6 +22,7 @@
 #include <stddef.h>
 
 #include <boolean.h>
+#include <retro_common_api.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -37,7 +38,14 @@
 
 #include "../natt.h"
 
+RETRO_BEGIN_DECLS
+
 typedef struct netplay netplay_t;
+
+#ifdef HAVE_BSV_MOVIE
+struct bsv_movie;
+bool netplay_bsv_movie_init(struct bsv_movie *movie);
+#endif
 
 typedef struct netplay_client_info
 {
@@ -72,6 +80,8 @@ struct netplay_room
    int  port;
    int  mitm_port;
    int  host_method;
+   int  player_count;
+   int  spectator_count;
    char nickname[NETPLAY_NICK_LEN];
    char frontend[NETPLAY_HOST_STR_LEN];
    char corename[NETPLAY_HOST_STR_LEN];
@@ -167,6 +177,16 @@ typedef struct
 
 net_driver_state_t *networking_state_get_ptr(void);
 
+#ifdef HAVE_NETWORKING
+/* The content fingerprint netplay advertises, compares and searches by.
+ * Derived on first use and cached; see netplay_frontend.c.
+ *
+ * Netplay is the only consumer of a content CRC in the frontend, so
+ * this exists only where netplay does - a target built without
+ * networking has neither this nor anything that calls it. */
+uint32_t netplay_content_crc(void);
+#endif
+
 bool netplay_compatible_version(const char *version);
 bool netplay_decode_hostname(const char *hostname,
    char *address, unsigned *port, char *session, size_t len);
@@ -195,6 +215,33 @@ void deinit_netplay(void);
 
 bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data);
 
+/**
+ * netplay_mitm_query_prefetch:
+ *
+ * Start the relay tunnel query early, when the user commits to
+ * hosting, rather than when host setup needs the address.  The round
+ * trip then overlaps work that was going to happen anyway, so host
+ * setup usually finds the answer in hand and is not deferred.
+ *
+ * Best effort: if it is skipped or fails, host setup issues the
+ * query exactly as it did before.
+ */
+void netplay_mitm_query_prefetch(void);
+
+/**
+ * netplay_host_setup_defer:
+ *
+ * Called by host setup (CMD_EVENT_NETPLAY_INIT) before it runs: when
+ * hosting through a relay whose address query is still out, puts the
+ * setup off to a main-thread task that runs it once the answer is in
+ * (or directly, past the query's bound) and returns true; otherwise
+ * returns false and the setup goes ahead now.
+ **/
+bool netplay_host_setup_defer(void);
+
+/* True while host setup is deferred on the tunnel query. */
+bool netplay_host_setup_pending(void);
+
 bool netplay_reinit_serialization(void);
 bool netplay_is_spectating(void);
 void netplay_force_send_savestate(void);
@@ -205,10 +252,20 @@ bool init_netplay_discovery(void);
 /** Deinitialize and free Netplay discovery */
 void deinit_netplay_discovery(void);
 
+/**
+ * netplay_discovery_free_hosts:
+ *
+ * Frees the LAN discovery result list. One-time teardown only.
+ */
+void netplay_discovery_free_hosts(void);
+
 /** Discovery control */
 bool netplay_discovery_driver_ctl(enum rarch_netplay_discovery_ctl_state state,
    void *data);
 #endif
 
 extern const mitm_server_t netplay_mitm_server_list[NETPLAY_MITM_SERVERS];
+
+RETRO_END_DECLS
+
 #endif

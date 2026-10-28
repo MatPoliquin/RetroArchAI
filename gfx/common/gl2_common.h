@@ -30,137 +30,68 @@
 #include <gfx/scaler/scaler.h>
 #include <glsym/glsym.h>
 #include <formats/image.h>
+#include <retro_atomic.h>
 
 #include "../video_driver.h"
+#include "gl_common.h"
+
+/* A software core's frames sampled where it writes them, on KMS */
+#if defined(HAVE_KMS) && defined(HAVE_EGL) && !defined(HAVE_PSGL)
+#define GL2_KMS_FRAMES
+#include "egl_gbm_frames.h"
+#endif
+
+/* The hardware ring's per-slot sync, handed from the core's thread to
+ * the video thread by exchange so that one thread waits and deletes
+ * each. A backend without pointer atomics only serves single-core
+ * targets, where a plain swap is the same. */
+#ifndef GL_HW_RING_SYNC_T
+#if defined(RETRO_ATOMIC_HAS_PTR)
+#define GL_HW_RING_SYNC_T retro_atomic_ptr_t
+#define GL_HW_RING_SYNC_SWAP(p, v, out) \
+   ((out) = retro_atomic_exchange_ptr((p), (v)))
+#else
+#define GL_HW_RING_SYNC_T void *
+#define GL_HW_RING_SYNC_SWAP(p, v, out) ((out) = *(p), *(p) = (v))
+#endif
+#endif
 
 RETRO_BEGIN_DECLS
 
-#define GL2_BIND_TEXTURE(id, wrap_mode, mag_filter, min_filter) \
-   glBindTexture(GL_TEXTURE_2D, id); \
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_mode); \
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_mode); \
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag_filter); \
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter)
-
-#if defined(HAVE_PSGL)
-#define RARCH_GL_FRAMEBUFFER GL_FRAMEBUFFER_OES
-#define RARCH_GL_FRAMEBUFFER_COMPLETE GL_FRAMEBUFFER_COMPLETE_OES
-#define RARCH_GL_COLOR_ATTACHMENT0 GL_COLOR_ATTACHMENT0_EXT
-#elif (defined(__MACH__)  && defined(MAC_OS_X_VERSION_MAX_ALLOWED) && (MAC_OS_X_VERSION_MAX_ALLOWED < 101200))
-#define RARCH_GL_FRAMEBUFFER GL_FRAMEBUFFER_EXT
-#define RARCH_GL_FRAMEBUFFER_COMPLETE GL_FRAMEBUFFER_COMPLETE_EXT
-#define RARCH_GL_COLOR_ATTACHMENT0 GL_COLOR_ATTACHMENT0_EXT
-#else
-#define RARCH_GL_FRAMEBUFFER GL_FRAMEBUFFER
-#define RARCH_GL_FRAMEBUFFER_COMPLETE GL_FRAMEBUFFER_COMPLETE
-#define RARCH_GL_COLOR_ATTACHMENT0 GL_COLOR_ATTACHMENT0
-#endif
-
-#if defined(HAVE_OPENGLES2) || defined(HAVE_OPENGLES3) || defined(HAVE_OPENGLES_3_1) || defined(HAVE_OPENGLES_3_2)
-#define RARCH_GL_RENDERBUFFER GL_RENDERBUFFER
-#if defined(HAVE_OPENGLES2)
-#define RARCH_GL_DEPTH24_STENCIL8 GL_DEPTH24_STENCIL8_OES
-#else
-#define RARCH_GL_DEPTH24_STENCIL8 GL_DEPTH24_STENCIL8
-#endif
-#define RARCH_GL_DEPTH_ATTACHMENT GL_DEPTH_ATTACHMENT
-#define RARCH_GL_STENCIL_ATTACHMENT GL_STENCIL_ATTACHMENT
-#elif (defined(__MACH__) && defined(MAC_OS_X_VERSION_MAX_ALLOWED) && (MAC_OS_X_VERSION_MAX_ALLOWED < 101200))
-#define RARCH_GL_RENDERBUFFER GL_RENDERBUFFER_EXT
-#define RARCH_GL_DEPTH24_STENCIL8 GL_DEPTH24_STENCIL8_EXT
-#define RARCH_GL_DEPTH_ATTACHMENT GL_DEPTH_ATTACHMENT_EXT
-#define RARCH_GL_STENCIL_ATTACHMENT GL_STENCIL_ATTACHMENT_EXT
-#elif defined(HAVE_PSGL)
-#define RARCH_GL_RENDERBUFFER GL_RENDERBUFFER_OES
-#define RARCH_GL_DEPTH24_STENCIL8 GL_DEPTH24_STENCIL8_SCE
-#define RARCH_GL_DEPTH_ATTACHMENT GL_DEPTH_ATTACHMENT_OES
-#define RARCH_GL_STENCIL_ATTACHMENT GL_STENCIL_ATTACHMENT_OES
-#else
-#define RARCH_GL_RENDERBUFFER GL_RENDERBUFFER
-#define RARCH_GL_DEPTH24_STENCIL8 GL_DEPTH24_STENCIL8
-#define RARCH_GL_DEPTH_ATTACHMENT GL_DEPTH_ATTACHMENT
-#define RARCH_GL_STENCIL_ATTACHMENT GL_STENCIL_ATTACHMENT
-#endif
-
-#if (defined(__MACH__) && defined(MAC_OS_X_VERSION_MAX_ALLOWED) && (MAC_OS_X_VERSION_MAX_ALLOWED < 101200))
-#define RARCH_GL_MAX_RENDERBUFFER_SIZE GL_MAX_RENDERBUFFER_SIZE_EXT
-#elif defined(HAVE_PSGL)
-#define RARCH_GL_MAX_RENDERBUFFER_SIZE GL_MAX_RENDERBUFFER_SIZE_OES
-#else
-#define RARCH_GL_MAX_RENDERBUFFER_SIZE GL_MAX_RENDERBUFFER_SIZE
-#endif
-
-#if defined(HAVE_PSGL)
-#define glGenerateMipmap glGenerateMipmapOES
-#endif
-
-#if defined(__APPLE__) || defined(HAVE_PSGL)
-#ifndef GL_RGBA32F
-#define GL_RGBA32F GL_RGBA32F_ARB
-#endif
-#endif
-
-#if defined(HAVE_PSGL)
-#define RARCH_GL_INTERNAL_FORMAT32 GL_ARGB_SCE
-#define RARCH_GL_INTERNAL_FORMAT16 GL_RGB5 /* TODO: Verify if this is really 565 or just 555. */
-#define RARCH_GL_TEXTURE_TYPE32 GL_BGRA
-#define RARCH_GL_TEXTURE_TYPE16 GL_BGRA
-#define RARCH_GL_FORMAT32 GL_UNSIGNED_INT_8_8_8_8_REV
-#define RARCH_GL_FORMAT16 GL_RGB5
-#elif defined(HAVE_OPENGLES)
-/* Imgtec/SGX headers have this missing. */
-#ifndef GL_BGRA_EXT
-#define GL_BGRA_EXT 0x80E1
-#endif
-#ifndef GL_BGRA8_EXT
-#define GL_BGRA8_EXT 0x93A1
-#endif
-#ifdef IOS
-/* Stupid Apple */
-#define RARCH_GL_INTERNAL_FORMAT32 GL_RGBA
-#else
-#define RARCH_GL_INTERNAL_FORMAT32 GL_BGRA_EXT
-#endif
-#define RARCH_GL_INTERNAL_FORMAT16 GL_RGB
-#define RARCH_GL_TEXTURE_TYPE32 GL_BGRA_EXT
-#define RARCH_GL_TEXTURE_TYPE16 GL_RGB
-#define RARCH_GL_FORMAT32 GL_UNSIGNED_BYTE
-#define RARCH_GL_FORMAT16 GL_UNSIGNED_SHORT_5_6_5
-#else
-/* On desktop, we always use 32-bit. */
-#define RARCH_GL_INTERNAL_FORMAT32 GL_RGBA8
-#define RARCH_GL_INTERNAL_FORMAT16 GL_RGBA8
-#define RARCH_GL_TEXTURE_TYPE32 GL_BGRA
-#define RARCH_GL_TEXTURE_TYPE16 GL_BGRA
-#define RARCH_GL_FORMAT32 GL_UNSIGNED_INT_8_8_8_8_REV
-#define RARCH_GL_FORMAT16 GL_UNSIGNED_INT_8_8_8_8_REV
-
-/* GL_RGB565 internal format isn't in desktop GL
- * until 4.1 core (ARB_ES2_compatibility).
- * Check for this. */
-#ifndef GL_RGB565
-#define GL_RGB565 0x8D62
-#endif
-#define RARCH_GL_INTERNAL_FORMAT16_565 GL_RGB565
-#define RARCH_GL_TEXTURE_TYPE16_565 GL_RGB
-#define RARCH_GL_FORMAT16_565 GL_UNSIGNED_SHORT_5_6_5
-#endif
-
-#if defined(HAVE_OPENGLES2) /* TODO: Figure out exactly what. */
-#define NO_GL_CLAMP_TO_BORDER
-#endif
-
-#if defined(HAVE_OPENGLES)
-#ifndef GL_UNPACK_ROW_LENGTH
-#define GL_UNPACK_ROW_LENGTH  0x0CF2
-#endif
-
-#ifndef GL_SRGB_ALPHA_EXT
-#define GL_SRGB_ALPHA_EXT 0x8C42
-#endif
-#endif
-
 typedef struct gl2 gl2_t;
+
+/* How many of each view's copies a preset can read: the newest and
+ * up to seven before it */
+#define GL2_VIEWS_HISTORY 8
+
+/* A render target views draw into: a texture and its framebuffer */
+struct gl2_views_fbo
+{
+   GLuint fbo;
+   GLuint tex;
+};
+
+/* A program views draw with, and where its uniforms are */
+struct gl2_views_prog
+{
+   GLuint prog;
+   GLint  loc_mvp;
+   GLint  loc_tex;
+   GLint  loc_clamp;
+   GLint  loc_height;
+};
+
+/* A window of screens' own: the context's record, which stays put
+ * until its destroy, and what the views draw into it with */
+struct gl2_window
+{
+   video_window_native_t native;
+   /* As last drawn and published */
+   video_views_layout_t  layout;
+   /* Anaglyph and interlaced draw both eyes into it first */
+   struct gl2_views_fbo  canvas;
+   video_views_target_t  canvas_target;
+};
 
 enum gl2_flags
 {
@@ -186,11 +117,50 @@ enum gl2_flags
    GL2_FLAG_MENU_TEXTURE_ENABLE    = (1 << 19),
    GL2_FLAG_MENU_TEXTURE_FULLSCREEN= (1 << 20),
    GL2_FLAG_NONE                   = (1 << 21),
-   GL2_FLAG_FRAME_DUPE_LOCK        = (1 << 22)
+   GL2_FLAG_FRAME_DUPE_LOCK        = (1 << 22),
+   /* Latched at init: the wrapper was active and the driver
+    * configuration allowed a hw ring when this context came up.
+    * core_context_is_mains() reads this instead of consulting the
+    * live settings from the frame path (the video thread, with the
+    * main thread running free). */
+   GL2_FLAG_HW_RING_EXPECTED = (1 << 27),
+   /* overlay_tex names belong to the overlay pack (load_textures):
+    * not deleted with the page. */
+   GL2_FLAG_OVERLAY_BORROWED       = (1 << 28),
+   /* GPU recording is on: taken from the frame the frontend hands over,
+    * so this thread never reads the recording state the main thread
+    * writes (video_frame_info_t::gpu_recording). */
+   GL2_FLAG_GPU_RECORDING          = (1 << 24),
+   /* What the last frame said context scaling should be:
+    * set_aspect_ratio() runs on the video thread under the threaded
+    * wrapper, and reading the setting there races the menu writing it. */
+   GL2_FLAG_CTX_SCALING            = (1 << 25),
+   /* What the last frame said the menu filter should be:
+    * set_texture_frame() is applied by the video thread in
+    * thread_update_driver_state(), and reading the setting there races
+    * the menu writing it. */
+   GL2_FLAG_MENU_LINEAR_FILTER     = (1 << 26),
+   /* How the passes' textures were last made, by init or set_shader:
+    * a frame past the textures makes them again on the video thread,
+    * and reading the settings there races the menu writing them. */
+   GL2_FLAG_FBO_SMOOTH             = (1 << 29),
+   GL2_FLAG_FBO_SRGB_DISABLE       = (1 << 30)
 };
 
 struct gl2
 {
+   /* gfx_display meshes kept on the GPU, by mesh id: vertices, and
+    * indices where the mesh has them. GL retires a deleted buffer once
+    * nothing in flight reads it, so the one drawn longest ago simply
+    * gives way when all are taken. */
+   struct
+   {
+      GLuint vbo;
+      GLuint ibo;
+      uint64_t last_draw;
+      uint32_t id;
+   } meshes[8];
+   uint64_t mesh_draws;
    const shader_backend_t *shader;
    void *shader_data;
    void *renderchain_data;
@@ -215,23 +185,48 @@ struct gl2
    GLuint pbo;
    GLuint *overlay_tex;
    GLuint menu_texture;
+   /* Sampled by a quad drawn with no texture: solid colour */
+   GLuint white_texture;
+   /* Copy of the last presented backbuffer, taken with
+    * glCopyTexSubImage2D before the swap of a frame() that asked for it
+    * (retain_output), plus the group that frame put on screen for
+    * present_last() to replay. GL 1.1 / GLES2, so every context. */
+   GLuint retained_texture;
+   /* In VIDEO_SCALE_PACK's layout. */
+   unsigned retained_dims;
+   unsigned retained_light;
+   unsigned retained_dark;
    GLuint pbo_readback[4];
    GLuint texture[GFX_MAX_TEXTURES];
    GLuint hw_render_fbo[GFX_MAX_TEXTURES];
+   /* The threaded wrapper's hardware ring: the fence the core's thread
+    * placed after rendering into each slot's texture, for the frame on
+    * this thread to wait before reading it. Sync objects are shared
+    * between the two contexts (GL_HW_RING_SYNC_SWAP). */
+   GL_HW_RING_SYNC_T hw_ring_sync[3];
+   void *hw_ring_done_sync; /* taken ahead of the swap */
+   /* Placed after each PBO readback: a slot is read only once its
+    * fence has signalled, so mapping it never waits on the GPU. */
+   void *pbo_readback_sync[4];
 
    uint32_t flags;
+   /* The threaded wrapper's hardware ring is driving this driver: set
+    * and cleared on the core's thread, read on the video thread. Kept
+    * apart from flags, whose bits the video thread moves: a bit the
+    * core's thread moved in the same word could be lost either way. */
+   retro_atomic_int_t hw_ring;
 
-   unsigned video_width;
-   unsigned video_height;
+   /* In VIDEO_SCALE_PACK's layout. */
+   unsigned video_dims;
 
    unsigned tex_index; /* For use with PREV. */
    unsigned textures;
    unsigned fbo_feedback_pass;
    unsigned rotation;
-   unsigned out_vp_width;
-   unsigned out_vp_height;
-   unsigned tex_w;
-   unsigned tex_h;
+   /* The viewport the last frame went out at, and the streaming
+    * texture's size, both in VIDEO_SCALE_PACK's layout. */
+   unsigned out_vp_dims;
+   unsigned tex_dims;
    unsigned base_size; /* 2 or 4 */
    unsigned overlays;
    unsigned pbo_readback_index;
@@ -256,7 +251,148 @@ struct gl2
    struct video_fbo_rect fbo_rect[GFX_MAX_SHADERS];   /* unsigned alignment */
 
    char device_str[128];
+#ifdef HAVE_GL_TEXTURE_LEND
+   gl_texture_lend_t *lend;
+#endif
+#ifdef HAVE_GL_FRAME_MEM
+   gl_frame_mem_t *frame_mem;
+   gl_sw_fb_t sw_fb;
+#endif
+#ifdef GL2_KMS_FRAMES
+   egl_gbm_frames_t *kms_frames;
+   /* Could not be made: frames are uploaded */
+   bool kms_frames_off;
+#endif
+#ifdef HAVE_GL_PLANAR
+   gl_planar_t planar;
+#endif
    bool pbo_readback_valid[4];
+   /* At init: textures take half floats (TEXTURE_GPU_FORMAT_RGBA16F) */
+   bool fp16_textures;
+   /* At init: ARB_sync is there (GL2_FLAG_HAVE_SYNC). Read by the
+    * ring's capture on the core's thread, where flags is not read. */
+   bool hw_ring_have_sync;
+   /* scRGB (FP16) default framebuffer support (Windows/WGL HDR):
+    * everything renders into this SDR offscreen and one GLSL 1.20
+    * pass encodes it into the FP16 backbuffer at end of frame.
+    * All zero / inactive on SDR contexts. */
+   struct
+   {
+      GLuint fbo;
+      GLuint tex;
+      GLuint program;
+      GLint  loc_tex;
+      GLint  loc_nits;
+      GLint  loc_expand;
+      unsigned dims;
+      /* Separate layer for the SDR UI when the content is PQ: one
+       * encode cannot treat some pixels as Rec.2020 PQ and others as
+       * gamma. Mirrors the glcore driver's ui_fbo/ui_tex. */
+      GLuint   ui_fbo;
+      GLuint   ui_tex;
+      GLint    loc_ui_tex;
+      GLint    loc_mode;
+      GLint    loc_ui_nits;
+      GLint    loc_out_pq;
+      /* Draws a half-float texture, linear scRGB, into the SDR layer
+       * as the encode's inverse (gl2_linear_program) */
+      GLuint   lin_program;
+      GLint    lin_loc_mvp;
+      GLint    lin_loc_tex;
+      GLint    lin_loc_params;
+      bool     lin_tried;
+      bool   active;
+      /* At init: the SDR layer can be RGBA16F, so a linear texture
+       * keeps what is above menu white (TEXTURE_GPU_FORMAT_SCRGB) */
+      bool     fp16_ok;
+      /* The layer the UI draws into is RGBA16F */
+      bool     tex_fp16;
+      /* The layers were last made for an RGBA16F UI layer */
+      bool     fp16_made;
+      /* The backbuffer is 10-bit Rec.2020 PQ, not FP16 scRGB */
+      bool   pq_out;
+      /* The HDR settings this frame carried (video_frame_info_t), so the
+       * thread that draws never reads what the menu writes */
+      float    menu_nits;
+      float    paper_white_nits;
+      unsigned expand_gamut;
+   } scrgb;
+
+   /* Views, drawn straight from the frame as the stock shader draws
+    * it, or with a preset through its passes, one view after another.
+    * A view's chain is the driver itself. The canvas holds both eyes
+    * for anaglyph and interlaced, the UI layer the UI drawn once for
+    * both eyes. */
+   struct
+   {
+      video_views_chains_t  chains;
+      struct gl2_views_fbo  canvas;
+      struct gl2_views_fbo  ui;
+      video_views_target_t  canvas_target;
+      video_views_target_t  ui_target;
+      video_views_ui_dims_t saved;
+      struct gl2_views_prog rect;
+      struct gl2_views_prog layer;
+      struct gl2_views_prog anaglyph;
+      struct gl2_views_prog interlaced;
+      /* With a preset each view is drawn from a copy of its own, the
+       * last few kept for a preset that reads earlier frames: head is
+       * the newest, prev what the preset reads as earlier ones. */
+      GLuint                tex[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      unsigned              tex_dims[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      /* Made for a software frame's view written straight in, as the
+       * frame's textures are, not for a copy drawn into it */
+      bool                  tex_written[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      unsigned              head[RETRO_VIDEO_VIEWS_MAX];
+      struct video_tex_info prev[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      /* What a feedback pass drew for each view the frame before */
+      struct gl2_views_fbo  feedback[RETRO_VIDEO_VIEWS_MAX];
+      unsigned              feedback_dims[RETRO_VIDEO_VIEWS_MAX];
+      /* For the view being drawn: its earlier frames and feedback */
+      const struct video_tex_info *prev_cur;
+      struct video_tex_info feedback_cur;
+      GLuint                copy_fbo;
+      GLuint                vbo;
+      /* For get_flags on the main thread: whether views may be drawn,
+       * and whether the last frame with a map was drawn whole. */
+      retro_atomic_int_t    allowed;
+      retro_atomic_int_t    fallback;
+      /* A shader preset is loaded */
+      bool                  preset;
+      bool                  preset_seen;
+      bool                  tried;
+      bool                  failed;
+      bool                  active;
+      /* Drawing into the UI layer */
+      bool                  ui_pass;
+      bool                  direct_seen;
+      bool                  written_seen;
+      /* Some copy or feedback target is held */
+      bool                  copies;
+      /* Each view's prev is filled */
+      bool                  prev_live[RETRO_VIDEO_VIEWS_MAX];
+   } views;
+
+#ifdef HAVE_VIDEO_WINDOWS
+   /* The screens' own windows, by window id; [0] is the main window
+    * and stays unused */
+   struct
+   {
+      struct gl2_window     win[RETRO_VIDEO_VIEWS_MAX];
+      video_windows_held_t  held;
+      /* gl2_frame()'s, for the preset's passes in them */
+      unsigned              frame_count;
+   } windows;
+#endif
+
+#if defined(HAVE_OPENXR) && defined(ANDROID) && defined(HAVE_OPENGLES3)
+   /* The framebuffer the headset's tracked eyes are drawn through. */
+   GLuint xr_fbo;
+#endif
+#if defined(HAVE_OPENXR_GL) && !defined(ANDROID)
+   /* Desktop headset output, while its host runs; gl2.c's own. */
+   struct gl2_desktop_xr *desktop_xr;
+#endif
 };
 
 bool gl2_load_luts(

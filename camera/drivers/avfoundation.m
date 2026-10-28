@@ -14,21 +14,24 @@
  */
 
 #include <TargetConditionals.h>
+#include "../../apple_runtime.h"
 #include <Foundation/Foundation.h>
 #include <AVFoundation/AVFoundation.h>
 #include <libretro.h>
-#include "../camera/camera_driver.h"
-#include "../verbosity.h"
-/// For image scaling and color space DSP
+#include <defines/cocoa_defines.h>
+/* For image scaling and color space DSP */
 #import <Accelerate/Accelerate.h>
 #if TARGET_OS_IOS
-/// For camera rotation detection
+/* For camera rotation detection */
 #import <UIKit/UIKit.h>
 #endif
 
-// TODO: Add an API to retroarch to allow selection of camera
+#include "../camera_driver.h"
+#include "../../verbosity.h"
+
+/* TODO: Add an API to retroarch to allow selection of camera */
 #ifndef CAMERA_PREFER_FRONTFACING
-#define CAMERA_PREFER_FRONTFACING 1  /// Default to front camera
+#define CAMERA_PREFER_FRONTFACING 1  /* Default to front camera */
 #endif
 
 #ifndef CAMERA_MIRROR_FRONT_CAMERA
@@ -44,6 +47,98 @@
 @property (assign) size_t height;
 
 - (bool)setupCameraSession;
+- (void)teardownScratchBuffers;
+@end
+
+/* Private class extension: cached per-frame scratch buffers.
+ * captureOutput:didOutputSampleBuffer: used to malloc + free four full-
+ * frame buffers per callback (intermediate colour-converted, rotated,
+ * optional mirrored, and scaled).  For a typical 720p BGRA camera that
+ * was ~3.5 MB × 4 allocations × 30 fps = hundreds of MB/s of allocator
+ * churn on the main thread (the capture delegate queue is the main
+ * queue — see setSampleBufferDelegate:queue: below).  Cache the
+ * buffers on the manager and grow only when the required size
+ * exceeds the current capacity; free them in teardownScratchBuffers
+ * on driver teardown.  Ivars are plain C pointers so the file remains
+ * identically correct under MRC and ARC. */
+@interface AVCameraManager ()
+{
+   void    *_intermediateBuf;
+   size_t   _intermediateCap;
+   void    *_rotatedBuf;
+   size_t   _rotatedCap;
+   void    *_mirroredBuf;
+   size_t   _mirroredCap;
+   void    *_scaledBuf;
+   size_t   _scaledCap;
+}
+@end
+
+/* Camera authorization is macOS 10.14 (iOS 7): its calls live in a
+ * class with that availability, so they are made directly there, and
+ * the camera reaches it by selector once it has checked the OS. */
+API_AVAILABLE(macos(10.14), ios(7.0))
+@interface RACameraAuthorization : NSObject
++ (void)authorizeWithCompletion:(void (^)(BOOL granted))completion;
++ (BOOL)requestBlocking;
+@end
+
+@implementation RACameraAuthorization
+
++ (void)authorizeWithCompletion:(void (^)(BOOL granted))completion
+{
+    AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+
+    switch (status) {
+    case AVAuthorizationStatusAuthorized: {
+        RARCH_LOG("[Camera] Camera access already authorized.\n");
+        completion(YES);
+        break;
+    }
+
+    case AVAuthorizationStatusNotDetermined: {
+
+        RARCH_LOG("[Camera] Requesting camera authorization...\n");
+        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo
+                                 completionHandler:^(BOOL granted) {
+            RARCH_LOG("[Camera] Authorization %s.\n", granted ? "granted" : "denied");
+            completion(granted);
+        }];
+        break;
+    }
+
+    case AVAuthorizationStatusDenied: {
+        RARCH_ERR("[Camera] Camera access denied by user.\n");
+        completion(NO);
+        break;
+    }
+
+    case AVAuthorizationStatusRestricted: {
+        RARCH_ERR("[Camera] Camera access restricted (parental controls?).\n");
+        completion(NO);
+        break;
+    }
+
+    default: {
+        RARCH_ERR("[Camera] Unknown authorization status.\n");
+        completion(NO);
+        break;
+    }
+    }
+}
+
++ (BOOL)requestBlocking
+{
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    __block BOOL granted = NO;
+    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL g) {
+        granted = g;
+        dispatch_semaphore_signal(sema);
+    }];
+    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+    return granted;
+}
+
 @end
 
 @implementation AVCameraManager
@@ -58,45 +153,17 @@
 }
 
 - (void)requestCameraAuthorizationWithCompletion:(void (^)(BOOL granted))completion {
-    RARCH_LOG("[Camera]: Checking camera authorization status\n");
+    RARCH_LOG("[Camera] Checking camera authorization status...\n");
 
-    AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
-
-    switch (status) {
-        case AVAuthorizationStatusAuthorized: {
-            RARCH_LOG("[Camera]: Camera access already authorized\n");
-            completion(YES);
-            break;
-        }
-
-        case AVAuthorizationStatusNotDetermined: {
-
-            RARCH_LOG("[Camera]: Requesting camera authorization...\n");
-            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo
-                                     completionHandler:^(BOOL granted) {
-                RARCH_LOG("[Camera]: Authorization %s\n", granted ? "granted" : "denied");
-                completion(granted);
-            }];
-            break;
-        }
-
-        case AVAuthorizationStatusDenied: {
-            RARCH_ERR("[Camera]: Camera access denied by user\n");
-            completion(NO);
-            break;
-        }
-
-        case AVAuthorizationStatusRestricted: {
-            RARCH_ERR("[Camera]: Camera access restricted (parental controls?)\n");
-            completion(NO);
-            break;
-        }
-
-        default: {
-            RARCH_ERR("[Camera]: Unknown authorization status\n");
-            completion(NO);
-            break;
-        }
+    /* AVCaptureDevice authorization gating exists on macOS 10.14+ (and iOS 7+).
+     * Earlier macOS had no camera TCC prompt, so access is implicitly granted. */
+    if (apple_runtime_available(APPLE_RUNTIME_VER(10, 14, 0), 0, 0)) {
+        apple_rt_send_id(apple_rt_class("RACameraAuthorization"),
+              @selector(authorizeWithCompletion:), completion);
+    } else {
+        /* Pre-10.14 macOS: no camera authorization API; access is implicit. */
+        RARCH_LOG("[Camera] Authorization API unavailable on this OS; assuming granted.\n");
+        completion(YES);
     }
 }
 
@@ -109,7 +176,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
         CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!imageBuffer) {
-            RARCH_ERR("[Camera]: Failed to get image buffer\n");
+            RARCH_ERR("[Camera] Failed to get image buffer.\n");
             return;
         }
 
@@ -120,15 +187,23 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         OSType pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer);
 
 #ifdef DEBUG
-        RARCH_LOG("[Camera]: Processing frame %zux%zu format: %u\n", sourceWidth, sourceHeight, (unsigned int)pixelFormat);
+        RARCH_LOG("[Camera] Processing frame %zux%zu format: %u.\n", sourceWidth, sourceHeight, (unsigned int)pixelFormat);
 #endif
-        // Create intermediate buffer for full-size converted image
-        uint32_t *intermediateBuffer = (uint32_t*)malloc(sourceWidth * sourceHeight * 4);
-        if (!intermediateBuffer) {
-            RARCH_ERR("[Camera]: Failed to allocate intermediate buffer\n");
-            CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
-            return;
+        // Intermediate buffer for full-size converted image.  Cached on
+        // the manager - grown only when the required size exceeds the
+        // current capacity.  See class extension above for rationale.
+        size_t intermediateSize = sourceWidth * sourceHeight * 4;
+        if (intermediateSize > _intermediateCap) {
+            void *tmp = realloc(_intermediateBuf, intermediateSize);
+            if (!tmp) {
+                RARCH_ERR("[Camera] Failed to allocate intermediate buffer.\n");
+                CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+                return;
+            }
+            _intermediateBuf = tmp;
+            _intermediateCap = intermediateSize;
         }
+        uint32_t *intermediateBuffer = (uint32_t*)_intermediateBuf;
 
         vImage_Buffer srcBuffer = {}, intermediateVBuffer = {}, dstBuffer = {};
         vImage_Error err = kvImageNoError;
@@ -199,15 +274,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             }
 
             default:
-                RARCH_ERR("[Camera]: Unsupported pixel format: %u\n", (unsigned int)pixelFormat);
-                free(intermediateBuffer);
+                RARCH_ERR("[Camera] Unsupported pixel format: %u.\n", (unsigned int)pixelFormat);
                 CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
                 return;
         }
 
         if (err != kvImageNoError) {
-            RARCH_ERR("[Camera]: Error converting color format: %ld\n", err);
-            free(intermediateBuffer);
+            RARCH_ERR("[Camera] Error converting color format: %ld.\n", err);
             CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
             return;
         }
@@ -231,20 +304,27 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 // TODO: Add an API to retroarch to allow for mirroring of front camera
                 shouldMirror = true; // Mirror front camera
                 #endif
-                RARCH_LOG("[Camera]: Using 270-degree rotation with mirroring for front camera in portrait mode\n");
+#ifdef DEBUG
+                RARCH_LOG("[Camera] Using 270-degree rotation with mirroring for front camera in portrait mode.\n");
+#endif
             }
         }
 #endif
 
-        // Rotate image
-        vImage_Buffer rotatedBuffer = {};
-        rotatedBuffer.data = malloc(sourceWidth * sourceHeight * 4);
-        if (!rotatedBuffer.data) {
-            RARCH_ERR("[Camera]: Failed to allocate rotation buffer\n");
-            free(intermediateBuffer);
-            CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
-            return;
+        // Rotate image (cached scratch buffer)
+        size_t rotatedSize = sourceWidth * sourceHeight * 4;
+        if (rotatedSize > _rotatedCap) {
+            void *tmp = realloc(_rotatedBuf, rotatedSize);
+            if (!tmp) {
+                RARCH_ERR("[Camera] Failed to allocate rotation buffer.\n");
+                CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+                return;
+            }
+            _rotatedBuf = tmp;
+            _rotatedCap = rotatedSize;
         }
+        vImage_Buffer rotatedBuffer = {};
+        rotatedBuffer.data = _rotatedBuf;
 
         // Set dimensions based on rotation angle
         if (rotationDegrees == 90 || rotationDegrees == 270) {
@@ -265,25 +345,31 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                                      kvImageNoFlags);
 
         if (err != kvImageNoError) {
-            RARCH_ERR("[Camera]: Error rotating image: %ld\n", err);
-            free(rotatedBuffer.data);
-            free(intermediateBuffer);
+            RARCH_ERR("[Camera] Error rotating image: %ld.\n", err);
             CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
             return;
         }
 
-        // Mirror the image if needed
-        if (shouldMirror) {
-            vImage_Buffer mirroredBuffer = {};
-            mirroredBuffer.data = malloc(rotatedBuffer.height * rotatedBuffer.rowBytes);
-            if (!mirroredBuffer.data) {
-                RARCH_ERR("[Camera]: Failed to allocate mirror buffer\n");
-                free(rotatedBuffer.data);
-                free(intermediateBuffer);
-                CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
-                return;
-            }
+        // Mirror the image if needed.  On success, the scale step below
+        // reads from the mirrored buffer; on failure it falls back to
+        // rotated.  Unlike the original code we don't swap pointers —
+        // each scratch has a stable identity across frames.
+        vImage_Buffer *scaleSource = &rotatedBuffer;
+        vImage_Buffer mirroredBuffer = {};
 
+        if (shouldMirror) {
+            size_t mirroredSize = rotatedBuffer.height * rotatedBuffer.rowBytes;
+            if (mirroredSize > _mirroredCap) {
+                void *tmp = realloc(_mirroredBuf, mirroredSize);
+                if (!tmp) {
+                    RARCH_ERR("[Camera] Failed to allocate mirror buffer.\n");
+                    CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+                    return;
+                }
+                _mirroredBuf = tmp;
+                _mirroredCap = mirroredSize;
+            }
+            mirroredBuffer.data = _mirroredBuf;
             mirroredBuffer.width = rotatedBuffer.width;
             mirroredBuffer.height = rotatedBuffer.height;
             mirroredBuffer.rowBytes = rotatedBuffer.rowBytes;
@@ -291,17 +377,15 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             err = vImageHorizontalReflect_ARGB8888(&rotatedBuffer, &mirroredBuffer, kvImageNoFlags);
 
             if (err == kvImageNoError) {
-                // Free rotated buffer and use mirrored buffer for scaling
-                free(rotatedBuffer.data);
-                rotatedBuffer = mirroredBuffer;
+                scaleSource = &mirroredBuffer;
             } else {
-                RARCH_ERR("[Camera]: Error mirroring image: %ld\n", err);
-                free(mirroredBuffer.data);
+                RARCH_ERR("[Camera] Error mirroring image: %ld.\n", err);
+                /* scaleSource stays pointed at rotatedBuffer */
             }
         }
 
         // Calculate aspect fill scaling
-        float sourceAspect = (float)rotatedBuffer.width / rotatedBuffer.height;
+        float sourceAspect = (float)scaleSource->width / scaleSource->height;
         float targetAspect = (float)self.width / self.height;
 
         vImage_Buffer scaledBuffer = {};
@@ -317,30 +401,32 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             scaledHeight = (size_t)(self.width / sourceAspect);
         }
 
-        RARCH_LOG("[Camera]: Aspect fill scaling from %zux%zu to %zux%zu\n",
-                  rotatedBuffer.width, rotatedBuffer.height, scaledWidth, scaledHeight);
+#ifdef DEBUG
+        RARCH_LOG("[Camera] Aspect fill scaling from %zux%zu to %zux%zu.\n",
+                  scaleSource->width, scaleSource->height, scaledWidth, scaledHeight);
+#endif
 
-        scaledBuffer.data = malloc(scaledWidth * scaledHeight * 4);
-        if (!scaledBuffer.data) {
-            RARCH_ERR("[Camera]: Failed to allocate scaled buffer\n");
-            free(rotatedBuffer.data);
-            free(intermediateBuffer);
-            CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
-            return;
+        size_t scaledSize = scaledWidth * scaledHeight * 4;
+        if (scaledSize > _scaledCap) {
+            void *tmp = realloc(_scaledBuf, scaledSize);
+            if (!tmp) {
+                RARCH_ERR("[Camera] Failed to allocate scaled buffer.\n");
+                CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+                return;
+            }
+            _scaledBuf = tmp;
+            _scaledCap = scaledSize;
         }
-
+        scaledBuffer.data = _scaledBuf;
         scaledBuffer.width = scaledWidth;
         scaledBuffer.height = scaledHeight;
         scaledBuffer.rowBytes = scaledWidth * 4;
 
         // Scale maintaining aspect ratio
-        err = vImageScale_ARGB8888(&rotatedBuffer, &scaledBuffer, NULL, kvImageHighQualityResampling);
+        err = vImageScale_ARGB8888(scaleSource, &scaledBuffer, NULL, kvImageHighQualityResampling);
 
         if (err != kvImageNoError) {
-            RARCH_ERR("[Camera]: Error scaling image: %ld\n", err);
-            free(scaledBuffer.data);
-            free(rotatedBuffer.data);
-            free(intermediateBuffer);
+            RARCH_ERR("[Camera] Error scaling image: %ld.\n", err);
             CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
             return;
         }
@@ -359,52 +445,70 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                    self.width * 4);
         }
 
-        // Clean up
-        free(scaledBuffer.data);
-        free(rotatedBuffer.data);
-        free(intermediateBuffer);
+        /* Scratch buffers retained on the manager; freed on teardown. */
         CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
     } // End of autorelease pool
 }
 
+- (void)teardownScratchBuffers {
+    if (_intermediateBuf) { free(_intermediateBuf); _intermediateBuf = NULL; }
+    _intermediateCap = 0;
+    if (_rotatedBuf)      { free(_rotatedBuf);      _rotatedBuf      = NULL; }
+    _rotatedCap = 0;
+    if (_mirroredBuf)     { free(_mirroredBuf);     _mirroredBuf     = NULL; }
+    _mirroredCap = 0;
+    if (_scaledBuf)       { free(_scaledBuf);       _scaledBuf       = NULL; }
+    _scaledCap = 0;
+}
+
 - (AVCaptureDevice *)selectCameraDevice {
-    RARCH_LOG("[Camera]: Selecting camera device\n");
+    RARCH_LOG("[Camera] Selecting camera device...\n");
 
     NSArray<AVCaptureDevice *> *devices;
 
 #if TARGET_OS_OSX
     // On macOS, use default discovery method
     // Could probably due the same as iOS but need to test.
-    devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+    // Deprecated in 10.15 and still present: sent by selector.
+    devices = apple_rt_get_id_arg([AVCaptureDevice class],
+          @selector(devicesWithMediaType:), AVMediaTypeVideo);
 #else
-    // On iOS/tvOS use modern discovery session
-    NSArray<AVCaptureDeviceType> *deviceTypes;
-    if (@available(iOS 17.0, *)) {
-        deviceTypes = @[
-            AVCaptureDeviceTypeExternal,
-            AVCaptureDeviceTypeBuiltInWideAngleCamera,
-            AVCaptureDeviceTypeBuiltInTelephotoCamera,
-            AVCaptureDeviceTypeBuiltInUltraWideCamera,
-            //        AVCaptureDeviceTypeBuiltInDualCamera,
-            //        AVCaptureDeviceTypeBuiltInDualWideCamera,
-            //        AVCaptureDeviceTypeBuiltInTripleCamera,
-            //        AVCaptureDeviceTypeBuiltInTrueDepthCamera,
-            //        AVCaptureDeviceTypeBuiltInLiDARDepthCamera,
-            //        AVCaptureDeviceTypeContinuityCamera,
-        ];
-    } else {
-        deviceTypes = @[
-            AVCaptureDeviceTypeBuiltInWideAngleCamera,
-            AVCaptureDeviceTypeBuiltInTelephotoCamera,
-            AVCaptureDeviceTypeBuiltInUltraWideCamera,
-            //        AVCaptureDeviceTypeBuiltInDualCamera,
-            //        AVCaptureDeviceTypeBuiltInDualWideCamera,
-            //        AVCaptureDeviceTypeBuiltInTripleCamera,
-            //        AVCaptureDeviceTypeBuiltInTrueDepthCamera,
-            //        AVCaptureDeviceTypeBuiltInLiDARDepthCamera,
-            //        AVCaptureDeviceTypeContinuityCamera,
-        ];
+    // On iOS/tvOS use modern discovery session.
+    // Build the type list at runtime: some constants are gated by both SDK
+    // (compile time) and OS version (deployment target), so they cannot all
+    // live in a single static array literal.
+    NSMutableArray<AVCaptureDeviceType> *deviceTypes = [NSMutableArray array];
+
+    // External cameras: iOS 17 / Mac Catalyst 17 only, unavailable on tvOS.
+    // The constant is looked up at runtime, so the same binary builds on
+    // any SDK and runs on any OS. Listed first to prefer an attached
+    // external camera when one is present.
+    if (apple_runtime_available(0, APPLE_RUNTIME_VER(17, 0, 0), 0))
+    {
+        void **external = apple_rt_constant_addr("AVCaptureDeviceTypeExternal");
+        if (external)
+            [deviceTypes addObject:apple_rt_obj_at(external)];
     }
+
+    // Built-in wide-angle and telephoto are the iOS 10 baseline.
+    [deviceTypes addObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
+    [deviceTypes addObject:AVCaptureDeviceTypeBuiltInTelephotoCamera];
+
+    // Ultra-wide was added in iOS 13; the deployment target may be lower, so
+    // it needs a runtime availability guard.
+    if (apple_runtime_available(0, APPLE_RUNTIME_VER(13, 0, 0), 0))
+    {
+        void **ultra = apple_rt_constant_addr("AVCaptureDeviceTypeBuiltInUltraWideCamera");
+        if (ultra)
+            [deviceTypes addObject:apple_rt_obj_at(ultra)];
+    }
+
+    //  AVCaptureDeviceTypeBuiltInDualCamera,
+    //  AVCaptureDeviceTypeBuiltInDualWideCamera,
+    //  AVCaptureDeviceTypeBuiltInTripleCamera,
+    //  AVCaptureDeviceTypeBuiltInTrueDepthCamera,
+    //  AVCaptureDeviceTypeBuiltInLiDARDepthCamera,
+    //  AVCaptureDeviceTypeContinuityCamera,
     AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession
                                                          discoverySessionWithDeviceTypes:deviceTypes
                                                          mediaType:AVMediaTypeVideo
@@ -414,13 +518,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 #endif
 
     if (devices.count == 0) {
-        RARCH_ERR("[Camera]: No camera devices found\n");
+        RARCH_ERR("[Camera] No camera devices found.\n");
         return nil;
     }
 
     // Log available devices
     for (AVCaptureDevice *device in devices) {
-        RARCH_LOG("[Camera]: Found device: %s - Position: %d\n",
+        RARCH_LOG("[Camera] Found device: %s - Position: %d.\n",
                   [device.localizedName UTF8String],
                   (int)device.position);
     }
@@ -428,7 +532,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 #if TARGET_OS_OSX
     // macOS: Just use the first available camera if only one exists
     if (devices.count == 1) {
-        RARCH_LOG("[Camera]: Using only available camera: %s\n",
+        RARCH_LOG("[Camera] Using only available camera: %s.\n",
                   [devices.firstObject.localizedName UTF8String]);
         return devices.firstObject;
     }
@@ -438,7 +542,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         BOOL isFrontFacing = [device.localizedName containsString:@"FaceTime"] ||
                             [device.localizedName containsString:@"Front"];
         if (CAMERA_PREFER_FRONTFACING == isFrontFacing) {
-            RARCH_LOG("[Camera]: Selected macOS camera: %s\n",
+            RARCH_LOG("[Camera] Selected macOS camera: %s.\n",
                       [device.localizedName UTF8String]);
             return device;
         }
@@ -451,7 +555,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     // Try to find preferred camera
     for (AVCaptureDevice *device in devices) {
         if (device.position == preferredPosition) {
-            RARCH_LOG("[Camera]: Selected iOS camera position: %d\n",
+            RARCH_LOG("[Camera] Selected iOS camera position: %d.\n",
                       (int)preferredPosition);
             return device;
         }
@@ -459,19 +563,26 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 #endif
 
     // Fallback to first available camera
-    RARCH_LOG("[Camera]: Using fallback camera: %s\n",
+    RARCH_LOG("[Camera] Using fallback camera: %s.\n",
               [devices.firstObject.localizedName UTF8String]);
     return devices.firstObject;
 }
 
 - (bool)setupCameraSession {
-    // Initialize capture session
-    self.session = [[AVCaptureSession alloc] init];
+    /* The property retains what it is handed, so the reference the
+     * allocation carries is released once it is stored - otherwise the
+     * session set up by a previous init is orphaned rather than torn
+     * down when this one replaces it. */
+    {
+        AVCaptureSession *sess = [[AVCaptureSession alloc] init];
+        self.session           = sess;
+        RARCH_RELEASE(sess);
+    }
 
     // Get camera device
     AVCaptureDevice *device = [self selectCameraDevice];
     if (!device) {
-        RARCH_ERR("[Camera]: No camera device found\n");
+        RARCH_ERR("[Camera] No camera device found.\n");
         return false;
     }
 
@@ -479,18 +590,22 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     NSError *error = nil;
     self.input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
     if (error) {
-        RARCH_ERR("[Camera]: Failed to create device input: %s\n",
+        RARCH_ERR("[Camera] Failed to create device input: %s.\n",
                   [error.localizedDescription UTF8String]);
         return false;
     }
 
     if ([self.session canAddInput:self.input]) {
         [self.session addInput:self.input];
-        RARCH_LOG("[Camera]: Added camera input to session\n");
+        RARCH_LOG("[Camera] Added camera input to session.\n");
     }
 
-    // Create and configure video output
-    self.output = [[AVCaptureVideoDataOutput alloc] init];
+    /* Create and configure video output; owned as the session above. */
+    {
+        AVCaptureVideoDataOutput *out = [[AVCaptureVideoDataOutput alloc] init];
+        self.output                   = out;
+        RARCH_RELEASE(out);
+    }
     self.output.videoSettings = @{
         (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
     };
@@ -498,7 +613,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
     if ([self.session canAddOutput:self.output]) {
         [self.session addOutput:self.output];
-        RARCH_LOG("[Camera]: Added video output to session\n");
+        RARCH_LOG("[Camera] Added video output to session.\n");
     }
 
     return true;
@@ -535,96 +650,90 @@ static void generateColorBars(uint32_t *buffer, size_t width, size_t height) {
 }
 
 static void *avfoundation_init(const char *device, uint64_t caps,
-                             unsigned width, unsigned height)
+                             unsigned dims)
 {
-    RARCH_LOG("[Camera]: Initializing AVFoundation camera %ux%u\n", width, height);
-
+    unsigned width      = VIDEO_SCALE_W(dims);
+    unsigned height     = VIDEO_SCALE_H(dims);
     avfoundation_t *avf = (avfoundation_t*)calloc(1, sizeof(avfoundation_t));
-    if (!avf) {
-        RARCH_ERR("[Camera]: Failed to allocate avfoundation_t\n");
+    RARCH_LOG("[Camera] Initializing AVFoundation camera %ux%u.\n", width, height);
+    if (!avf)
+    {
+        RARCH_ERR("[Camera] Failed to allocate avfoundation_t.\n");
         return NULL;
     }
 
-    avf->manager = [AVCameraManager sharedInstance];
-    avf->width = width;
-    avf->height = height;
-    avf->manager.width = width;
+    avf->manager        = [AVCameraManager sharedInstance];
+    avf->width          = width;
+    avf->height         = height;
+    avf->manager.width  = width;
     avf->manager.height = height;
 
-    // Check if we're on the main thread
-    if ([NSThread isMainThread]) {
-        RARCH_LOG("[Camera]: Initializing on main thread\n");
-        // Direct initialization on main thread
-        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
-            AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
-            if (status != AVAuthorizationStatusAuthorized) {
-                RARCH_ERR("[Camera]: Camera access not authorized (status: %d)\n", (int)status);
-                free(avf);
-                return;
-            }
-        }];
+    /* Synchronously request camera authorization */
+    BOOL granted = NO;
+    RARCH_LOG("[Camera] Requesting camera authorization synchronously.\n");
+    if (apple_runtime_available(APPLE_RUNTIME_VER(10, 14, 0), 0, 0)) {
+        granted = apple_rt_get_bool(apple_rt_class("RACameraAuthorization"),
+              @selector(requestBlocking));
     } else {
-        RARCH_LOG("[Camera]: Initializing on background thread\n");
-        // Use dispatch_sync to run authorization check on main thread
-        __block AVAuthorizationStatus status;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
-        });
-
-        if (status != AVAuthorizationStatusAuthorized) {
-            RARCH_ERR("[Camera]: Camera access not authorized (status: %d)\n", (int)status);
-            free(avf);
-            return NULL;
-        }
+        /* Pre-10.14 macOS: no authorization gate; access is implicit. */
+        granted = YES;
     }
-
-    // Allocate frame buffer
-    avf->manager.frameBuffer = (uint32_t*)calloc(width * height, sizeof(uint32_t));
-    if (!avf->manager.frameBuffer) {
-        RARCH_ERR("[Camera]: Failed to allocate frame buffer\n");
+    if (!granted)
+    {
+        RARCH_ERR("[Camera] Camera access not authorized.\n");
         free(avf);
         return NULL;
     }
 
-    // Initialize capture session on main thread
+    /* Allocate frame buffer */
+    avf->manager.frameBuffer = (uint32_t*)calloc(width * height, sizeof(uint32_t));
+    if (!avf->manager.frameBuffer)
+    {
+        RARCH_ERR("[Camera] Failed to allocate frame buffer.\n");
+        free(avf);
+        return NULL;
+    }
+
+    /* Initialize capture session on main thread */
     __block bool setupSuccess = false;
 
-    if ([NSThread isMainThread]) {
+    if ([NSThread isMainThread])
+    {
         @autoreleasepool {
             setupSuccess = [avf->manager setupCameraSession];
             if (setupSuccess) {
-                [avf->manager.session startRunning];
-                RARCH_LOG("[Camera]: Started camera session\n");
+                RARCH_LOG("[Camera] Started camera session.\n");
             }
         }
-    } else {
+    }
+    else
+    {
         dispatch_sync(dispatch_get_main_queue(), ^{
             @autoreleasepool {
                 setupSuccess = [avf->manager setupCameraSession];
                 if (setupSuccess) {
-                    [avf->manager.session startRunning];
-                    RARCH_LOG("[Camera]: Started camera session\n");
+                    RARCH_LOG("[Camera] Started camera session.\n");
                 }
             }
         });
     }
 
-    if (!setupSuccess) {
-        RARCH_ERR("[Camera]: Failed to setup camera\n");
+    if (!setupSuccess)
+    {
+        RARCH_ERR("[Camera] Failed to setup camera.\n");
+        /* Null out frameBuffer on the singleton manager after freeing,
+         * so a subsequent init doesn't observe a stale pointer.  The
+         * main-thread-only access pattern means nothing actually sees
+         * the dangling value between these two statements and the next
+         * init's calloc on the same field, but leaving a dangling
+         * pointer in a singleton ivar is defensive-programming-wrong. */
         free(avf->manager.frameBuffer);
+        avf->manager.frameBuffer = NULL;
         free(avf);
         return NULL;
     }
 
-    // Add a check to verify the session is actually running
-    if (!avf->manager.session.isRunning) {
-        RARCH_ERR("[Camera]: Failed to start camera session\n");
-        free(avf->manager.frameBuffer);
-        free(avf);
-        return NULL;
-    }
-
-    RARCH_LOG("[Camera]: AVFoundation camera initialized and started successfully\n");
+    RARCH_LOG("[Camera] AVFoundation camera initialized and started successfully.\n");
     return avf;
 }
 
@@ -634,41 +743,46 @@ static void avfoundation_free(void *data)
     if (!avf)
         return;
 
-    RARCH_LOG("[Camera]: Freeing AVFoundation camera\n");
+    RARCH_LOG("[Camera] Freeing AVFoundation camera.\n");
 
-    if (avf->manager.session) {
+    if (avf->manager.session)
         [avf->manager.session stopRunning];
-    }
 
-    if (avf->manager.frameBuffer) {
+    if (avf->manager.frameBuffer)
+    {
         free(avf->manager.frameBuffer);
         avf->manager.frameBuffer = NULL;
     }
 
+    /* The manager is a singleton; its scratch buffers from the per-
+     * frame conversion/rotation/mirror/scale pipeline persist across
+     * driver instances.  Free them here so a subsequent init starts
+     * clean and stale capacity from a prior session does not linger. */
+    [avf->manager teardownScratchBuffers];
+
     free(avf);
-    RARCH_LOG("[Camera]: AVFoundation camera freed\n");
+    RARCH_LOG("[Camera] AVFoundation camera freed.\n");
 }
 
 static bool avfoundation_start(void *data)
 {
+    bool isRunning;
     avfoundation_t *avf = (avfoundation_t*)data;
-    if (!avf || !avf->manager.session) {
-        RARCH_ERR("[Camera]: Cannot start - invalid data\n");
+    if (!avf || !avf->manager.session)
+    {
+        RARCH_ERR("[Camera] Cannot start - invalid data.\n");
         return false;
     }
 
-    RARCH_LOG("[Camera]: Starting AVFoundation camera\n");
+    RARCH_LOG("[Camera] Starting AVFoundation camera.\n");
 
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    dispatch_sync(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [avf->manager.session startRunning];
-        RARCH_LOG("[Camera]: Camera session started on background thread\n");
+        RARCH_LOG("[Camera] Camera session started on background thread.\n");
     });
 
-    // Give the session a moment to start
-    usleep(100000); // 100ms
-
-    bool isRunning = avf->manager.session.isRunning;
-    RARCH_LOG("[Camera]: Camera session running: %s\n", isRunning ? "YES" : "NO");
+    isRunning = avf->manager.session.isRunning;
+    RARCH_LOG("[Camera] Camera session running: %s.\n", isRunning ? "YES" : "NO");
     return isRunning;
 }
 
@@ -678,38 +792,51 @@ static void avfoundation_stop(void *data)
     if (!avf || !avf->manager.session)
         return;
 
-    RARCH_LOG("[Camera]: Stopping AVFoundation camera\n");
+    RARCH_LOG("[Camera] Stopping AVFoundation camera...\n");
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [avf->manager.session stopRunning];
-        RARCH_LOG("[Camera]: Camera session stopped on background thread\n");
+        RARCH_LOG("[Camera] Camera session stopped on background thread.\n");
     });
 }
 
 static bool avfoundation_poll(void *data,
       retro_camera_frame_raw_framebuffer_t frame_raw_cb,
-      retro_camera_frame_opengl_texture_t frame_gl_cb)
+      retro_camera_frame_opengl_texture_t frame_gl_cb,
+      retro_camera_frame_planar_t frame_planar_cb)
 {
     avfoundation_t *avf = (avfoundation_t*)data;
-    if (!avf || !frame_raw_cb) {
-        RARCH_ERR("[Camera]: Cannot poll - invalid data or callback\n");
+    (void)frame_planar_cb;
+    if (!avf || !frame_raw_cb)
+    {
+        RARCH_ERR("[Camera] Cannot poll - invalid data or callback.\n");
         return false;
     }
 
-    if (!avf->manager.session.isRunning) {
-        RARCH_LOG("[Camera]: Camera not running, generating color bars\n");
-        uint32_t *tempBuffer = (uint32_t*)calloc(avf->width * avf->height, sizeof(uint32_t));
-        if (tempBuffer) {
-            generateColorBars(tempBuffer, avf->width, avf->height);
-            frame_raw_cb(tempBuffer, avf->width, avf->height, avf->width * 4);
-            free(tempBuffer);
-            return true;
-        }
-        return false;
+    if (!avf->manager.session.isRunning)
+    {
+        /* Session not running yet (or already stopped).  Deliver a
+         * color-bars test pattern so the core gets a well-formed
+         * frame rather than nothing.  Paint into the manager's own
+         * frameBuffer rather than allocating a throwaway: the
+         * generation cost is trivial (two nested loops of direct
+         * assignments, no conversion) and it avoids a calloc+free
+         * pair on every poll while the camera warms up.  Once the
+         * session starts and captureOutput:didOutputSampleBuffer:
+         * begins overwriting frameBuffer with real frames, this
+         * branch stops firing. */
+#ifdef DEBUG
+        RARCH_LOG("[Camera] Camera not running, generating color bars...\n");
+#endif
+        if (!avf->manager.frameBuffer)
+            return false;
+        generateColorBars(avf->manager.frameBuffer, avf->width, avf->height);
+        frame_raw_cb(avf->manager.frameBuffer, avf->width, avf->height, avf->width * 4);
+        return true;
     }
 
 #ifdef DEBUG
-    RARCH_LOG("[Camera]: Delivering camera frame\n");
+    RARCH_LOG("[Camera] Delivering camera frame.\n");
 #endif
     frame_raw_cb(avf->manager.frameBuffer, avf->width, avf->height, avf->width * 4);
     return true;

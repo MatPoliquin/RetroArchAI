@@ -2,6 +2,7 @@ name: CI Windows (MSYS2)
 
 on:
   push:
+    branches: [master]
   pull_request:
   repository_dispatch:
     types: [run_build]
@@ -9,65 +10,103 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   msys2-build-test:
     strategy:
       fail-fast: false
       matrix:
-        sys: [MINGW64, UCRT64,CLANG64]
-    runs-on: windows-latest
+        include:
+          # Existing x64 builds
+          - sys: MINGW64
+            runner: windows-latest
+          - sys: UCRT64
+            runner: windows-latest
+          - sys: CLANG64
+            runner: windows-latest
+
+          # New ARM64 build (native Windows on ARM)
+          # MSYS2's runtime runs emulated on these runners, so configure
+          # runs its checks one at a time here instead of in parallel
+          # background workers.
+          - sys: CLANGARM64
+            runner: windows-11-arm
+            qb_jobs: 1
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.sys }}
           update: true
-          install: base-devel git
-          pacboy: >-
-            gettext:p
-            gobject-introspection:p
-            graphite2:p
-            p11-kit:p
-            qt6:p
-            qt6-3d:p
-            qt6-charts:p
-            qt6-datavis3d:p
-            qt6-imageformats:p
-            qt6-location:p
-            qt6-lottie:p
-            qt6-networkauth:p
-            qt6-quick3dphysics:p
-            qt6-quicktimeline:p
-            qt6-remoteobjects:p
-            qt6-scxml:p
-            qt6-sensors:p
-            qt6-serialbus:p
-            qt6-speech:p
-            qt6-tools:p
-            qt6-translations:p
-            qt6-virtualkeyboard:p
-            qt6-webchannel:p
-            qt6-websockets:p
-            x264:p
-            cc:p
+
+      - name: Install packages
+        shell: msys2 {0}
+        run: |
+          # A mirror that stalls or rate-limits (HTTP 429) fails pacman's
+          # whole transaction; what it fetched stays in the cache, so a
+          # retry fetches only the rest, one file at a time after a
+          # growing wait so a shared runner's rate limit can clear.
+          # A package that fails its checksum is deleted, but pacman
+          # fetches it again from the same first mirror, so each retry
+          # also moves every mirror list's first server to the end.
+          # Runtime updates belong to setup-msys2 above, which can restart
+          # its shell. These retries install dependencies only.
+          p=$MINGW_PACKAGE_PREFIX
+          pkgs="base-devel git $p-gettext $p-gobject-introspection
+            $p-graphite2 $p-p11-kit $p-qt6-base $p-x264 $p-cc"
+          for i in 1 2 3 4 5; do
+            pacman -S --noconfirm --needed $pkgs && exit 0
+            [ $i = 5 ] && break
+            echo "package install failed (attempt $i); retrying in $((30 * i))s, next mirror, serial downloads"
+            sed -i -e '/^#*ParallelDownloads/d' -e '/^\[options\]/a ParallelDownloads = 1' /etc/pacman.conf
+            for m in /etc/pacman.d/mirrorlist.*; do
+              awk '/^Server/ && !s { s = $0; next } { print } END { if (s) print s }' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+            done
+            sleep $((30 * i))
+          done
+          exit 1
 
       - name: Configure and build RetroArch
         shell: msys2 {0}
         run: |
-          echo "Building RetroArch in ${{ matrix.sys }} environment"
-          ./configure
-          make -j$(nproc) info all
+          echo "Building RetroArch in ${{ matrix.sys }} on ${{ matrix.runner }}"
+          QB_JOBS=${{ matrix.qb_jobs }} ./configure
+          make -j"$(nproc)" info all
+
+      - name: Native modal message pump regression
+        shell: msys2 {0}
+        run: |
+          set -eu
+          flags=''
+          if cc --version | grep -qi clang; then flags=-Wno-c99-extensions; fi
+          cc $flags -std=c89 -pedantic -Wall -Wextra -Werror -Wno-unused-function -Wframe-larger-than=4096 -Ilibretro-common/include samples/gfx/win32_window_proc/modal_frame_test.c -o modal_frame_test.exe -lgdi32 -luser32
+          rc=0
+          ./modal_frame_test.exe || rc=$?
+          if [ "$rc" = 77 ] && [ "${{ matrix.sys }}" = CLANGARM64 ]; then
+            echo "::notice::Modal continuity unavailable; checking safe fallback"
+            ./modal_frame_test.exe --fallback
+          else
+            test "$rc" = 0
+          fi
 
       - name: Collect DLLs and binaries
         shell: msys2 {0}
         run: |
           echo "Collecting DLLs and binaries"
+          rm -rf dist
           mkdir -p dist
           cp retroarch.exe dist/
-          ldd retroarch.exe|grep $MINGW_PREFIX |awk '{print $3}'|xargs -I {} cp {} dist/
+          ldd retroarch.exe | grep "$MINGW_PREFIX" | awk '{print $3}' | xargs -I {} cp {} dist/ || true
 
       - name: Archive build artifacts
         if: success()

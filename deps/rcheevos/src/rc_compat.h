@@ -1,6 +1,13 @@
 #ifndef RC_COMPAT_H
 #define RC_COMPAT_H
 
+#ifdef _WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+ #endif
+ #include <windows.h>
+#endif
+
 #include "rc_export.h"
 
 #include <stdio.h>
@@ -58,7 +65,7 @@ RC_BEGIN_C_DECLS
 
 #endif /* __STDC_VERSION__ < 199901L */
 
-#ifndef __STDC_WANT_SECURE_LIB__
+#ifndef __STDC_SECURE_LIB__
  /* _CRT_SECURE_NO_WARNINGS redefinitions */
  #define strcpy_s(dest, sz, src) strcpy(dest, src)
  #define sscanf_s sscanf
@@ -77,18 +84,56 @@ RC_BEGIN_C_DECLS
  #define rc_mutex_lock(mutex)
  #define rc_mutex_unlock(mutex)
 #else
- #ifdef _WIN32
-  typedef struct rc_mutex_t {
-    void* handle; /* HANDLE is defined as "void*" */
-  } rc_mutex_t;
- #elif defined(GEKKO)
+ #if defined(_WIN32)
+   typedef struct rc_mutex_t {
+   #if defined(WINVER) && WINVER >= 0x0600
+     /* Windows Vista and later can use a slim reader/writer (SRW) lock */
+     SRWLOCK srw_lock;
+     /* Current thread owner needs to be tracked (for recursive mutex usage) */
+     DWORD owner;
+     DWORD count;
+   #else
+     /* Pre-Vista must use a critical section */
+     CRITICAL_SECTION critical_section;
+   #endif
+   } rc_mutex_t;
+ #elif defined(GEKKO) && !defined(GEKKO_NATIVE)
   #include <ogcsys.h>
   typedef struct rc_mutex_t {
     mutex_t handle;
   } rc_mutex_t;
+ #elif defined(GEKKO_NATIVE)
+  /* RetroArch-local: os/gekko's recursive mutex, which every devkitPPC
+   * can build; newlib's pthreads only came with r49. */
+  #include <gekko/thread.h>
+  typedef gk_rmutex_t rc_mutex_t;
+ #elif defined(WIIU)
+  /* RetroArch-local: rthreads drives Cafe OS threads natively here, so
+   * rcheevos cannot use the pthread backend -- devkitPPC ships
+   * <pthread.h> but leaves pthread_mutex_t undefined without
+   * _POSIX_THREADS. OSMutex is the recursive primitive (OSFastMutex is
+   * not), which is what rcheevos' recursive usage needs. */
+  #if defined(__has_include) && __has_include(<wiiu/os/mutex.h>)
+   #include <wiiu/os/mutex.h>
+  #else
+   #include <coreinit/mutex.h>
+  #endif
+  typedef OSMutex rc_mutex_t;
  #elif defined(_3DS)
   #include <3ds/synchronization.h>
   typedef RecursiveLock rc_mutex_t;
+ #elif defined(VITA)
+  #include <psp2/kernel/threadmgr.h>
+  typedef struct rc_mutex_t {
+    int handle;
+  } rc_mutex_t;
+ #elif defined(__SWITCH__)
+  #include <switch.h>
+  typedef RMutex rc_mutex_t;
+ #elif defined(__PSL1GHT__)
+  /* RetroArch-local: PSL1GHT ships no pthreads. */
+  #include <lv2/mutex.h>
+  typedef sys_lwmutex_t rc_mutex_t;
  #else
   #include <pthread.h>
   typedef pthread_mutex_t rc_mutex_t;

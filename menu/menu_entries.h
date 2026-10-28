@@ -24,6 +24,7 @@
 #include <retro_miscellaneous.h>
 
 #include <lists/file_list.h>
+#include <lists/string_list.h>
 
 #include "menu_setting.h"
 #include "menu_input.h"
@@ -31,7 +32,7 @@
 
 RETRO_BEGIN_DECLS
 
-#define MENU_LABEL_MAX_LENGTH 512
+#define MENU_LABEL_MAX_LENGTH 1024
 
 #define MENU_SEARCH_FILTER_MAX_TERMS  8
 #define MENU_SEARCH_FILTER_MAX_LENGTH 64
@@ -87,7 +88,9 @@ enum menu_entry_flags
 typedef struct menu_ctx_list
 {
    const char  *path;
-   char        *fullpath;
+   /* Borrowed from the menu stack, not owned; see
+    * menu_entries_append(). */
+   const char  *fullpath;
    const char  *label;
    file_list_t *list;
    void        *entry;
@@ -138,6 +141,13 @@ typedef struct menu_file_list_cbs
          size_t idx);
    int (*action_start)(const char *path, const char *label, unsigned type,
          size_t idx, size_t entry_idx);
+   /* @payload holds one or more local paths, one drop. 0 accepts,
+    * -1 refuses. action_drag only reports a hover; it must not act
+    * on @payload. */
+   int (*action_drag)(const char *path, const char *label, unsigned type,
+         size_t idx, size_t entry_idx, const struct string_list *payload);
+   int (*action_drop)(const char *path, const char *label, unsigned type,
+         size_t idx, size_t entry_idx, const struct string_list *payload);
    int (*action_info)(unsigned type,  const char *label);
    int (*action_left)(unsigned type, const char *label, bool wraparound);
    int (*action_right)(unsigned type, const char *label, bool wraparound);
@@ -154,9 +164,24 @@ typedef struct menu_file_list_cbs
          const char *label, char *s, size_t len,
          const char *path,
          char *s2, size_t len2);
-   menu_search_terms_t search;
+   /* Lazily allocated; NULL until a search term is actually pushed.
+    * Held by value this was 520 of the struct's 656 bytes, carried by
+    * every entry of every list, while only one cbs in the whole menu
+    * can ever be asked for it -- menu_entries_search_get_terms_internal()
+    * reads it from the top entry of the menu stack and nowhere else.
+    * Freed by menu_entries_cbs_free(), which file_list_t dispatches to
+    * through its actiondata_free hook. */
+   menu_search_terms_t *search;
    enum msg_hash_enums enum_idx;
+   /* When the generic sublabel handler is bound from the data map,
+    * this carries the description enum to look up. */
+   enum msg_hash_enums sublabel_enum;
+   /* When the generic title handler is bound from the data map,
+    * these carry the title enum and formatting variant. */
+   enum msg_hash_enums title_enum;
+   uint8_t title_variant;
    bool checked;
+   uint8_t file_extension_state; /* enum menu_file_browser_extension_state */
 } menu_file_list_cbs_t;
 
 size_t menu_entries_get_title(char *s, size_t len);
@@ -187,6 +212,9 @@ bool menu_entries_search_pop(void);
 
 menu_search_terms_t *menu_entries_search_get_terms(void);
 
+/* file_list_t::actiondata_free hook for menu-owned lists. */
+void menu_entries_cbs_free(void *actiondata);
+
 /* Convenience function: Appends list of current
  * search terms to specified string */
 void menu_entries_search_append_terms_string(char *s, size_t len);
@@ -209,11 +237,26 @@ bool menu_entries_list_search(const char *needle, size_t *idx);
  * Its only interaction back to the UI is to arrange for
  * notify_list_loaded on the UI companion.
  */
+/* A remembered @selection for @list: @selection while it is inside the
+ * list, or while the list is a placeholder ("Loading", Explore
+ * initialising) that a finished background read replaces, since it
+ * belongs to the full list; otherwise the list's last entry. */
+size_t menu_entries_restorable_selection(const file_list_t *list,
+      size_t selection);
+
 void menu_entry_get(menu_entry_t *entry, size_t stack_idx,
       size_t i, void *userdata, bool use_representation);
 
+size_t menu_file_browser_stem_length(const char *path);
+
 int menu_entry_action(
       menu_entry_t *entry, size_t i, enum menu_action action);
+
+/* Main thread only, outside platform event dispatch:
+ * a drop may reinitialise the drivers. */
+int menu_entry_drag(size_t i, const struct string_list *payload);
+
+int menu_entry_drop(size_t i, const struct string_list *payload);
 
 RETRO_END_DECLS
 

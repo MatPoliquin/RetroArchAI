@@ -22,6 +22,7 @@
 #include <string/stdstring.h>
 
 #include "../msg_hash.h"
+#include "../msg_hash_lbl_str.h"
 #include "../verbosity.h"
 
 #ifdef RARCH_INTERNAL
@@ -41,7 +42,7 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_ENABLE_HOTKEY), len);
              break;
           default:
-             if (string_is_empty(s))
+             if (!s || !*s)
                 strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE), len);
              break;
        }
@@ -54,6 +55,12 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
        {
           case MENU_ENUM_LABEL_INPUT_RETROPAD_BINDS:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_INPUT_RETROPAD_BINDS), len);
+             break;
+          case MENU_ENUM_LABEL_INPUT_POLL_TYPE_BEHAVIOR:
+             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_INPUT_POLL_TYPE_BEHAVIOR), len);
+             break;
+          case MENU_ENUM_LABEL_DISK_IMAGE_APPEND:
+             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_DISK_IMAGE_APPEND), len);
              break;
           case MENU_ENUM_LABEL_ACCOUNTS_RETRO_ACHIEVEMENTS:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_ACCOUNTS_RETRO_ACHIEVEMENTS), len);
@@ -84,9 +91,6 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
              break;
           case MENU_ENUM_LABEL_DUMMY_ON_CORE_SHUTDOWN:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_DUMMY_ON_CORE_SHUTDOWN), len);
-             break;
-          case MENU_ENUM_LABEL_CHECK_FOR_MISSING_FIRMWARE:
-             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_CHECK_FOR_MISSING_FIRMWARE), len);
              break;
           case MENU_ENUM_LABEL_CORE_INFO_SAVESTATE_BYPASS:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_CORE_INFO_SAVESTATE_BYPASS), len);
@@ -141,9 +145,6 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
              break;
           case MENU_ENUM_LABEL_FILE_BROWSER_DIRECTORY:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_FILE_BROWSER_DIRECTORY), len);
-             break;
-          case MENU_ENUM_LABEL_INPUT_POLL_TYPE_BEHAVIOR:
-             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_INPUT_POLL_TYPE_BEHAVIOR), len);
              break;
           case MENU_ENUM_LABEL_CORE_LIST:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_CORE_LIST), len);
@@ -310,6 +311,9 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
           case MENU_ENUM_LABEL_REPLAY_CHECKPOINT_INTERVAL:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_REPLAY_CHECKPOINT_INTERVAL), len);
              break;
+          case MENU_ENUM_LABEL_REPLAY_CHECKPOINT_DESERIALIZE:
+             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_REPLAY_CHECKPOINT_DESERIALIZE), len);
+             break;
           case MENU_ENUM_LABEL_VALUE_INPUT_ADC_TYPE:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_INPUT_ADC_TYPE), len);
              break;
@@ -349,6 +353,8 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
                    strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_AUDIO_DRIVER_AL), len);
                 else if (string_is_equal(lbl, msg_hash_to_str(MENU_ENUM_LABEL_AUDIO_DRIVER_SL)))
                    strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_AUDIO_DRIVER_SL), len);
+                else if (string_is_equal(lbl, msg_hash_to_str(MENU_ENUM_LABEL_AUDIO_DRIVER_AAUDIO)))
+                   strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_AUDIO_DRIVER_AAUDIO), len);
                 else if (string_is_equal(lbl, msg_hash_to_str(MENU_ENUM_LABEL_AUDIO_DRIVER_DSOUND)))
                    strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_AUDIO_DRIVER_DSOUND), len);
                 else if (string_is_equal(lbl, msg_hash_to_str(MENU_ENUM_LABEL_AUDIO_DRIVER_WASAPI)))
@@ -463,6 +469,12 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
           case MENU_ENUM_LABEL_CHEAT_START_OR_CONT:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_CHEAT_START_OR_CONT), len);
              break;
+          case MENU_ENUM_LABEL_SAVE_STATE:
+             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_SAVE_STATE), len);
+             break;
+          case MENU_ENUM_LABEL_LOAD_STATE:
+             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_LOAD_STATE), len);
+             break;
 #ifdef HAVE_LAKKA
           case MENU_ENUM_LABEL_TIMEZONE:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_TIMEZONE), len);
@@ -501,7 +513,7 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
              }
              break;
           default:
-             if (string_is_empty(s))
+             if (!s || !*s)
                 strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE), len);
              return -1;
        }
@@ -512,6 +524,38 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
 #endif
 
 #ifdef HAVE_MENU
+#if defined(MSG_HASH_HAVE_STRTAB)
+/* The label rows are expanded three times, as the value rows are
+ * below: the blob's initializer, the id array, and the byte total
+ * the contiguity check compares against; msg_hash_lbl_str.h expanded
+ * the blob type from the same rows. A row repeated in one build is a
+ * duplicate member, so it cannot pass unnoticed. */
+#define MSG_HASH_LBL_ROW(Id, str) str,
+const struct msg_hash_us_lbl_blob_s msg_hash_us_lbl_blob =
+{
+#include "msg_hash_lbl_rows.h"
+};
+#undef MSG_HASH_LBL_ROW
+#define MSG_HASH_LBL_ROW(Id, str) (msg_hash_id_t)Id,
+static const msg_hash_id_t msg_hash_us_lbl_ids[] = {
+#include "msg_hash_lbl_rows.h"
+};
+#undef MSG_HASH_LBL_ROW
+#define MSG_HASH_LBL_ROW(Id, str) + sizeof(str)
+typedef char msg_hash_us_lbl_blob_check[
+      (sizeof(msg_hash_us_lbl_blob) == (0
+#include "msg_hash_lbl_rows.h"
+      )) ? 1 : -1];
+#undef MSG_HASH_LBL_ROW
+
+static const msg_hash_strtab_t msg_hash_us_lbl_strtab =
+{ msg_hash_us_lbl_ids,
+  (uint32_t)(sizeof(msg_hash_us_lbl_ids) / sizeof(msg_hash_us_lbl_ids[0])),
+  (const char*)&msg_hash_us_lbl_blob };
+
+static msg_hash_strtab_index_t msg_hash_us_lbl_index;
+#endif
+
 static const char *menu_hash_to_str_us_label_enum(enum msg_hash_enums msg)
 {
    if (   msg <= MENU_ENUM_LABEL_INPUT_HOTKEY_BIND_END
@@ -523,6 +567,14 @@ static const char *menu_hash_to_str_us_label_enum(enum msg_hash_enums msg)
       return hotkey_lbl;
    }
 
+#if defined(MSG_HASH_HAVE_STRTAB)
+   {
+      const char *ret = msg_hash_strtab_lookup(&msg_hash_us_lbl_strtab,
+            &msg_hash_us_lbl_index, (uint32_t)msg);
+      if (ret)
+         return ret;
+   }
+#else
    switch (msg)
    {
 #include "msg_hash_lbl.h"
@@ -532,8 +584,57 @@ static const char *menu_hash_to_str_us_label_enum(enum msg_hash_enums msg)
 #endif
          break;
    }
+#endif
 
    return "null";
+}
+#endif
+
+#if defined(MSG_HASH_HAVE_STRTAB)
+/* The hand-maintained MSG_HASH rows are expanded three times: once
+ * into exactly-sized members of a packed blob struct (named by the
+ * id token, so mutually exclusive guarded duplicates stay legal),
+ * once into its initializer, and once into the id array.  This
+ * keeps the file freely hand-editable and h2json-parseable while
+ * eliminating the string pointer array and its relocations, the
+ * same layout the generated translation headers use. */
+#undef MSG_HASH
+#define MSG_HASH(Id, str) char m_##Id[sizeof(str)];
+static const struct msg_hash_us_blob_s
+{
+#include "msg_hash_us.h"
+}
+#undef MSG_HASH
+#define MSG_HASH(Id, str) str,
+msg_hash_us_blob =
+{
+#include "msg_hash_us.h"
+};
+#undef MSG_HASH
+#define MSG_HASH(Id, str) (msg_hash_id_t)Id,
+static const msg_hash_id_t msg_hash_us_ids[] = {
+#include "msg_hash_us.h"
+};
+#undef MSG_HASH
+#define MSG_HASH(Id, str) case Id: return str;
+
+static const msg_hash_strtab_t msg_hash_us_strtab =
+{ msg_hash_us_ids,
+  (uint32_t)(sizeof(msg_hash_us_ids) / sizeof(msg_hash_us_ids[0])),
+  (const char*)&msg_hash_us_blob };
+
+static msg_hash_strtab_index_t msg_hash_us_index;
+
+void msg_hash_us_index_init(void)
+{
+   if (msg_hash_us_index.tab != &msg_hash_us_strtab)
+      msg_hash_strtab_index_build(&msg_hash_us_index,
+            &msg_hash_us_strtab);
+#ifdef HAVE_MENU
+   if (msg_hash_us_lbl_index.tab != &msg_hash_us_lbl_strtab)
+      msg_hash_strtab_index_build(&msg_hash_us_lbl_index,
+            &msg_hash_us_lbl_strtab);
+#endif
 }
 #endif
 
@@ -546,6 +647,14 @@ const char *msg_hash_to_str_us(enum msg_hash_enums msg)
        return ret;
 #endif
 
+#if defined(MSG_HASH_HAVE_STRTAB)
+    {
+       const char *s = msg_hash_strtab_lookup(&msg_hash_us_strtab,
+             &msg_hash_us_index, (uint32_t)msg);
+       if (s)
+          return s;
+    }
+#else
     switch (msg)
     {
 #include "msg_hash_us.h"
@@ -558,6 +667,7 @@ const char *msg_hash_to_str_us(enum msg_hash_enums msg)
 #endif
             break;
     }
+#endif
 
     return "null";
 }

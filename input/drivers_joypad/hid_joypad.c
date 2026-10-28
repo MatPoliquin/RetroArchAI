@@ -20,11 +20,16 @@
 /* TODO/FIXME - static global */
 static const hid_driver_t *generic_hid = NULL;
 
+static const input_pad_view_t *hid_joypad_view(unsigned pad);
+
 static void *hid_joypad_init(void *data)
 {
    generic_hid = input_hid_init_first();
    if (!generic_hid)
       return NULL;
+   /* lent where the HID driver lends: its pads are then read through
+    * the snapshot bridge (input_driver.c) */
+   hid_joypad.view = generic_hid->view ? hid_joypad_view : NULL;
    return (void*)-1;
 }
 
@@ -62,10 +67,11 @@ static int16_t hid_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t hid_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
-   unsigned i;
+   int i;
    int16_t ret                          = 0;
    uint16_t port_idx                    = joypad_info->joy_idx;
 
@@ -74,16 +80,13 @@ static int16_t hid_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if ((uint16_t)joykey != NO_BTN && hid_joypad_button(
                port_idx, (uint16_t)joykey))
          ret |= ( 1 << i);
       else if (joyaxis != AXIS_NONE &&
-            ((float)abs(hid_joypad_axis(port_idx, joyaxis)) 
+            ((float)abs(hid_joypad_axis(port_idx, joyaxis))
              / 0x8000) > joypad_info->axis_threshold)
          ret |= (1 << i);
    }
@@ -120,6 +123,55 @@ static const char *hid_joypad_name(unsigned pad)
    return NULL;
 }
 
+static bool hid_joypad_get_bt_host(unsigned pad, uint8_t *addr)
+{
+   return generic_hid && generic_hid->get_bt_host
+      && generic_hid->get_bt_host((void*)hid_driver_get_data(), pad, addr);
+}
+
+static bool hid_joypad_set_bt_host(unsigned pad, const uint8_t *addr)
+{
+   return generic_hid && generic_hid->set_bt_host
+      && generic_hid->set_bt_host((void*)hid_driver_get_data(), pad, addr);
+}
+
+static const input_pad_view_t *hid_joypad_view(unsigned pad)
+{
+   if (generic_hid && generic_hid->view)
+      return generic_hid->view((void*)hid_driver_get_data(), pad);
+   return NULL;
+}
+
+static void hid_joypad_set_player(unsigned pad, unsigned player)
+{
+   if (generic_hid && generic_hid->set_player)
+      generic_hid->set_player((void*)hid_driver_get_data(), pad, player);
+}
+
+/* Kept across a video driver restart: a HID driver's pads are read on
+ * its own threads, or at the poll, and nothing of it is the video
+ * driver's. Stopping it would only close every pad and open it again. */
+static bool hid_joypad_set_sensor_state(unsigned port,
+      enum retro_sensor_action action, unsigned rate)
+{
+   return generic_hid && generic_hid->set_sensor_state
+      && generic_hid->set_sensor_state((void*)hid_driver_get_data(),
+            port, action, rate);
+}
+
+static bool hid_joypad_get_sensor_input(unsigned port, unsigned id,
+      float *value)
+{
+   return generic_hid && generic_hid->get_sensor_input
+      && generic_hid->get_sensor_input((void*)hid_driver_get_data(),
+            port, id, value);
+}
+
+static bool hid_joypad_survives_video(void)
+{
+   return generic_hid != NULL;
+}
+
 input_device_driver_t hid_joypad = {
    hid_joypad_init,
    hid_joypad_query_pad,
@@ -131,8 +183,13 @@ input_device_driver_t hid_joypad = {
    hid_joypad_poll,
    hid_joypad_rumble,
    NULL, /* set_rumble_gain */
-   NULL, /* set_sensor_state */
-   NULL, /* get_sensor_input */
+   hid_joypad_set_sensor_state,
+   hid_joypad_get_sensor_input,
    hid_joypad_name,
-   "hid"
+   "hid",
+   hid_joypad_get_bt_host,
+   hid_joypad_set_bt_host,
+   hid_joypad_survives_video,
+   hid_joypad_set_player,
+   NULL  /* view: set at init, where the HID driver lends */
 };

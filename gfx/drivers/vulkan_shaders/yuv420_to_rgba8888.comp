@@ -1,0 +1,64 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define float3 vec3
+#define float4 vec4
+#include "../../drivers_shader/video_hdr.inc.glsl"
+
+// One invocation for each 2x2 block of pixels, which share a chroma
+// sample.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#ifdef OUTPUT_FP16
+layout(set = 0, binding = 3, rgba16f)
+#else
+layout(set = 0, binding = 3, rgba8)
+#endif
+ writeonly uniform image2D uImage;
+// A 20 word header, then the planes, all where the header says.
+layout(set = 0, binding = 4, std430) readonly buffer SSBO
+{
+	uint words[];
+};
+
+float sample_at(uint off)
+{
+	if (words[14] == 2u)
+	{
+		uint value = (words[off >> 2u] >> ((off & 2u) * 8u)) & 0xffffu;
+		return float(value >> 6u) / (words[15] != 0u ? 1023.0 : 1020.0);
+	}
+	return float((words[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu) * (1.0 / 255.0);
+}
+
+void main()
+{
+	uvec2 res = uvec2(words[0], words[1]);
+	uvec2 blk = gl_GlobalInvocationID.xy;
+	uvec2 p0  = blk * 2u;
+	if (any(greaterThanEqual(p0, res)))
+		return;
+
+	uint y_off    = words[2];
+	uint y_stride = words[3];
+	uint co       = blk.y * words[6] + blk.x * words[7];
+	float ym      = uintBitsToFloat(words[8]);
+	float yb      = uintBitsToFloat(words[9]);
+	float center  = words[14] == 2u && words[15] != 0u ? 512.0 / 1023.0 : 128.0 / 255.0;
+	float cb      = sample_at(words[4] + co) - center;
+	float cr      = sample_at(words[5] + co) - center;
+	uint step     = words[14] == 2u ? 2u : 1u;
+	vec3 c        = vec3(uintBitsToFloat(words[10]) * cr,
+	                     uintBitsToFloat(words[11]) * cb + uintBitsToFloat(words[12]) * cr,
+	                     uintBitsToFloat(words[13]) * cb);
+
+	for (uint j = 0u; j < 2u; j++)
+		for (uint i = 0u; i < 2u; i++)
+		{
+			uvec2 p = p0 + uvec2(i, j);
+			if (p.x < res.x && p.y < res.y)
+			{
+				float y = sample_at(y_off + p.y * y_stride + p.x * step);
+				imageStore(uImage, ivec2(p), vec4(video_hdr_convert(vec3(ym * y + yb) + c, vec4(uintBitsToFloat(words[16]), uintBitsToFloat(words[17]), uintBitsToFloat(words[18]), uintBitsToFloat(words[19]))), 1.0));
+			}
+		}
+}

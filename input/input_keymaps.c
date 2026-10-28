@@ -52,6 +52,8 @@
 
 #if defined(HAVE_SDL) || defined(HAVE_SDL2)
 #include "SDL.h"
+#elif defined(HAVE_SDL3)
+#include <SDL3/SDL.h>
 #endif
 
 #if defined(__linux__) || defined(HAVE_WAYLAND) || defined(__FreeBSD__) && !defined(__PS4__)
@@ -68,9 +70,9 @@
 #endif
 
 #ifdef HAVE_DINPUT
+#define WIN32_LEAN_AND_MEAN
 #undef DIRECTINPUT_VERSION
 #define DIRECTINPUT_VERSION 0x0800
-
 #include <dinput.h>
 #endif
 
@@ -822,6 +824,302 @@ const struct rarch_key_map rarch_key_map_sdl[] = {
 };
 #endif
 
+#ifdef HAVE_SDL3
+const struct rarch_key_map rarch_key_map_sdl3[] = {
+   { SDLK_BACKSPACE, RETROK_BACKSPACE },
+   { SDLK_TAB, RETROK_TAB },
+   { SDLK_CLEAR, RETROK_CLEAR },
+   { SDLK_RETURN, RETROK_RETURN },
+   { SDLK_PAUSE, RETROK_PAUSE },
+   { SDLK_ESCAPE, RETROK_ESCAPE },
+   { SDLK_SPACE, RETROK_SPACE },
+   { SDLK_EXCLAIM, RETROK_EXCLAIM },
+   { SDLK_DBLAPOSTROPHE, RETROK_QUOTEDBL },
+   { SDLK_HASH, RETROK_HASH },
+   { SDLK_DOLLAR, RETROK_DOLLAR },
+   { SDLK_AMPERSAND, RETROK_AMPERSAND },
+   { SDLK_APOSTROPHE, RETROK_QUOTE },
+   { SDLK_LEFTPAREN, RETROK_LEFTPAREN },
+   { SDLK_RIGHTPAREN, RETROK_RIGHTPAREN },
+   { SDLK_ASTERISK, RETROK_ASTERISK },
+   { SDLK_PLUS, RETROK_PLUS },
+   { SDLK_COMMA, RETROK_COMMA },
+   { SDLK_MINUS, RETROK_MINUS },
+   { SDLK_PERIOD, RETROK_PERIOD },
+   { SDLK_SLASH, RETROK_SLASH },
+   { SDLK_0, RETROK_0 },
+   { SDLK_1, RETROK_1 },
+   { SDLK_2, RETROK_2 },
+   { SDLK_3, RETROK_3 },
+   { SDLK_4, RETROK_4 },
+   { SDLK_5, RETROK_5 },
+   { SDLK_6, RETROK_6 },
+   { SDLK_7, RETROK_7 },
+   { SDLK_8, RETROK_8 },
+   { SDLK_9, RETROK_9 },
+   { SDLK_COLON, RETROK_COLON },
+   { SDLK_SEMICOLON, RETROK_SEMICOLON },
+   { SDLK_LESS, RETROK_OEM_102 },
+   { SDLK_EQUALS, RETROK_EQUALS },
+   { SDLK_GREATER, RETROK_GREATER },
+   { SDLK_QUESTION, RETROK_QUESTION },
+   { SDLK_AT, RETROK_AT },
+   { SDLK_LEFTBRACKET, RETROK_LEFTBRACKET },
+   { SDLK_BACKSLASH, RETROK_BACKSLASH },
+   { SDLK_RIGHTBRACKET, RETROK_RIGHTBRACKET },
+   { SDLK_CARET, RETROK_CARET },
+   { SDLK_UNDERSCORE, RETROK_UNDERSCORE },
+   { SDLK_GRAVE, RETROK_BACKQUOTE },
+   /* Character keycodes for layouts where these are unshifted
+    * (SDL3 keycodes follow the layout's unshifted character). */
+   { SDLK_TILDE, RETROK_TILDE },
+   { SDLK_LEFTBRACE, RETROK_LEFTBRACE },
+   { SDLK_RIGHTBRACE, RETROK_RIGHTBRACE },
+   { SDLK_PIPE, RETROK_BAR },
+   { SDLK_A, RETROK_a },
+   { SDLK_B, RETROK_b },
+   { SDLK_C, RETROK_c },
+   { SDLK_D, RETROK_d },
+   { SDLK_E, RETROK_e },
+   { SDLK_F, RETROK_f },
+   { SDLK_G, RETROK_g },
+   { SDLK_H, RETROK_h },
+   { SDLK_I, RETROK_i },
+   { SDLK_J, RETROK_j },
+   { SDLK_K, RETROK_k },
+   { SDLK_L, RETROK_l },
+   { SDLK_M, RETROK_m },
+   { SDLK_N, RETROK_n },
+   { SDLK_O, RETROK_o },
+   { SDLK_P, RETROK_p },
+   { SDLK_Q, RETROK_q },
+   { SDLK_R, RETROK_r },
+   { SDLK_S, RETROK_s },
+   { SDLK_T, RETROK_t },
+   { SDLK_U, RETROK_u },
+   { SDLK_V, RETROK_v },
+   { SDLK_W, RETROK_w },
+   { SDLK_X, RETROK_x },
+   { SDLK_Y, RETROK_y },
+   { SDLK_Z, RETROK_z },
+   { SDLK_DELETE, RETROK_DELETE },
+   { SDLK_KP_0, RETROK_KP0 },
+   { SDLK_KP_1, RETROK_KP1 },
+   { SDLK_KP_2, RETROK_KP2 },
+   { SDLK_KP_3, RETROK_KP3 },
+   { SDLK_KP_4, RETROK_KP4 },
+   { SDLK_KP_5, RETROK_KP5 },
+   { SDLK_KP_6, RETROK_KP6 },
+   { SDLK_KP_7, RETROK_KP7 },
+   { SDLK_KP_8, RETROK_KP8 },
+   { SDLK_KP_9, RETROK_KP9 },
+   { SDLK_KP_PERIOD, RETROK_KP_PERIOD },
+   { SDLK_KP_DIVIDE, RETROK_KP_DIVIDE },
+   { SDLK_KP_MULTIPLY, RETROK_KP_MULTIPLY },
+   { SDLK_KP_MINUS, RETROK_KP_MINUS },
+   { SDLK_KP_PLUS, RETROK_KP_PLUS },
+   { SDLK_KP_ENTER, RETROK_KP_ENTER },
+   { SDLK_KP_EQUALS, RETROK_KP_EQUALS },
+   { SDLK_UP, RETROK_UP },
+   { SDLK_DOWN, RETROK_DOWN },
+   { SDLK_RIGHT, RETROK_RIGHT },
+   { SDLK_LEFT, RETROK_LEFT },
+   { SDLK_INSERT, RETROK_INSERT },
+   { SDLK_HOME, RETROK_HOME },
+   { SDLK_END, RETROK_END },
+   { SDLK_PAGEUP, RETROK_PAGEUP },
+   { SDLK_PAGEDOWN, RETROK_PAGEDOWN },
+   { SDLK_F1, RETROK_F1 },
+   { SDLK_F2, RETROK_F2 },
+   { SDLK_F3, RETROK_F3 },
+   { SDLK_F4, RETROK_F4 },
+   { SDLK_F5, RETROK_F5 },
+   { SDLK_F6, RETROK_F6 },
+   { SDLK_F7, RETROK_F7 },
+   { SDLK_F8, RETROK_F8 },
+   { SDLK_F9, RETROK_F9 },
+   { SDLK_F10, RETROK_F10 },
+   { SDLK_F11, RETROK_F11 },
+   { SDLK_F12, RETROK_F12 },
+   { SDLK_F13, RETROK_F13 },
+   { SDLK_F14, RETROK_F14 },
+   { SDLK_F15, RETROK_F15 },
+   { SDLK_NUMLOCKCLEAR, RETROK_NUMLOCK },
+   { SDLK_CAPSLOCK, RETROK_CAPSLOCK },
+   { SDLK_SCROLLLOCK, RETROK_SCROLLOCK },
+   { SDLK_RSHIFT, RETROK_RSHIFT },
+   { SDLK_LSHIFT, RETROK_LSHIFT },
+   { SDLK_RCTRL, RETROK_RCTRL },
+   { SDLK_LCTRL, RETROK_LCTRL },
+   { SDLK_RALT, RETROK_RALT },
+   { SDLK_LALT, RETROK_LALT },
+   { SDLK_LGUI, RETROK_LSUPER },
+   { SDLK_RGUI, RETROK_RSUPER },
+   { SDLK_MODE, RETROK_MODE },
+   { SDLK_HELP, RETROK_HELP },
+   { SDLK_PRINTSCREEN, RETROK_PRINT },
+   { SDLK_SYSREQ, RETROK_SYSREQ },
+   { SDLK_PAUSE, RETROK_BREAK },
+   { SDLK_MENU, RETROK_MENU },
+   { SDLK_APPLICATION, RETROK_MENU },
+   { SDLK_POWER, RETROK_POWER },
+   { SDLK_UNDO, RETROK_UNDO },
+   { SDLK_MEDIA_NEXT_TRACK,     RETROK_MEDIA_NEXT },
+   { SDLK_MEDIA_PREVIOUS_TRACK, RETROK_MEDIA_PREV },
+   { SDLK_MEDIA_STOP,           RETROK_MEDIA_STOP },
+   { SDLK_MEDIA_PLAY,           RETROK_MEDIA_PLAY_PAUSE },
+   { SDLK_MEDIA_PLAY_PAUSE,     RETROK_MEDIA_PLAY_PAUSE },
+   { SDLK_MUTE,                 RETROK_VOLUME_MUTE },
+   { SDLK_MEDIA_SELECT,         RETROK_LAUNCH_MEDIA },
+   { SDLK_AC_SEARCH,            RETROK_BROWSER_SEARCH },
+   { SDLK_AC_HOME,              RETROK_BROWSER_HOME },
+   { SDLK_AC_BACK,              RETROK_BROWSER_BACK },
+   { SDLK_AC_FORWARD,           RETROK_BROWSER_FORWARD },
+   { SDLK_AC_STOP,              RETROK_BROWSER_STOP },
+   { SDLK_AC_REFRESH,           RETROK_BROWSER_REFRESH },
+   { SDLK_AC_BOOKMARKS,         RETROK_BROWSER_FAVORITES },
+   { SDLK_VOLUMEUP,             RETROK_VOLUME_UP },
+   { SDLK_VOLUMEDOWN,           RETROK_VOLUME_DOWN },
+   { 0, RETROK_UNKNOWN },
+};
+#endif
+
+#ifdef HAVE_WIN32INPUT
+/* The keyboard's scancodes, the extended keys with 0x80 added: what
+ * the window procedure makes of a key message, and what DirectInput
+ * calls its DIK_ codes. The same keys as rarch_key_map_dinput below,
+ * in numbers, so that a build with no DirectX header has it. */
+const struct rarch_key_map rarch_key_map_win32[] = {
+   { 0xCB, RETROK_LEFT            }, /* LEFT */
+   { 0xCD, RETROK_RIGHT           }, /* RIGHT */
+   { 0xC8, RETROK_UP              }, /* UP */
+   { 0xD0, RETROK_DOWN            }, /* DOWN */
+   { 0x1C, RETROK_RETURN          }, /* RETURN */
+   { 0x0F, RETROK_TAB             }, /* TAB */
+   { 0xD2, RETROK_INSERT          }, /* INSERT */
+   { 0xD3, RETROK_DELETE          }, /* DELETE */
+   { 0x36, RETROK_RSHIFT          }, /* RSHIFT */
+   { 0x2A, RETROK_LSHIFT          }, /* LSHIFT */
+   { 0x9D, RETROK_RCTRL           }, /* RCONTROL */
+   { 0x1D, RETROK_LCTRL           }, /* LCONTROL */
+   { 0xB8, RETROK_RALT            }, /* RMENU */
+   { 0x38, RETROK_LALT            }, /* LALT */
+   { 0xDB, RETROK_LSUPER          }, /* LWIN */
+   { 0xDC, RETROK_RSUPER          }, /* RWIN */
+   { 0xDD, RETROK_MENU            }, /* APPS */
+   { 0xCF, RETROK_END             }, /* END */
+   { 0xC7, RETROK_HOME            }, /* HOME */
+   { 0xD1, RETROK_PAGEDOWN        }, /* NEXT */
+   { 0xC9, RETROK_PAGEUP          }, /* PRIOR */
+   { 0x39, RETROK_SPACE           }, /* SPACE */
+   { 0x01, RETROK_ESCAPE          }, /* ESCAPE */
+   { 0x0E, RETROK_BACKSPACE       }, /* BACKSPACE */
+   { 0x9C, RETROK_KP_ENTER        }, /* NUMPADENTER */
+   { 0x4E, RETROK_KP_PLUS         }, /* NUMPADPLUS */
+   { 0x4A, RETROK_KP_MINUS        }, /* NUMPADMINUS */
+   { 0x37, RETROK_KP_MULTIPLY     }, /* NUMPADSTAR */
+   { 0xB5, RETROK_KP_DIVIDE       }, /* DIVIDE */
+   { 0x29, RETROK_BACKQUOTE       }, /* GRAVE */
+   { 0xC5, RETROK_PAUSE           }, /* PAUSE */
+   { 0x52, RETROK_KP0             }, /* NUMPAD0 */
+   { 0x4F, RETROK_KP1             }, /* NUMPAD1 */
+   { 0x50, RETROK_KP2             }, /* NUMPAD2 */
+   { 0x51, RETROK_KP3             }, /* NUMPAD3 */
+   { 0x4B, RETROK_KP4             }, /* NUMPAD4 */
+   { 0x4C, RETROK_KP5             }, /* NUMPAD5 */
+   { 0x4D, RETROK_KP6             }, /* NUMPAD6 */
+   { 0x47, RETROK_KP7             }, /* NUMPAD7 */
+   { 0x48, RETROK_KP8             }, /* NUMPAD8 */
+   { 0x49, RETROK_KP9             }, /* NUMPAD9 */
+   { 0x0B, RETROK_0               }, /* 0 */
+   { 0x02, RETROK_1               }, /* 1 */
+   { 0x03, RETROK_2               }, /* 2 */
+   { 0x04, RETROK_3               }, /* 3 */
+   { 0x05, RETROK_4               }, /* 4 */
+   { 0x06, RETROK_5               }, /* 5 */
+   { 0x07, RETROK_6               }, /* 6 */
+   { 0x08, RETROK_7               }, /* 7 */
+   { 0x09, RETROK_8               }, /* 8 */
+   { 0x0A, RETROK_9               }, /* 9 */
+   { 0x3B, RETROK_F1              }, /* F1 */
+   { 0x3C, RETROK_F2              }, /* F2 */
+   { 0x3D, RETROK_F3              }, /* F3 */
+   { 0x3E, RETROK_F4              }, /* F4 */
+   { 0x3F, RETROK_F5              }, /* F5 */
+   { 0x40, RETROK_F6              }, /* F6 */
+   { 0x41, RETROK_F7              }, /* F7 */
+   { 0x42, RETROK_F8              }, /* F8 */
+   { 0x43, RETROK_F9              }, /* F9 */
+   { 0x44, RETROK_F10             }, /* F10 */
+   { 0x57, RETROK_F11             }, /* F11 */
+   { 0x58, RETROK_F12             }, /* F12 */
+   { 0x64, RETROK_F13             }, /* F13 */
+   { 0x65, RETROK_F14             }, /* F14 */
+   { 0x66, RETROK_F15             }, /* F15 */
+   { 0x1E, RETROK_a               }, /* A */
+   { 0x30, RETROK_b               }, /* B */
+   { 0x2E, RETROK_c               }, /* C */
+   { 0x20, RETROK_d               }, /* D */
+   { 0x12, RETROK_e               }, /* E */
+   { 0x21, RETROK_f               }, /* F */
+   { 0x22, RETROK_g               }, /* G */
+   { 0x23, RETROK_h               }, /* H */
+   { 0x17, RETROK_i               }, /* I */
+   { 0x24, RETROK_j               }, /* J */
+   { 0x25, RETROK_k               }, /* K */
+   { 0x26, RETROK_l               }, /* L */
+   { 0x32, RETROK_m               }, /* M */
+   { 0x31, RETROK_n               }, /* N */
+   { 0x18, RETROK_o               }, /* O */
+   { 0x19, RETROK_p               }, /* P */
+   { 0x10, RETROK_q               }, /* Q */
+   { 0x13, RETROK_r               }, /* R */
+   { 0x1F, RETROK_s               }, /* S */
+   { 0x14, RETROK_t               }, /* T */
+   { 0x16, RETROK_u               }, /* U */
+   { 0x2F, RETROK_v               }, /* V */
+   { 0x11, RETROK_w               }, /* W */
+   { 0x2D, RETROK_x               }, /* X */
+   { 0x15, RETROK_y               }, /* Y */
+   { 0x2C, RETROK_z               }, /* Z */
+   { 0x28, RETROK_QUOTE           }, /* APOSTROPHE */
+   { 0x33, RETROK_COMMA           }, /* COMMA */
+   { 0x0C, RETROK_MINUS           }, /* MINUS */
+   { 0x35, RETROK_SLASH           }, /* SLASH */
+   { 0x27, RETROK_SEMICOLON       }, /* SEMICOLON */
+   { 0x0D, RETROK_EQUALS          }, /* EQUALS */
+   { 0x1A, RETROK_LEFTBRACKET     }, /* LBRACKET */
+   { 0x2B, RETROK_BACKSLASH       }, /* BACKSLASH */
+   { 0x1B, RETROK_RIGHTBRACKET    }, /* RBRACKET */
+   { 0x53, RETROK_KP_PERIOD       }, /* DECIMAL */
+   { 0x34, RETROK_PERIOD          }, /* PERIOD */
+   { 0x46, RETROK_SCROLLOCK       }, /* SCROLL */
+   { 0x3A, RETROK_CAPSLOCK        }, /* CAPSLOCK */
+   { 0x45, RETROK_NUMLOCK         }, /* NUMLOCK */
+   { 0x56, RETROK_OEM_102         }, /* OEM_102 */
+   { 0x90, RETROK_MEDIA_PREV      }, /* CIRCUMFLEX */
+   { 0x99, RETROK_MEDIA_NEXT      }, /* NEXTTRACK */
+   { 0xA0, RETROK_VOLUME_MUTE     }, /* MUTE */
+   { 0xA1, RETROK_LAUNCH_APP2     }, /* CALCULATOR */
+   { 0xA2, RETROK_MEDIA_PLAY_PAUSE }, /* PLAYPAUSE */
+   { 0xA4, RETROK_MEDIA_STOP      }, /* MEDIASTOP */
+   { 0xAE, RETROK_VOLUME_DOWN     }, /* VOLUMEDOWN */
+   { 0xB0, RETROK_VOLUME_UP       }, /* VOLUMEUP */
+   { 0xB2, RETROK_BROWSER_HOME    }, /* WEBHOME */
+   { 0xE5, RETROK_BROWSER_SEARCH  }, /* WEBSEARCH */
+   { 0xE6, RETROK_BROWSER_FAVORITES }, /* WEBFAVORITES */
+   { 0xE7, RETROK_BROWSER_REFRESH }, /* WEBREFRESH */
+   { 0xE8, RETROK_BROWSER_STOP    }, /* WEBSTOP */
+   { 0xE9, RETROK_BROWSER_FORWARD }, /* WEBFORWARD */
+   { 0xEA, RETROK_BROWSER_BACK    }, /* WEBBACK */
+   { 0xEB, RETROK_LAUNCH_APP1     }, /* MYCOMPUTER */
+   { 0xEC, RETROK_LAUNCH_MAIL     }, /* MAIL */
+   { 0xED, RETROK_LAUNCH_MEDIA    }, /* MEDIASELECT */
+   { 0x90, RETROK_MEDIA_PREV      }, /* PREVTRACK */
+   { 0, RETROK_UNKNOWN },
+};
+#endif
+
 #ifdef HAVE_DINPUT
 const struct rarch_key_map rarch_key_map_dinput[] = {
    { DIK_LEFT, RETROK_LEFT },
@@ -959,13 +1257,14 @@ const struct rarch_key_map rarch_key_map_dinput[] = {
 };
 #endif
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 /* this is generated at runtime, so it isn't constant */
 struct rarch_key_map rarch_key_map_rwebinput[RARCH_KEY_MAP_RWEBINPUT_SIZE];
 #endif
 
-#ifdef WIIU
-const struct rarch_key_map rarch_key_map_wiiu[] = {
+#if defined(WIIU) || defined(GEKKO_NATIVE)
+/* USB HID keyboard usages */
+const struct rarch_key_map rarch_key_map_hid[] = {
    { 4, RETROK_a },
    { 5, RETROK_b },
    { 6, RETROK_c },
@@ -1394,6 +1693,7 @@ const struct rarch_key_map rarch_key_map_android[] = {
    { AKEYCODE_TAB, RETROK_TAB },
    { AKEYCODE_CLEAR, RETROK_CLEAR },
    { AKEYCODE_ENTER, RETROK_RETURN },
+/*   { AKEYCODE_DPAD_CENTER, RETROK_RETURN }, */ /* Duplicate - skip */
    { AKEYCODE_BREAK, RETROK_PAUSE },
    { AKEYCODE_ESCAPE, RETROK_ESCAPE },
    { AKEYCODE_SPACE, RETROK_SPACE },
@@ -1420,6 +1720,7 @@ const struct rarch_key_map rarch_key_map_android[] = {
    { AKEYCODE_EQUALS, RETROK_EQUALS },
    { AKEYCODE_LEFT_BRACKET, RETROK_LEFTBRACKET },
    { AKEYCODE_BACKSLASH, RETROK_BACKSLASH },
+   /* 102. key can not be mapped, it behaves the same as backslash */
    { AKEYCODE_RIGHT_BRACKET, RETROK_RIGHTBRACKET },
    { AKEYCODE_GRAVE, RETROK_BACKQUOTE },
    { AKEYCODE_A, RETROK_a },
@@ -1490,8 +1791,8 @@ const struct rarch_key_map rarch_key_map_android[] = {
    { AKEYCODE_NUM_LOCK, RETROK_NUMLOCK },
    { AKEYCODE_CAPS_LOCK, RETROK_CAPSLOCK },
    { AKEYCODE_SCROLL_LOCK, RETROK_SCROLLOCK },
-   { AKEYCODE_SHIFT_LEFT, RETROK_RSHIFT },
-   { AKEYCODE_SHIFT_RIGHT, RETROK_LSHIFT },
+   { AKEYCODE_SHIFT_LEFT, RETROK_LSHIFT },
+   { AKEYCODE_SHIFT_RIGHT, RETROK_RSHIFT },
    { AKEYCODE_CTRL_RIGHT, RETROK_RCTRL },
    { AKEYCODE_CTRL_LEFT, RETROK_LCTRL },
    { AKEYCODE_ALT_RIGHT, RETROK_RALT },
@@ -1736,6 +2037,9 @@ const struct rarch_key_map rarch_key_map_dos[] = {
    { DOSKEY_F8, RETROK_F8 },
    { DOSKEY_F9, RETROK_F9 },
    { DOSKEY_F10, RETROK_F10 },
+   { DOSKEY_F11, RETROK_F11 },
+   { DOSKEY_F12, RETROK_F12 },
+   { DOSKEY_KP_SCRLOCK, RETROK_SCROLLOCK },
 
    { DOSKEY_BACKQUOTE, RETROK_BACKQUOTE },
    { DOSKEY_1, RETROK_1 },
@@ -1782,6 +2086,7 @@ const struct rarch_key_map rarch_key_map_dos[] = {
    { DOSKEY_RETURN, RETROK_RETURN },
 
    { DOSKEY_LSHIFT, RETROK_LSHIFT },
+   { DOSKEY_OEM102, RETROK_OEM_102 },
    { DOSKEY_z, RETROK_z },
    { DOSKEY_x, RETROK_x },
    { DOSKEY_c, RETROK_c },
@@ -1812,6 +2117,27 @@ const struct rarch_key_map rarch_key_map_dos[] = {
    { DOSKEY_END, RETROK_END },
    { DOSKEY_PGUP, RETROK_PAGEUP },
    { DOSKEY_PGDN, RETROK_PAGEDOWN },
+   { DOSKEY_INS, RETROK_INSERT },
+   { DOSKEY_DEL, RETROK_DELETE },
+
+   { DOSKEY_KP_UP,     RETROK_KP8 },
+   { DOSKEY_KP_DOWN,   RETROK_KP2 },
+   { DOSKEY_KP_LEFT,   RETROK_KP4 },
+   { DOSKEY_KP_RIGHT,  RETROK_KP6 },
+   { DOSKEY_KP_5,      RETROK_KP5 },
+   { DOSKEY_KP_HOME,   RETROK_KP7 },
+   { DOSKEY_KP_END,    RETROK_KP1 },
+   { DOSKEY_KP_PGUP,   RETROK_KP9 },
+   { DOSKEY_KP_PGDN,   RETROK_KP3 },
+   { DOSKEY_KP_RETURN, RETROK_KP_ENTER },
+   { DOSKEY_KP_INS,    RETROK_KP0 },
+   { DOSKEY_KP_PERIOD, RETROK_KP_PERIOD },
+
+   { DOSKEY_KP_DIVIDE,   RETROK_KP_DIVIDE },
+   { DOSKEY_KP_MULTIPLY, RETROK_KP_MULTIPLY },
+   { DOSKEY_KP_MINUS,    RETROK_KP_MINUS },
+   { DOSKEY_KP_PLUS,     RETROK_KP_PLUS },
+   { DOSKEY_KP_NUMLOCK,  RETROK_NUMLOCK },
 
    { 0, RETROK_UNKNOWN }
 };
@@ -2109,7 +2435,12 @@ void input_keymaps_init_keyboard_lut(const struct rarch_key_map *map)
       if (rarch_keysym_rlut)
          free(rarch_keysym_rlut);
 
-      rarch_keysym_rlut = (unsigned*)calloc(++rarch_keysym_rlut_size, sizeof(unsigned));
+      /* On failure the lookup falls back to its slow path. */
+      if (!(rarch_keysym_rlut = (unsigned*)calloc(++rarch_keysym_rlut_size, sizeof(unsigned))))
+      {
+         rarch_keysym_rlut_size = 0;
+         return;
+      }
 
       for (map = map_start; map->rk != RETROK_UNKNOWN; map++)
          rarch_keysym_rlut[map->sym] = (enum retro_key)map->rk;

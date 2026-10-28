@@ -1,0 +1,208 @@
+name: CI Windows raw input under Wine
+
+# The Windows build's raw input path, run for real. The other winraw
+# tests take the drivers apart and stand in for the frontend around
+# them; this one cross-builds retroarch.exe with mingw-w64, runs it
+# under Wine on a virtual display with the GDI video driver, the raw
+# input driver and the raw input joypad driver, presses keys in its
+# window and reads its log.
+#
+# It runs a small core that writes to the log what reaches it. Four
+# scenarios, each: two keys, a fullscreen toggle (which restarts the
+# GDI video driver), the two keys again, quit with Escape - and in each
+# the core must have seen its button and its key events before the
+# restart and after it. Read by the poll and kept across the restart
+# (the default); restarted with the video driver
+# (RETROARCH_INPUT_KEEP=0); threaded video off; and DirectInput.
+# In all of those the window is left up across both restarts and
+# taken back; two more destroy it with the driver as before
+# (RETROARCH_WINDOW_KEEP=0) and leave it up without taking it (=2).
+# Those use the GDI video driver. Two more use OpenGL on Wine's
+# software rasteriser: the fullscreen toggle restyling the window in
+# place, and - with that turned off - restarting on the kept window.
+# See samples/input/windows_wine_smoke/run.sh.
+#
+# Wine is not Windows: what this holds is that the frontend, the pump,
+# the two drivers and the driver restart fit together, on every commit
+# that touches them. What only Windows answers - whether its raw input
+# reaches a window on a thread without the focus, what a real
+# controller sends - was tried by hand when the path was made.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'input/input_driver.c'
+      - 'input/input_driver.h'
+      - 'input/input_driver_choice.c'
+      - 'input/drivers/winraw_input.c'
+      - 'input/drivers/winraw_mouse_pending.h'
+      - 'input/drivers/winraw_mouse_buttons.h'
+      - 'input/drivers_joypad/winraw_joypad.c'
+      - 'gfx/common/win32_common.c'
+      - 'gfx/common/win32_msg_route.h'
+      - 'gfx/common/win32_ime.h'
+      - 'samples/input/win32_ime/**'
+      - 'gfx/display_servers/dispserv_win32.c'
+      - 'gfx/drivers/gdi_gfx.c'
+      - 'gfx/drivers_context/wgl_ctx.c'
+      - 'gfx/video_driver.c'
+      - 'gfx/video_thread_wrapper.*'
+      - 'ui/drivers/ui_win32.c'
+      - 'retroarch.c'
+      - 'runloop.c'
+      - 'samples/input/windows_wine_smoke/**'
+      - '.github/workflows/Windows-wine-input.yml'
+  pull_request:
+    paths:
+      - 'input/input_driver.c'
+      - 'input/input_driver.h'
+      - 'input/input_driver_choice.c'
+      - 'input/drivers/winraw_input.c'
+      - 'input/drivers/winraw_mouse_pending.h'
+      - 'input/drivers/winraw_mouse_buttons.h'
+      - 'input/drivers_joypad/winraw_joypad.c'
+      - 'gfx/common/win32_common.c'
+      - 'gfx/common/win32_msg_route.h'
+      - 'gfx/common/win32_ime.h'
+      - 'samples/input/win32_ime/**'
+      - 'gfx/display_servers/dispserv_win32.c'
+      - 'gfx/drivers/gdi_gfx.c'
+      - 'gfx/video_driver.c'
+      - 'gfx/video_thread_wrapper.*'
+      - 'ui/drivers/ui_win32.c'
+      - 'retroarch.c'
+      - 'runloop.c'
+      - 'samples/input/windows_wine_smoke/**'
+      - '.github/workflows/Windows-wine-input.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only pull requests cancel a superseded run.  On master every push
+# gets its own group (keyed by the commit), so a burst of pushes queues
+# instead of cancelling the run for the commit before it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows-wine-input:
+    name: Run retroarch.exe under Wine and press keys
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential ccache gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64 xvfb xdotool libgl1-mesa-dri
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Build and run win32_ime_test under Wine
+        shell: bash
+        run: |
+          set -eu
+          # The window has its input context (the IME) only while a line
+          # of text is open: gfx/common/win32_ime.h, driven from another
+          # thread as the frontend does, the window asked on its own.
+          Xvfb :97 -screen 0 640x480x24 > /dev/null 2>&1 &
+          trap 'kill $! 2>/dev/null; wineserver -k >/dev/null 2>&1 || true' EXIT
+          export DISPLAY=:97
+          make -C samples/input/win32_ime check
+          make -C samples/input/win32_ime clean
+
+      - name: Build and run winusb_hid_test under Wine
+        shell: bash
+        run: |
+          set -eu
+          # The WinUSB HID driver with the real pad handlers and a
+          # stand-in for winusb.dll: a DualShock 3 started by HID class
+          # requests on the control pipe, the newest report its reader
+          # has had taken at the poll, its Bluetooth address read and
+          # set, and a pad that goes or a driver that stops letting the
+          # reader go.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make -C samples/input/winusb_hid check
+          make -C samples/input/winusb_hid clean
+
+      - name: Build retroarch.exe with mingw-w64 (GDI and raw input, the rest off)
+        shell: bash
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache -M 250M
+          ccache -z
+          # What the test runs has to be real: the Win32 window code,
+          # the GDI and OpenGL drivers, the raw input drivers, the
+          # menu, threads. Everything else is build time.
+          ./configure --host=x86_64-w64-mingw32 \
+                      --disable-qt --disable-vulkan --disable-ffmpeg \
+                      --disable-networking --disable-cheevos \
+                      --disable-glslang --disable-slang \
+                      --disable-spirv_cross --disable-xmb \
+                      --disable-materialui --disable-ozone \
+                      --disable-7zip --disable-flac \
+                      --disable-audiomixer --disable-translate \
+                      --disable-accessibility --disable-langextra \
+                      --disable-libretrodb --disable-discord \
+                      --disable-d3d9 --disable-d3d10 --disable-d3d11 \
+                      --disable-d3d12 --disable-sdl \
+                      --disable-sdl2 --disable-video_filter \
+                      --disable-dsp_filter --disable-crtswitchres
+          make -j$(nproc) CC="ccache x86_64-w64-mingw32-gcc" \
+                          CXX="ccache x86_64-w64-mingw32-g++"
+          ccache -s
+          test -f retroarch.exe
+
+      - name: Run the scenarios under Wine
+        shell: bash
+        run: |
+          set -eu
+          # Stop wineserver on exit so it cannot hold the step's output
+          # open.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          timeout 900 samples/input/windows_wine_smoke/run.sh
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

@@ -8,6 +8,8 @@ SALAMANDER_BUILD           = 0
 HAVE_STATIC_DUMMY ?= 0
 WHOLE_ARCHIVE_LINK         = 0
 WIIU_HID                   = 1
+HAVE_WIIU_DESCRIPTOR_IO   ?= 0
+HAVE_THREADS               = 1
 HAVE_HID                   = 1
 HAVE_RUNAHEAD              = 1
 WIIU_LOG_RPX               = 0
@@ -37,18 +39,19 @@ INCDIRS :=
 #-----------------------------
 # Features and object files
 
-OBJ += wiiu/main.o
-OBJ += wiiu/system/memory.o
-OBJ += wiiu/system/atomic.o
-OBJ += wiiu/system/exception_handler.o
-OBJ += wiiu/system/missing_libc_functions.o
-OBJ += wiiu/fs/sd_fat_devoptab.o
-OBJ += wiiu/fs/fs_utils.o
-OBJ += wiiu/hbl.o
+OBJ += os/wiiu/main.o
+OBJ += os/wiiu/system/memory.o
+OBJ += os/wiiu/system/atomic.o
+OBJ += os/wiiu/system/exception_handler.o
+OBJ += os/wiiu/system/missing_libc_functions.o
+OBJ += os/wiiu/system/newlib_locks.o
+OBJ += os/wiiu/fs/sd_fat_devoptab.o
+OBJ += os/wiiu/fs/fs_utils.o
+OBJ += os/wiiu/hbl.o
 
-RPX_OBJ = $(BUILD_DIR)/wiiu/system/stubs_rpl.o
-HBL_ELF_OBJ = $(BUILD_DIR)/wiiu/system/dynamic.o \
-              $(BUILD_DIR)/wiiu/system/stubs_elf.o
+RPX_OBJ = $(BUILD_DIR)/os/wiiu/system/stubs_rpl.o
+HBL_ELF_OBJ = $(BUILD_DIR)/os/wiiu/system/dynamic.o \
+              $(BUILD_DIR)/os/wiiu/system/stubs_elf.o
 
 ifeq ($(SALAMANDER_BUILD),1)
    DEFINES += -DRARCH_CONSOLE -DIS_SALAMANDER
@@ -61,6 +64,7 @@ ifeq ($(SALAMANDER_BUILD),1)
    OBJ += libretro-common/compat/fopen_utf8.o
    OBJ += libretro-common/file/file_path.o
    OBJ += libretro-common/file/file_path_io.o
+   OBJ += libretro-common/string/rstrtod.o
    OBJ += libretro-common/string/stdstring.o
    OBJ += libretro-common/lists/string_list.o
    OBJ += libretro-common/lists/dir_list.o
@@ -68,9 +72,9 @@ ifeq ($(SALAMANDER_BUILD),1)
    OBJ += libretro-common/compat/compat_strl.o
    OBJ += libretro-common/compat/compat_strldup.o
    OBJ += libretro-common/file/config_file.o
+   OBJ += libretro-common/file/config_file_io.o
    OBJ += libretro-common/streams/file_stream.o
    OBJ += libretro-common/vfs/vfs_implementation.o
-   OBJ += libretro-common/hash/lrc_hash.o
    OBJ += libretro-common/time/rtime.o
    OBJ += verbosity.o
 
@@ -94,7 +98,7 @@ ifeq ($(LOAD_WITHOUT_CORE_INFO),1)
    DEFINES += -DLOAD_WITHOUT_CORE_INFO
 endif
 
-   OBJ += wiiu/shader_utils.o
+   OBJ += os/wiiu/shader_utils.o
    OBJ += gfx/drivers/gx2_shaders/tex.o
    OBJ += gfx/drivers/gx2_shaders/sprite.o
    OBJ += gfx/drivers/gx2_shaders/frame.o
@@ -106,29 +110,26 @@ endif
    OBJ += gfx/drivers/gx2_shaders/snowflake.o
 
    ifeq ($(GRIFFIN_BUILD), 1)
-      OBJ += griffin/griffin.o griffin/griffin_cpp.o
+      OBJ += griffin/griffin.o griffin/griffin_cpp.o griffin/griffin_rslc.o
 
-      INCDIRS += -Ilibretro-common/include/compat/zlib
+      INCDIRS +=
       # for stb, libfat, iosuhax
       INCDIRS += -Ideps -Ideps/libfat/include -Ideps/libiosuhax/include
       # pad_functions uses wiiu/input.h
       INCDIRS += -Iinput/include
-      INCDIRS += -Ideps/SPIRV-Cross
 
       DEFINES += -DHAVE_AUDIOMIXER
       DEFINES += -DHAVE_RWAV
       DEFINES += -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_GFX_WIDGETS -DHAVE_CONFIGFILE -DHAVE_PATCH -DHAVE_CHEATS -DHAVE_RGUI -DHAVE_LIBRETRODB
-		DEFINES += -DHAVE_REWIND
-      DEFINES += -DHAVE_ZLIB -DHAVE_RPNG -DHAVE_RJPEG -DHAVE_RBMP -DHAVE_RTGA -DHAVE_CC_RESAMPLER
-      DEFINES += -DHAVE_SPIRV_CROSS -DHAVE_SLANG
-      DEFINES += -DHAVE_STB_FONT -DHAVE_STB_VORBIS -DHAVE_LANGEXTRA -DHAVE_LIBRETRODB -DHAVE_NETWORKING -DHAVE_IFINFO -DHAVE_NETPLAYDISCOVERY
-      #DEFINES += -DWANT_IFADDRS
-      #DEFINES += -DHAVE_FREETYPE
+      DEFINES += -DHAVE_REWIND
+      DEFINES += -DHAVE_RPNG -DHAVE_RWEBP -DHAVE_RDDS -DHAVE_RJPEG -DHAVE_RBMP -DHAVE_RTGA -DHAVE_CC_RESAMPLER
+      DEFINES += -DHAVE_RSLC -DHAVE_SLANG
+      DEFINES += -DHAVE_RVORBIS -DHAVE_LANGEXTRA -DHAVE_LIBRETRODB -DHAVE_NETWORKING -DHAVE_IFINFO -DHAVE_NETPLAYDISCOVERY
       DEFINES += -DHAVE_XMB -DHAVE_MATERIALUI
       DEFINES += -DHAVE_HID
+      DEFINES += -DHAVE_THREADS
       DEFINES += -DWANT_LIBFAT -DHAVE_LIBFAT -DWANT_IOSUHAX -DHAVE_IOSUHAX
       DEFINES += -DHAVE_CORE_INFO_CACHE
-      DEFINES += -DSPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
 
    # $(GRIFFIN_BUILD),0
    else
@@ -139,6 +140,8 @@ endif
       HAVE_GFX_WIDGETS = 1
       HAVE_RTGA = 1
       HAVE_RPNG = 1
+      HAVE_RWEBP = 1
+      HAVE_RDDS = 1
       HAVE_RJPEG = 1
       HAVE_RBMP = 1
       HAVE_CONFIGFILE = 1
@@ -149,22 +152,22 @@ endif
       HAVE_MENU = 1
       HAVE_RGUI = 1
       HAVE_7ZIP = 1
-      HAVE_ZLIB = 1
-      HAVE_BUILTINZLIB = 0
+      HAVE_RZSTD = 1
       HAVE_LIBRETRODB = 1
       HAVE_MATERIALUI = 1
       HAVE_XMB = 1
-      HAVE_STB_FONT = 1
       #HAVE_FREETYPE = 1
       HAVE_LANGEXTRA = 1
       HAVE_LIBRETRODB = 1
       HAVE_NETWORKING = 1
+      # the built-in NFS client (nfs://); it needs no crypto
+      HAVE_RETRONFS = 1
       HAVE_IFINFO = 1
       HAVE_NETPLAYDISCOVERY = 1
       HAVE_CHEEVOS = 1
       #WANT_IFADDRS = 1
       HAVE_OVERLAY = 1
-      HAVE_SPIRV_CROSS = 1
+      HAVE_RSLC = 1
       HAVE_SLANG = 1
       HAVE_DSP_FILTER = 1
       HAVE_VIDEO_FILTER = 1
@@ -186,6 +189,12 @@ OBJ := $(addprefix $(BUILD_DIR)/,$(OBJ))
 # Compile flags
 
 DEFINES += -DWIIU -D__WUT__ -DHW_WUP -D__wiiu__
+
+# Whole-file reads on open()/read() straight into a line-aligned buffer
+# instead of through stdio's. Off until it has run on hardware.
+ifeq ($(HAVE_WIIU_DESCRIPTOR_IO), 1)
+   DEFINES += -DHAVE_WIIU_DESCRIPTOR_IO
+endif
 DEFINES += -DHAVE_MAIN
 DEFINES += -DRARCH_CONSOLE
 
@@ -199,8 +208,8 @@ endif
 
 INCDIRS += -I.
 INCDIRS += -Ilibretro-common/include
-INCDIRS += -Iwiiu
-INCDIRS += -Iwiiu/include
+INCDIRS += -Ios/wiiu
+INCDIRS += -Ios/wiiu/include
 
 CFLAGS  := -mcpu=750 -meabi -mhard-float
 CFLAGS  += -Werror=implicit-function-declaration
@@ -238,24 +247,15 @@ endif
 
 LIBS := $(WHOLE_START) $(LIB_CORE) $(WHOLE_END) -lm
 
-# Use portlibs zlib if deps/ isn't being used
-ifeq ($(HAVE_ZLIB),1)
-ifeq ($(HAVE_BUILTINZLIB),0)
-   INCDIRS += -I$(DEVKITPRO)/portlibs/ppc/include
-   LIBDIRS += -L$(DEVKITPRO)/portlibs/ppc/lib
-   # Bonus: libpng for cores that need it
-   LIBS += -lpng -lz
-endif
-endif
 
 LDFLAGS += -Wl,--gc-sections
 
 RPX_LDFLAGS      := -pie -fPIE
 RPX_LDFLAGS      += -z common-page-size=64 -z max-page-size=64
-RPX_LDFLAGS      += -T wiiu/link_rpl.ld
+RPX_LDFLAGS      += -T os/wiiu/link_rpl.ld
 RPX_LDFLAGS      += -nostartfiles
 
-HBL_ELF_LDFLAGS  := -T wiiu/link_elf.ld
+HBL_ELF_LDFLAGS  := -T os/wiiu/link_elf.ld
 
 #-----------------------------
 # Compiler setup
@@ -280,7 +280,7 @@ STRIP   := $(PREFIX)strip
 NM      := $(PREFIX)nm
 LD      := $(CXX)
 
-ELF2RPL   := wiiu/wut/elf2rpl/elf2rpl
+ELF2RPL   := os/wiiu/wut/elf2rpl/elf2rpl
 
 ifneq ($(findstring Linux,$(shell uname -a)),)
 else ifneq ($(findstring Darwin,$(shell uname -a)),)
@@ -367,14 +367,14 @@ $(BUILD_DIR)/%.o: %.s %.depend
 
 $(ELF2RPL):
 	@$(if $(Q), echo MAKE $@,)
-	$(Q)$(MAKE) -C wiiu/wut/elf2rpl/
+	$(Q)$(MAKE) -C os/wiiu/wut/elf2rpl/
 
-$(BUILD_DIR)/$(TARGET).elf: $(OBJ) $(HBL_ELF_OBJ) libretro_wiiu.a wiiu/link_elf.ld .$(TARGET).elf.last
+$(BUILD_DIR)/$(TARGET).elf: $(OBJ) $(HBL_ELF_OBJ) libretro_wiiu.a os/wiiu/link_elf.ld .$(TARGET).elf.last
 	@$(if $(Q), echo LD $@,)
 	@touch .$(TARGET).elf.last
 	$(Q)$(LD) $(OBJ) $(HBL_ELF_OBJ) $(LDFLAGS) $(HBL_ELF_LDFLAGS) $(LIBDIRS) $(LIBS) -o $@
 
-$(BUILD_DIR)/$(TARGET).rpx.elf: $(OBJ) $(RPX_OBJ) libretro_wiiu.a wiiu/link_elf.ld
+$(BUILD_DIR)/$(TARGET).rpx.elf: $(OBJ) $(RPX_OBJ) libretro_wiiu.a os/wiiu/link_elf.ld
 	@$(if $(Q), echo LD $@,)
 	$(Q)$(LD) $(OBJ) $(RPX_OBJ) $(LDFLAGS) $(RPX_LDFLAGS) $(LIBDIRS)  $(LIBS) -o $@
 
@@ -394,7 +394,7 @@ clean:
 	$(Q)rm -f $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/$(TARGET).rpx.elf $(BUILD_DIR)/$(TARGET).large.rpx $(BUILD_DIR)/$(TARGET).rpx
 	$(Q)rm -f .$(TARGET).elf.last .$(TARGET).rpx.elf.last .$(TARGET).rpx.large.last .$(TARGET).rpx.last
 	$(Q)rm -f $(OBJ:.o=.depend) $(RPX_OBJ:.o=.depend) $(HBL_ELF_OBJ:.o=.depend)
-	$(Q)$(MAKE) -C wiiu/wut/elf2rpl/ clean
+	$(Q)$(MAKE) -C os/wiiu/wut/elf2rpl/ clean
 
 .PHONY: clean all
 .PRECIOUS: %.depend %.last

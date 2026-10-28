@@ -34,27 +34,37 @@
 #include <compat/strl.h>
 #include <compat/posix_string.h>
 #include <file/file_path.h>
+#include <streams/file_stream.h>
 #include <string/stdstring.h>
 #include <retro_math.h>
+#include <encodings/utf.h>
 
 #include <string.h>
 #include <retro_inline.h>
 #include <retro_math.h>
+#include <math.h>
 
+#ifndef _XBOX
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <d3d9.h>
-#include <d3dx9shader.h>
+#include "../common/d3dcompiler_common.h"
+#include "../common/d3d9_common.h"
 
-#include "d3d_shaders/opaque.hlsl.d3d9.h"
-#include "d3d9_renderchain.h"
+#include "../video_driver.h"
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
 #endif
 
+#ifdef HAVE_THREADS
+#include "../video_thread_wrapper.h"
+#endif
+
 #include <defines/d3d_defines.h>
+#include <gfx/math/matrix_4x4.h>
 #include "../common/d3d_common.h"
-#include "../common/d3d9_common.h"
-#include "../video_driver.h"
+
 #include "../../configuration.h"
 #include "../../dynamic.h"
 #include "../../frontend/frontend_driver.h"
@@ -74,12 +84,590 @@
 #include "../../verbosity.h"
 #include "../../retroarch.h"
 
+#include "d3d_shaders/shaders_common.h"
+#include "d3d_shaders/ribbon_sm3.hlsl.h"
+#include "d3d_shaders/ribbon_simple_sm3.hlsl.h"
+#include "d3d_shaders/simple_snow_sm3.hlsl.h"
+#include "d3d_shaders/snow_sm3.hlsl.h"
+#include "d3d_shaders/bokeh_sm3.hlsl.h"
+#include "d3d_shaders/snowflake_sm3.hlsl.h"
+
+static const char *stock_hlsl_program = CG(
+      void main_vertex
+      (
+         float3 position : POSITION,
+         float4 color    : COLOR,
+         float2 texCoord : TEXCOORD0,
+
+         uniform float4x4 modelViewProj,
+
+         out float4 oPosition : POSITION,
+         out float4 oColor : COLOR,
+         out float2 otexCoord : TEXCOORD
+      )
+      {
+         oPosition = mul(modelViewProj, float4(position, 1.0f));
+         oColor = color;
+         otexCoord = texCoord;
+      }
+
+      struct output
+      {
+         float4 color: COLOR;
+      };
+
+      struct input
+      {
+         float2 video_size;
+         float2 texture_size;
+         float2 output_size;
+         float frame_count;
+         float frame_direction;
+         float frame_rotation;
+      };
+
+      output main_fragment(float4 color : COLOR, float2 texCoord : TEXCOORD0,
+      uniform sampler2D decal : TEXUNIT0, uniform input IN)
+      {
+         output OUT;
+         OUT.color = color * tex2D(decal, texCoord);
+         return OUT;
+      }
+);
+
 #ifdef __WINRT__
 #error "UWP does not support D3D9"
 #endif
 
-/* TODO/FIXME - Temporary workaround for D3D9 not being able to poll flags during init */
-static gfx_ctx_driver_t d3d9_hlsl_fake_context;
+#define D3D_FILTER_LINEAR           (3 << 0)
+#define D3D_FILTER_POINT            (2 << 0)
+
+struct lut_info
+{
+   LPDIRECT3DTEXTURE9 tex;
+   char id[64];
+   bool smooth;
+};
+
+struct shader_pass
+{
+   /* The frame size the pass last built vertices for, packed. */
+   unsigned last_dims;
+   struct LinkInfo info;
+   D3DPOOL pool;
+   LPDIRECT3DTEXTURE9 tex;
+   LPDIRECT3DVERTEXBUFFER9 vertex_buf;
+   LPDIRECT3DVERTEXDECLARATION9 vertex_decl;
+   void *attrib_map;
+   void *vprg;
+   void *fprg;
+   void *vtable;
+   void *ftable;
+};
+
+#define D3D_PI 3.14159265358979323846264338327
+
+#define VECTOR_LIST_TYPE unsigned
+#define VECTOR_LIST_NAME unsigned
+#include "../../libretro-common/lists/vector_list.c"
+#undef VECTOR_LIST_TYPE
+#undef VECTOR_LIST_NAME
+
+#define VECTOR_LIST_TYPE struct lut_info
+#define VECTOR_LIST_NAME lut_info
+#include "../../libretro-common/lists/vector_list.c"
+#undef VECTOR_LIST_TYPE
+#undef VECTOR_LIST_NAME
+
+#define VECTOR_LIST_TYPE struct shader_pass
+#define VECTOR_LIST_NAME shader_pass
+#include "../../libretro-common/lists/vector_list.c"
+#undef VECTOR_LIST_TYPE
+#undef VECTOR_LIST_NAME
+
+typedef struct d3d9_hlsl_renderchain
+{
+   unsigned pixel_size;
+   uint64_t frame_count;
+   struct
+   {
+      LPDIRECT3DTEXTURE9 tex[TEXTURES];
+      LPDIRECT3DVERTEXBUFFER9 vertex_buf[TEXTURES];
+      unsigned ptr;
+      unsigned last_dims[TEXTURES];
+   } prev;
+   LPDIRECT3DDEVICE9 dev;
+   D3DVIEWPORT9 *out_vp;
+   /* The software framebuffer loan, on the main chain alone */
+   d3d9_sw_fb_t *sw_fb;
+   struct shader_pass_vector_list  *passes;
+   struct unsigned_vector_list *bound_tex;
+   struct unsigned_vector_list *bound_vert;
+   struct lut_info_vector_list *luts;
+#ifdef D3D9_HW_RENDER
+   /* The core's texture the first pass reads this frame, else NULL */
+   LPDIRECT3DTEXTURE9 hw_tex;
+   /* The first pass sized for the core's texture, not its own */
+   bool hw_sized;
+#endif
+} d3d9_hlsl_renderchain_t;
+
+static INLINE bool d3d9_hlsl_renderchain_add_lut(d3d9_hlsl_renderchain_t *chain,
+      const char *id, const char *path, bool smooth)
+{
+   struct lut_info info;
+   struct texture_image image;
+   LPDIRECT3DTEXTURE9 lut    = NULL;
+
+   memset(&image, 0, sizeof(image));
+   image.supports_rgba       = true;
+
+   if (!image_texture_load(&image, path))
+   {
+      RARCH_ERR("[D3D9] Failed to load LUT image: %s.\n", path);
+      return false;
+   }
+
+   lut = NULL;
+   d3d9_tex_create(chain->dev,
+         image.width, image.height, 1,
+         0, D3D9_ARGB8888_FORMAT,
+         (LPDIRECT3DTEXTURE9*)&lut);
+
+   if (!lut)
+   {
+      image_texture_free(&image);
+      return false;
+   }
+
+   {
+      D3DLOCKED_RECT lr;
+      if (SUCCEEDED(d3d9_tex_lock(lut, 0, &lr, NULL, 0)))
+      {
+         unsigned y;
+         uint32_t       *dst   = (uint32_t*)lr.pBits;
+         const uint32_t *src   = image.pixels;
+         unsigned        pitch = lr.Pitch >> 2;
+         for (y = 0; y < image.height; y++, dst += pitch, src += image.width)
+            memcpy(dst, src, image.width << 2);
+         d3d9_tex_unlock(lut, 0, true);
+      }
+   }
+
+   image_texture_free(&image);
+
+   RARCH_LOG("[D3D9] LUT texture loaded: %s.\n", path);
+
+   info.tex    = lut;
+   info.smooth = smooth;
+   strlcpy(info.id, id, sizeof(info.id));
+
+   IDirect3DDevice9_SetTexture(chain->dev, 0, (IDirect3DBaseTexture9*)lut);
+   IDirect3DDevice9_SetSamplerState(chain->dev, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+   IDirect3DDevice9_SetSamplerState(chain->dev, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+   IDirect3DDevice9_SetTexture(chain->dev, 0, (IDirect3DBaseTexture9*)NULL);
+
+   lut_info_vector_list_append(chain->luts, info);
+
+   return true;
+}
+
+static INLINE bool d3d9_hlsl_renderchain_set_pass_size(
+      LPDIRECT3DDEVICE9 dev,
+      struct shader_pass *pass,
+      struct shader_pass *pass2,
+      unsigned dims)
+{
+   if (pass->info.tex_dims != dims)
+   {
+      if (pass->tex)
+         IDirect3DTexture9_Release(pass->tex);
+
+      pass->info.tex_dims = dims;
+      pass->pool          = D3DPOOL_DEFAULT;
+      pass->tex           = NULL;
+      IDirect3DDevice9_CreateTexture(dev,
+            VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), 1,
+            D3DUSAGE_RENDERTARGET,
+            (pass2->info.pass->fbo.flags & FBO_SCALE_FLAG_FP_FBO)
+            ? D3DFMT_A32B32G32R32F
+            : D3D9_ARGB8888_FORMAT,
+            D3DPOOL_DEFAULT,
+            (struct IDirect3DTexture9**)&pass->tex, NULL);
+
+      if (!pass->tex)
+         return false;
+
+      IDirect3DDevice9_SetTexture(dev, 0, (IDirect3DBaseTexture9*)pass->tex);
+      IDirect3DDevice9_SetSamplerState(dev, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+      IDirect3DDevice9_SetSamplerState(dev, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+      IDirect3DDevice9_SetTexture(dev, 0, (IDirect3DBaseTexture9*)NULL);
+   }
+
+   return true;
+}
+
+/* The passes' textures sized for @shader's scales, from the frame's
+ * texture to a viewport @vp */
+static INLINE void d3d9_recompute_pass_sizes(
+      LPDIRECT3DDEVICE9 dev,
+      d3d9_hlsl_renderchain_t *chain,
+      struct video_shader *shader,
+      const D3DVIEWPORT9 *vp)
+{
+   int i;
+   struct LinkInfo link_info;
+   /* The first pass's texture is the frame's, which
+    * d3d9_hlsl_renderchain_fit_frame sizes. */
+   unsigned current_width            = VIDEO_SCALE_W(
+         chain->passes->data[0].info.tex_dims);
+   unsigned current_height           = VIDEO_SCALE_H(
+         chain->passes->data[0].info.tex_dims);
+   unsigned out_width                = 0;
+   unsigned out_height               = 0;
+
+   link_info.pass                    = &shader->pass[0];
+
+   for (i = 1; i < (int) shader->passes; i++)
+   {
+      switch (link_info.pass->fbo.type_x)
+      {
+         case RARCH_SCALE_VIEWPORT:
+            out_width = link_info.pass->fbo.scale_x * vp->Width;
+            break;
+         case RARCH_SCALE_ABSOLUTE:
+            out_width = link_info.pass->fbo.abs_x;
+            break;
+         case RARCH_SCALE_INPUT:
+            out_width = link_info.pass->fbo.scale_x * current_width;
+            break;
+      }
+      switch (link_info.pass->fbo.type_y)
+      {
+         case RARCH_SCALE_VIEWPORT:
+            out_height = link_info.pass->fbo.scale_y * vp->Height;
+            break;
+         case RARCH_SCALE_ABSOLUTE:
+            out_height = link_info.pass->fbo.abs_y;
+            break;
+         case RARCH_SCALE_INPUT:
+            out_height = link_info.pass->fbo.scale_y * current_height;
+            break;
+      }
+
+      link_info.tex_dims = VIDEO_SCALE_PACK(next_pow2(out_width),
+            next_pow2(out_height));
+
+      if (!d3d9_hlsl_renderchain_set_pass_size(dev,
+               (struct shader_pass*)&chain->passes->data[i],
+               (struct shader_pass*)&chain->passes->data[
+               chain->passes->count - 1],
+               link_info.tex_dims))
+      {
+         RARCH_ERR("[D3D9] Failed to set pass size.\n");
+         return;
+      }
+
+      current_width  = out_width;
+      current_height = out_height;
+
+      link_info.pass = &shader->pass[i];
+   }
+}
+
+/* The frame's textures grown to hold a frame of @width x @height, past
+ * the size the core declared; false if they couldn't be, and the frame
+ * is cut to them. */
+static bool d3d9_hlsl_renderchain_fit_frame(d3d9_hlsl_renderchain_t *chain,
+      unsigned width, unsigned height)
+{
+   unsigned i, tw, th;
+   D3DSURFACE_DESC desc;
+   struct shader_pass *first = (struct shader_pass*)&chain->passes->data[0];
+   tw = VIDEO_SCALE_W(first->info.tex_dims);
+   th = VIDEO_SCALE_H(first->info.tex_dims);
+   if (width <= tw && height <= th)
+      return true;
+   if (FAILED(IDirect3DTexture9_GetLevelDesc(chain->prev.tex[0], 0, &desc)))
+      return false;
+   tw = next_pow2(MAX(width, tw));
+   th = next_pow2(MAX(height, th));
+   for (i = 0; i < TEXTURES; i++)
+   {
+      LPDIRECT3DTEXTURE9 tex = NULL;
+      if (FAILED(d3d9_tex_create(chain->dev, tw, th, 1, 0,
+                  desc.Format,
+                  (LPDIRECT3DTEXTURE9*)&tex)))
+         return false;
+      d3d9_sw_fb_release(chain->sw_fb, chain->prev.tex[i]);
+      chain->prev.tex[i]       = tex;
+      chain->prev.last_dims[i] = 0;
+   }
+   first->tex             = chain->prev.tex[chain->prev.ptr];
+   first->last_dims       = 0;
+   first->info.tex_dims   = VIDEO_SCALE_PACK(tw, th);
+   return true;
+}
+
+/* =====================================================================
+ * SM3.0 CTAB (Constant Table) parser
+ *
+ * Parses the CTAB embedded in compiled SM3.0 shader bytecode to find
+ * hardware register indices by uniform name.
+ * ===================================================================== */
+
+#define CTAB_REGSET_FLOAT4  2
+#define CTAB_REGSET_SAMPLER 3
+#define CTAB_NOT_FOUND      ((int)-1)
+
+static int d3d9_hlsl_ctab_find_register(
+      const DWORD *bytecode, size_t bytecode_dwords,
+      const char *name, int *out_regset, int *out_count)
+{
+   size_t pos;
+   const DWORD CTAB_TAG = 0x42415443; /* 'CTAB' */
+
+   if (out_regset)
+      *out_regset = -1;
+   if (out_count)
+      *out_count = 0;
+   if (!bytecode || bytecode_dwords < 2 || !name || !*name)
+      return CTAB_NOT_FOUND;
+
+   for (pos = 1; pos < bytecode_dwords; )
+   {
+      DWORD token  = bytecode[pos];
+      DWORD opcode = token & 0xFFFF;
+
+      if (opcode == 0xFFFF)
+         break;
+
+      if (opcode == 0xFFFE)
+      {
+         DWORD comment_dwords = (token >> 16) & 0x7FFF;
+         size_t comment_bytes;
+
+         if (pos + 1 + comment_dwords > bytecode_dwords)
+            break;
+
+         comment_bytes = comment_dwords * sizeof(DWORD);
+
+         if (comment_dwords >= 6 && bytecode[pos + 1] == CTAB_TAG)
+         {
+            const uint8_t *ctab_start = (const uint8_t*)&bytecode[pos + 1];
+            size_t ctab_total_bytes   = comment_bytes;
+            const uint8_t *hdr        = ctab_start + 4;
+            size_t hdr_avail          = ctab_total_bytes - 4;
+            DWORD num_constants;
+            DWORD const_info_offset;
+            DWORD ci;
+
+            if (hdr_avail < 28)
+               return CTAB_NOT_FOUND;
+
+            num_constants     = *(const DWORD*)(hdr + 12);
+            const_info_offset = *(const DWORD*)(hdr + 16);
+
+            for (ci = 0; ci < num_constants; ci++)
+            {
+               size_t entry_off = const_info_offset + ci * 20;
+               const uint8_t *entry;
+               DWORD name_offset;
+               WORD  reg_set, reg_index;
+               const char *cname;
+
+               if (entry_off + 20 > hdr_avail)
+                  break;
+
+               entry       = hdr + entry_off;
+               name_offset = *(const DWORD*)(entry + 0);
+               reg_set     = *(const WORD*)(entry + 4);
+               reg_index   = *(const WORD*)(entry + 6);
+
+               if (name_offset >= hdr_avail)
+                  continue;
+
+               cname = (const char*)(hdr + name_offset);
+
+               /* D3DCompile with backwards compat may prefix names with '$' */
+               if (string_is_equal(cname, name)
+                     || (cname[0] == '$' && string_is_equal(cname + 1, name)))
+               {
+                  if (out_regset)
+                     *out_regset = (int)reg_set;
+                  if (out_count)
+                     *out_count = (int)*(const WORD*)(entry + 8);
+                  return (int)reg_index;
+               }
+            }
+            return CTAB_NOT_FOUND;
+         }
+
+         pos += 1 + comment_dwords;
+         continue;
+      }
+
+      pos++;
+   }
+
+   return CTAB_NOT_FOUND;
+}
+
+
+static INLINE void d3d9_hlsl_set_vs_const(LPDIRECT3DDEVICE9 dev,
+      int reg, const float *data, unsigned float4_count)
+{
+   if (reg >= 0)
+      IDirect3DDevice9_SetVertexShaderConstantF(dev, reg, data, float4_count);
+}
+
+static INLINE void d3d9_hlsl_set_ps_const(LPDIRECT3DDEVICE9 dev,
+      int reg, const float *data, unsigned float4_count)
+{
+   if (reg >= 0)
+      IDirect3DDevice9_SetPixelShaderConstantF(dev, reg, data, float4_count);
+}
+
+typedef struct hlsl_uniform_map
+{
+   int mvp;
+   int video_size;
+   int texture_size;
+   int output_size;
+   int frame_count;
+   int orig_video_size;
+   int orig_texture_size;
+   int orig_texture;
+   int prev_video_size[TEXTURES - 1];
+   int prev_texture_size[TEXTURES - 1];
+   int prev_texture[TEXTURES - 1];
+   int pass_video_size[GFX_MAX_SHADERS];
+   int pass_texture_size[GFX_MAX_SHADERS];
+   int pass_texture[GFX_MAX_SHADERS];
+} hlsl_uniform_map_t;
+
+static void hlsl_uniform_map_init(hlsl_uniform_map_t *map)
+{
+   memset(map, 0xFF, sizeof(*map)); /* -1 = not found */
+}
+
+static void hlsl_uniform_map_from_bytecode(
+      hlsl_uniform_map_t *map,
+      const DWORD *bytecode, size_t bytecode_dwords)
+{
+   int i;
+   char attr[64];
+   static const char *prev_names[] = {
+      "PREV", "PREV1", "PREV2", "PREV3", "PREV4", "PREV5", "PREV6"
+   };
+
+   hlsl_uniform_map_init(map);
+   if (!bytecode)
+      return;
+
+   map->mvp          = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "modelViewProj", NULL, NULL);
+   map->video_size   = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "IN.video_size", NULL, NULL);
+   map->texture_size = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "IN.texture_size", NULL, NULL);
+   map->output_size  = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "IN.output_size", NULL, NULL);
+   map->frame_count  = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "IN.frame_count", NULL, NULL);
+
+   /* If individual IN.* lookups failed, check if the struct is
+    * registered as a single "IN" entry. D3DCompile packs struct
+    * members into consecutive float4 registers:
+    *   c[N+0] = { video_size.x, video_size.y, texture_size.x, texture_size.y }
+    *   c[N+1] = { output_size.x, output_size.y, frame_count, frame_direction }
+    */
+   if (map->video_size < 0 && map->texture_size < 0)
+   {
+      int in_cnt = 0;
+      int in_reg = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "IN", NULL, &in_cnt);
+      if (in_reg >= 0)
+      {
+         if (in_cnt >= 3)
+         {
+            /* Per-member packing (cnt >= 3):
+             * c[N+0] = { video_size.x, video_size.y, 0, 0 }
+             * c[N+1] = { texture_size.x, texture_size.y, 0, 0 }
+             * c[N+2] = { output_size.x, output_size.y, 0, 0 }
+             * For cnt==4:
+             * c[N+3] = { frame_count, frame_direction, 0, 0 }
+             * For cnt==3, frame_count is packed into c[N+2].z */
+            map->video_size   = in_reg;
+            map->texture_size = in_reg + 1;
+            map->output_size  = in_reg + 2;
+            map->frame_count  = (in_cnt >= 4) ? in_reg + 3 : in_reg + 2;
+         }
+         else
+         {
+            /* Tight packing (cnt <= 2):
+             * c[N+0] = { video_size.x, video_size.y, texture_size.x, texture_size.y }
+             * c[N+1] = { output_size.x, output_size.y, frame_count, frame_direction } */
+            map->video_size   = in_reg;
+            map->texture_size = in_reg;
+            map->output_size  = in_reg + 1;
+            map->frame_count  = in_reg + 1;
+         }
+      }
+   }
+   map->orig_video_size   = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "ORIG.video_size", NULL, NULL);
+   map->orig_texture_size = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "ORIG.texture_size", NULL, NULL);
+   map->orig_texture      = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "ORIG.texture", NULL, NULL);
+   /* Fallback: decomposed sampler names (ORIG__texture instead of ORIG.texture) */
+   if (map->orig_texture < 0)
+      map->orig_texture   = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, "ORIG__texture", NULL, NULL);
+
+   for (i = 0; i < TEXTURES - 1; i++)
+   {
+      size_t _len = strlcpy(attr, prev_names[i], sizeof(attr));
+      strlcpy_lit(attr + _len, ".video_size",   sizeof(attr) - _len);
+      map->prev_video_size[i]   = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      strlcpy_lit(attr + _len, ".texture_size", sizeof(attr) - _len);
+      map->prev_texture_size[i] = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      strlcpy_lit(attr + _len, ".texture",      sizeof(attr) - _len);
+      map->prev_texture[i]      = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      /* Fallback: decomposed sampler name */
+      if (map->prev_texture[i] < 0)
+      {
+         strlcpy_lit(attr + _len, "__texture",  sizeof(attr) - _len);
+         map->prev_texture[i]   = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      }
+   }
+
+   for (i = 0; i < GFX_MAX_SHADERS; i++)
+   {
+      size_t _len = snprintf(attr, sizeof(attr), "PASS%u", i + 1);
+      strlcpy_lit(attr + _len, ".video_size",   sizeof(attr) - _len);
+      map->pass_video_size[i]   = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      strlcpy_lit(attr + _len, ".texture_size", sizeof(attr) - _len);
+      map->pass_texture_size[i] = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      strlcpy_lit(attr + _len, ".texture",      sizeof(attr) - _len);
+      map->pass_texture[i]      = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      /* Fallback: decomposed sampler name */
+      if (map->pass_texture[i] < 0)
+      {
+         strlcpy_lit(attr + _len, "__texture",  sizeof(attr) - _len);
+         map->pass_texture[i]   = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, attr, NULL, NULL);
+      }
+   }
+}
+
+typedef struct hlsl_pass_data
+{
+   DWORD *vs_bytecode;
+   DWORD *ps_bytecode;
+   size_t vs_bytecode_dwords;
+   size_t ps_bytecode_dwords;
+   hlsl_uniform_map_t vs_map;
+   hlsl_uniform_map_t ps_map;
+} hlsl_pass_data_t;
+
+static void hlsl_pass_data_free(hlsl_pass_data_t *pd)
+{
+   if (pd->vs_bytecode) { free(pd->vs_bytecode); pd->vs_bytecode = NULL; }
+   if (pd->ps_bytecode) { free(pd->ps_bytecode); pd->ps_bytecode = NULL; }
+   pd->vs_bytecode_dwords = 0;
+   pd->ps_bytecode_dwords = 0;
+}
 
 /* BEGIN HLSL RENDERCHAIN */
 
@@ -87,9 +675,70 @@ static gfx_ctx_driver_t d3d9_hlsl_fake_context;
 
 typedef struct hlsl_renderchain
 {
-   struct d3d9_renderchain chain;
+   struct d3d9_hlsl_renderchain chain;
    struct shader_pass stock_shader;
+   /* Per-pass HLSL uniform data for shader presets */
+   hlsl_pass_data_t pass_data[GFX_MAX_SHADERS + 1];
+   unsigned pass_data_count;
+   hlsl_pass_data_t stock_data;
+   /* XMB pipeline shaders */
+   struct shader_pass pipeline_shaders[6]; /* MENU..MENU_6 */
+   hlsl_pass_data_t  pipeline_data[6];
+   /* Which menu effects' programs are compiled, and which have been
+    * tried; one bit each, MENU at bit 0 */
+   uint8_t           pipeline_ready;
+   uint8_t           pipeline_tried;
+   /* A view's chain: its view, the viewport its passes are sized for,
+    * that viewport's size packed, its last pass's input size, and
+    * whether it ran this frame */
+   D3DVIEWPORT9      view_vp;
+   unsigned          view;
+   unsigned          sized_dims;
+   unsigned          last_dims;
+   bool              ran;
 } hlsl_renderchain_t;
+
+static bool hlsl_d3d9_pipeline_ready(hlsl_renderchain_t *chain,
+      LPDIRECT3DDEVICE9 dev, unsigned idx);
+static bool d3d9_hlsl_load_program_ex(
+      LPDIRECT3DDEVICE9 dev,
+      struct shader_pass *pass,
+      const char *prog,
+      hlsl_pass_data_t *pd);
+
+/* Pipeline vertex buffer for menu shader effects (VIDEO_SHADER_MENU, etc.).
+ * Stored as a file-static since the d3d9 menu_display struct
+ * does not have a pipeline_vbo member like d3d10_video_t does. */
+static LPDIRECT3DVERTEXBUFFER9 d3d9_hlsl_menu_pipeline_vbo = NULL;
+static LPDIRECT3DVERTEXBUFFER9 d3d9_hlsl_menu_fullscreen_vbo = NULL;
+static LPDIRECT3DVERTEXDECLARATION9 d3d9_hlsl_pipeline_decl = NULL;
+static LPDIRECT3DVERTEXDECLARATION9 d3d9_hlsl_overlay_decl = NULL;
+
+static void d3d9_vertex_buffer_free(void *vertex_data, void *vertex_declaration)
+{
+   if (vertex_data)
+   {
+      LPDIRECT3DVERTEXBUFFER9 buf =
+         (LPDIRECT3DVERTEXBUFFER9)vertex_data;
+      IDirect3DVertexBuffer9_Release(buf);
+      buf = NULL;
+   }
+
+   if (vertex_declaration)
+   {
+      LPDIRECT3DVERTEXDECLARATION9 vertex_decl =
+         (LPDIRECT3DVERTEXDECLARATION9)vertex_declaration;
+      IDirect3DVertexDeclaration9_Release(vertex_decl);
+      vertex_decl = NULL;
+   }
+}
+
+/* Forward declarations for functions used by display driver
+ * but defined in the video driver section below. */
+static INLINE void d3d9_hlsl_set_param_1f(
+      const DWORD *bytecode, size_t bytecode_dwords,
+      bool is_vertex,
+      LPDIRECT3DDEVICE9 dev, const char *name, const void *value);
 
 /*
  * DISPLAY DRIVER
@@ -109,42 +758,7 @@ static const float d3d9_hlsl_tex_coords[8] = {
    1, 0
 };
 
-static const float *gfx_display_d3d9_hlsl_get_default_vertices(void)
-{
-   return &d3d9_hlsl_vertexes[0];
-}
-
-static const float *gfx_display_d3d9_hlsl_get_default_tex_coords(void)
-{
-   return &d3d9_hlsl_tex_coords[0];
-}
-
-static void *gfx_display_d3d9_hlsl_get_default_mvp(void *data)
-{
-   static float id[16] =       { 1.0f, 0.0f, 0.0f, 0.0f,
-                                 0.0f, 1.0f, 0.0f, 0.0f,
-                                 0.0f, 0.0f, 1.0f, 0.0f,
-                                 0.0f, 0.0f, 0.0f, 1.0f
-                               };
-   return &id;
-}
-
-static INT32 gfx_display_prim_to_d3d9_hlsl_enum(
-      enum gfx_display_prim_type prim_type)
-{
-   switch (prim_type)
-   {
-      case GFX_DISPLAY_PRIM_TRIANGLES:
-      case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
-         return D3DPT_COMM_TRIANGLESTRIP;
-      case GFX_DISPLAY_PRIM_NONE:
-      default:
-         break;
-   }
-
-   /* TODO/FIXME - hack */
-   return 0;
-}
+static LPDIRECT3DTEXTURE9 d3d9_hlsl_white_texture = NULL;
 
 static void gfx_display_d3d9_hlsl_blend_begin(void *data)
 {
@@ -171,27 +785,35 @@ static void gfx_display_d3d9_bind_texture(gfx_display_ctx_draw_t *draw,
 {
    LPDIRECT3DDEVICE9 dev = d3d->dev;
 
-   IDirect3DDevice9_SetTexture(dev, 0,
-         (IDirect3DBaseTexture9*)draw->texture);
+   if (draw->texture)
+      IDirect3DDevice9_SetTexture(dev, 0,
+            (IDirect3DBaseTexture9*)draw->texture);
+   else if (d3d9_hlsl_white_texture)
+      IDirect3DDevice9_SetTexture(dev, 0,
+            (IDirect3DBaseTexture9*)d3d9_hlsl_white_texture);
+   else
+      IDirect3DDevice9_SetTexture(dev, 0, NULL);
+
    IDirect3DDevice9_SetSamplerState(dev,
-         0, D3DSAMP_ADDRESSU, D3DTADDRESS_COMM_CLAMP);
+         0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
    IDirect3DDevice9_SetSamplerState(dev,
-         0, D3DSAMP_ADDRESSV, D3DTADDRESS_COMM_CLAMP);
+         0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
    IDirect3DDevice9_SetSamplerState(dev,
-         0, D3DSAMP_MINFILTER, D3DTEXF_COMM_LINEAR);
+         0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
    IDirect3DDevice9_SetSamplerState(dev,
-         0, D3DSAMP_MAGFILTER, D3DTEXF_COMM_LINEAR);
+         0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
    IDirect3DDevice9_SetSamplerState(dev, 0,
-         D3DSAMP_MIPFILTER, D3DTEXF_COMM_LINEAR);
+         D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
 }
 
 static void gfx_display_d3d9_hlsl_draw(gfx_display_ctx_draw_t *draw,
-      void *data, unsigned video_width, unsigned video_height)
+      void *data, unsigned video_dims)
 {
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
    unsigned i;
-   math_matrix_4x4 mop, m1, m2;
    LPDIRECT3DDEVICE9 dev;
-   D3DPRIMITIVETYPE type;
+   bool has_vertex_data;
    unsigned start                = 0;
    unsigned count                = 0;
    d3d9_video_t *d3d             = (d3d9_video_t*)data;
@@ -200,21 +822,276 @@ static void gfx_display_d3d9_hlsl_draw(gfx_display_ctx_draw_t *draw,
    const float *tex_coord        = NULL;
    const float *color            = NULL;
 
-   if (!d3d || !draw || draw->pipeline_id)
+   if (!d3d || !draw)
       return;
 
    dev                           = d3d->dev;
 
-   if ((d3d->menu_display.offset + draw->coords->vertices )
-         > (unsigned)d3d->menu_display.size)
+   switch (draw->pipeline_id)
+   {
+      case VIDEO_SHADER_MENU:
+      case VIDEO_SHADER_MENU_2:
+      case VIDEO_SHADER_MENU_3:
+      case VIDEO_SHADER_MENU_4:
+      case VIDEO_SHADER_MENU_5:
+      case VIDEO_SHADER_MENU_6:
+      {
+         hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+
+         /* Compiled by the pipeline call before this, or not at all */
+         if (_chain && (_chain->pipeline_ready
+                  & (1u << (VIDEO_SHADER_MENU - draw->pipeline_id))))
+         {
+            unsigned idx = VIDEO_SHADER_MENU - draw->pipeline_id;
+            struct shader_pass *shader = &_chain->pipeline_shaders[idx];
+
+            IDirect3DDevice9_SetVertexShader(dev,
+                  (LPDIRECT3DVERTEXSHADER9)shader->vprg);
+            IDirect3DDevice9_SetPixelShader(dev,
+                  (LPDIRECT3DPIXELSHADER9)shader->fprg);
+            IDirect3DDevice9_SetVertexDeclaration(dev,
+                  (LPDIRECT3DVERTEXDECLARATION9)d3d->menu_display.decl);
+
+            /* Snow/bokeh/snowflake need MVP matrix set */
+            if (draw->pipeline_id <= VIDEO_SHADER_MENU_3)
+            {
+               hlsl_pass_data_t *pd = &_chain->pipeline_data[idx];
+               /* Row-major ortho for mul(matrix, vector) in shader.
+                * D3D9 SetVertexShaderConstantF stores rows sequentially.
+                * mul(M, v) computes dot(row[i], v) — correct with row-major.
+                * Maps X [0,1]→[-1,1], Y [0,1]→[-1,1], Z pass-through. */
+               static const float ortho_mvp[16] = {
+                   2.0f,  0.0f, 0.0f, 0.0f,
+                   0.0f,  2.0f, 0.0f, 0.0f,
+                   0.0f,  0.0f, 1.0f, 0.0f,
+                  -1.0f, -1.0f, 0.0f, 1.0f
+               };
+               {
+                  int reg = d3d9_hlsl_ctab_find_register(
+                        pd->vs_bytecode, pd->vs_bytecode_dwords,
+                        "modelViewProj", NULL, NULL);
+                  if (reg >= 0)
+                     d3d9_hlsl_set_vs_const(dev, reg, ortho_mvp, 4);
+               }
+            }
+
+            IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP,
+                  0, draw->coords->vertices - 2);
+         }
+         else if (_chain)
+         {
+            /* Fallback to stock shader */
+            IDirect3DDevice9_SetVertexShader(dev,
+                  (LPDIRECT3DVERTEXSHADER9)(&_chain->stock_shader)->vprg);
+            IDirect3DDevice9_SetPixelShader(dev,
+                  (LPDIRECT3DPIXELSHADER9)(&_chain->stock_shader)->fprg);
+            IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP,
+                  0, draw->coords->vertices - 2);
+         }
+
+         /* Re-enable alpha blending after pipeline draw */
+         IDirect3DDevice9_SetRenderState(dev,
+               D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA);
+         IDirect3DDevice9_SetRenderState(dev,
+               D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+         IDirect3DDevice9_SetRenderState(dev,
+               D3DRS_ALPHABLENDENABLE, true);
+
+         /* Restore menu display vertex buffer state */
+         IDirect3DDevice9_SetStreamSource(dev, 0,
+               (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+               0, sizeof(Vertex));
+         IDirect3DDevice9_SetVertexDeclaration(dev,
+               (LPDIRECT3DVERTEXDECLARATION9)d3d->menu_display.decl);
+
+         /* Restore stock shader and its constants so subsequent
+          * non-pipeline draws (text, icons) work correctly. */
+         if (_chain)
+         {
+            IDirect3DDevice9_SetVertexShader(dev,
+                  (LPDIRECT3DVERTEXSHADER9)(&_chain->stock_shader)->vprg);
+            IDirect3DDevice9_SetPixelShader(dev,
+                  (LPDIRECT3DPIXELSHADER9)(&_chain->stock_shader)->fprg);
+         }
+         return;
+      }
+      default:
+         break;
+   }
+
+   /* Determine whether caller provides explicit vertex arrays or
+    * expects us to build the quad from draw->pos and draw->dims
+    * (the single-sprite path used by Ozone and other modern menus).
+    * Mirrors the d3d10 vertex_count==1 vs multi-vertex split. */
+   has_vertex_data = draw->coords->vertex
+      && draw->coords->tex_coord && draw->coords->color;
+
+   if (!has_vertex_data)
+   {
+      /* Single-sprite path: no explicit vertex arrays provided.
+       * Build a quad directly from draw->pos and draw->dims in
+       * normalized [0,1] space, written straight into the menu's
+       * vertex buffer (a stack copy for DrawPrimitiveUP if it
+       * cannot be locked). */
+      D3DCOLOR col[4];
+      Vertex quad_up[4];
+      Vertex *quad;
+      unsigned vb_start;
+      float x1, y1, x2, y2;
+      const float *c = draw->coords->color;
+
+      /* Per-vertex colors: map the 16-float color array directly
+       * to the 4 quad vertices in order. */
+      /* The color array is laid out for bottom-up coordinates
+       * (vertex 0,1 = bottom, vertex 2,3 = top) as used by d3d10/d3d11.
+       * Since this path un-flips Y (top-down ortho), swap the top and
+       * bottom vertex color pairs so gradients render correctly. */
+      if (c)
+      {
+         col[0] = D3DCOLOR_ARGB((int)(c[11]*0xFF), (int)(c[ 8]*0xFF), (int)(c[ 9]*0xFF), (int)(c[10]*0xFF));
+         col[1] = D3DCOLOR_ARGB((int)(c[15]*0xFF), (int)(c[12]*0xFF), (int)(c[13]*0xFF), (int)(c[14]*0xFF));
+         col[2] = D3DCOLOR_ARGB((int)(c[ 3]*0xFF), (int)(c[ 0]*0xFF), (int)(c[ 1]*0xFF), (int)(c[ 2]*0xFF));
+         col[3] = D3DCOLOR_ARGB((int)(c[ 7]*0xFF), (int)(c[ 4]*0xFF), (int)(c[ 5]*0xFF), (int)(c[ 6]*0xFF));
+      }
+      else
+      {
+         col[0] = col[1] = col[2] = col[3] = D3DCOLOR_ARGB(0xFF, 0xFF, 0xFF, 0xFF);
+      }
+
+      vb_start = 0;
+      if (!(quad = d3d9_menu_vbuf_map(d3d, 4, &vb_start)))
+         quad = quad_up;
+
+      /* Normalize to [0,1] range.
+       * Both ozone_draw_icon and gfx_display_draw_quad pre-flip Y
+       * (the packed y is height - y - h). The Y-flip here undoes that,
+       * then topdown_ortho applies the correct top-down mapping. */
+      x1 = VIDEO_POS_X(draw->pos) / (float)video_width;
+      y1 = (float)VIDEO_POS_FLIP_Y(video_height, draw->pos, draw->dims) / (float)video_height;
+      x2 = (VIDEO_POS_X(draw->pos) + VIDEO_SCALE_W(draw->dims))  / (float)video_width;
+      y2 = ((float)video_height - VIDEO_POS_Y(draw->pos)) / (float)video_height;
+
+      /* Apply scale_factor: scale the quad around its center,
+       * matching D3D10's geometry shader params.scaling behavior. */
+      if (draw->scale_factor && draw->scale_factor != 1.0f)
+      {
+         float cx = (x1 + x2) * 0.5f;
+         float cy = (y1 + y2) * 0.5f;
+         float hw = (x2 - x1) * 0.5f * draw->scale_factor;
+         float hh = (y2 - y1) * 0.5f * draw->scale_factor;
+         x1 = cx - hw;
+         y1 = cy - hh;
+         x2 = cx + hw;
+         y2 = cy + hh;
+      }
+
+      /* Apply draw->rotation around the quad center.  Rotation is
+       * computed in pixel space (using VIDEO_SCALE_W(draw->dims) / VIDEO_SCALE_H(draw->dims) as
+       * the icon's true square extents) and then converted back to
+       * normalised [0,1], so a non-square viewport does not skew the
+       * rotated icon. */
+      if (draw->rotation != 0.0f)
+      {
+         float cx     = (x1 + x2) * 0.5f;
+         float cy     = (y1 + y2) * 0.5f;
+         float half_w = VIDEO_SCALE_W(draw->dims) * 0.5f;
+         float half_h = VIDEO_SCALE_H(draw->dims) * 0.5f;
+         if (draw->scale_factor && draw->scale_factor != 1.0f)
+         {
+            half_w *= draw->scale_factor;
+            half_h *= draw->scale_factor;
+         }
+         {
+            float c            = cosf(draw->rotation);
+            float s            = sinf(draw->rotation);
+            float inv_vw       = 1.0f / (float)video_width;
+            float inv_vh       = 1.0f / (float)video_height;
+            /* Pixel-space corner offsets (dx, dy) for each of the
+             * four quad vertices.  Order matches the (x1,y1)..
+             * (x2,y2) layout used immediately below. */
+            float ox[4], oy[4];
+            float rx[4], ry[4];
+            int   k;
+            /* Assigned, not initialised: C89 wants constant initialisers */
+            ox[0] = -half_w; ox[1] =  half_w; ox[2] = -half_w; ox[3] =  half_w;
+            oy[0] = -half_h; oy[1] = -half_h; oy[2] =  half_h; oy[3] =  half_h;
+            for (k = 0; k < 4; k++)
+            {
+               rx[k] = (ox[k] * c - oy[k] * s) * inv_vw;
+               ry[k] = (ox[k] * s + oy[k] * c) * inv_vh;
+            }
+            quad[0].x = cx + rx[2]; quad[0].y = cy + ry[2]; quad[0].z = 0.5f;
+            quad[0].u = 0.0f; quad[0].v = 1.0f; quad[0].color = col[2];
+
+            quad[1].x = cx + rx[3]; quad[1].y = cy + ry[3]; quad[1].z = 0.5f;
+            quad[1].u = 1.0f; quad[1].v = 1.0f; quad[1].color = col[3];
+
+            quad[2].x = cx + rx[0]; quad[2].y = cy + ry[0]; quad[2].z = 0.5f;
+            quad[2].u = 0.0f; quad[2].v = 0.0f; quad[2].color = col[0];
+
+            quad[3].x = cx + rx[1]; quad[3].y = cy + ry[1]; quad[3].z = 0.5f;
+            quad[3].u = 1.0f; quad[3].v = 0.0f; quad[3].color = col[1];
+         }
+      }
+      else
+      {
+         quad[0].x = x1; quad[0].y = y2; quad[0].z = 0.5f;
+         quad[0].u = 0.0f; quad[0].v = 1.0f; quad[0].color = col[2];
+
+         quad[1].x = x2; quad[1].y = y2; quad[1].z = 0.5f;
+         quad[1].u = 1.0f; quad[1].v = 1.0f; quad[1].color = col[3];
+
+         quad[2].x = x1; quad[2].y = y1; quad[2].z = 0.5f;
+         quad[2].u = 0.0f; quad[2].v = 0.0f; quad[2].color = col[0];
+
+         quad[3].x = x2; quad[3].y = y1; quad[3].z = 0.5f;
+         quad[3].u = 1.0f; quad[3].v = 0.0f; quad[3].color = col[1];
+      }
+
+      /* Top-down ortho: maps X [0,1]→[-1,1], Y [0,1]→[1,-1] (Y=0 at top).
+       * Row-major layout for mul(vector, matrix) in the stock HLSL vertex shader.
+       * Translation goes in the 4th row (D3D convention). */
+      {
+         static const float topdown_ortho[16] = {
+             2.0f,  0.0f, 0.0f, 0.0f,
+             0.0f, -2.0f, 0.0f, 0.0f,
+             0.0f,  0.0f, 1.0f, 0.0f,
+            -1.0f,  1.0f, 0.0f, 1.0f
+         };
+         IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev,
+               0, topdown_ortho, 4);
+      }
+
+      gfx_display_d3d9_bind_texture(draw, d3d);
+
+      if (quad != quad_up)
+      {
+         d3d9_menu_vbuf_unmap(d3d);
+         IDirect3DDevice9_SetStreamSource(dev, 0,
+               (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+               0, sizeof(Vertex));
+         IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP,
+               vb_start, 2);
+         return;
+      }
+
+      IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP,
+            2, quad, sizeof(Vertex));
+
+      /* DrawPrimitiveUP unbinds the stream source, re-bind it */
+      IDirect3DDevice9_SetStreamSource(dev, 0,
+            (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+            0, sizeof(Vertex));
+      return;
+   }
+
+   /* Multi-vertex path: explicit vertex/tex_coord/color arrays, a
+    * strip of at least three */
+   if (draw->coords->vertices < 3)
+      return;
+   if (!(pv = d3d9_menu_vbuf_map(d3d, draw->coords->vertices, &start)))
       return;
 
-   IDirect3DVertexBuffer9_Lock((LPDIRECT3DVERTEXBUFFER9)
-            d3d->menu_display.buffer, 0, 0, (void**)&pv, 0);
-   if (!pv)
-      return;
-
-   pv          += d3d->menu_display.offset;
    vertex       = draw->coords->vertex;
    tex_coord    = draw->coords->tex_coord;
    color        = draw->coords->color;
@@ -247,99 +1124,278 @@ static void gfx_display_d3d9_hlsl_draw(gfx_display_ctx_draw_t *draw,
                colors[2]  /* B */
                );
    }
-   IDirect3DVertexBuffer9_Unlock((LPDIRECT3DVERTEXBUFFER9)
-         d3d->menu_display.buffer);
+   d3d9_menu_vbuf_unmap(d3d);
 
-   if (!draw->matrix_data)
-      draw->matrix_data = gfx_display_d3d9_hlsl_get_default_mvp(d3d);
+   /* Multi-vertex coords from gfx_display_draw_texture_slice and
+    * similar are in bottom-up [0,1] space (Y=0 at bottom), matching
+    * D3D10's VIDEO_SHADER_STOCK_BLEND ortho.
+    * Use bottom-up ortho: X [0,1]→[-1,1], Y [0,1]→[-1,1]. */
+   {
+      /* Row-major layout for mul(vector, matrix) in the stock HLSL vertex shader. */
+      static const float bottomup_ortho[16] = {
+          2.0f,  0.0f, 0.0f, 0.0f,
+          0.0f,  2.0f, 0.0f, 0.0f,
+          0.0f,  0.0f, 1.0f, 0.0f,
+         -1.0f, -1.0f, 0.0f, 1.0f
+      };
+      IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev,
+            0, bottomup_ortho, 4);
+   }
 
-   /* ugh */
-   matrix_4x4_scale(m1,       2.0,  2.0, 0);
-   matrix_4x4_translate(mop, -1.0, -1.0, 0);
-   matrix_4x4_multiply(m2, mop, m1);
-   matrix_4x4_multiply(m1,
-         *((math_matrix_4x4*)draw->matrix_data), m2);
-   matrix_4x4_scale(mop,
-         (draw->width  / 2.0) / video_width,
-         (draw->height / 2.0) / video_height, 0);
-   matrix_4x4_multiply(m2, mop, m1);
-   matrix_4x4_translate(mop,
-         (draw->x + (draw->width  / 2.0)) / video_width,
-         (draw->y + (draw->height / 2.0)) / video_height,
-         0);
-   matrix_4x4_multiply(m1, mop, m2);
-   matrix_4x4_multiply(m2, d3d->mvp_transposed, m1);
+   /* Untextured strips (batched quads) take the white texture, not
+    * whatever the font renderer left bound */
+   gfx_display_d3d9_bind_texture(draw, d3d);
 
-   IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev,
-         0, (const float*)&m2, 4);
+   count = draw->coords->vertices - 2;
 
-   if (draw && draw->texture)
-      gfx_display_d3d9_bind_texture(draw, d3d);
-
-   type  = (D3DPRIMITIVETYPE)gfx_display_prim_to_d3d9_hlsl_enum(draw->prim_type);
-   start = d3d->menu_display.offset;
-   count = draw->coords->vertices -
-         ((draw->prim_type == GFX_DISPLAY_PRIM_TRIANGLESTRIP)
-          ? 2 : 0);
-
-   IDirect3DDevice9_BeginScene(dev);
-   IDirect3DDevice9_DrawPrimitive(dev, type, start, count);
-   IDirect3DDevice9_EndScene(dev);
-
-   d3d->menu_display.offset += draw->coords->vertices;
+   IDirect3DDevice9_SetStreamSource(dev, 0,
+         (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+         0, sizeof(Vertex));
+   IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP, start, count);
 }
 
 static void gfx_display_d3d9_hlsl_draw_pipeline(
       gfx_display_ctx_draw_t *draw,
       gfx_display_t *p_disp,
-      void *data, unsigned video_width, unsigned video_height)
+      void *data, unsigned video_dims)
 {
-   static float t                    = 0;
-   video_coord_array_t *ca           = NULL;
+   static float t                        = 0.0f;
+   struct video_coords *ca               = NULL;
+   d3d9_video_t *d3d                     = (d3d9_video_t*)data;
 
-   if (!draw)
+   if (!d3d || !draw)
       return;
 
-   ca                                = &p_disp->dispca;
+   ca                                    = gfx_display_effect_coords(p_disp);
 
-   draw->x                           = 0;
-   draw->y                           = 0;
-   draw->coords                      = NULL;
-   draw->matrix_data                 = NULL;
+   if (!ca)
+
+      return;
+
+   draw->pos                             = VIDEO_POS_PACK(0, 0);
+   draw->coords                          = NULL;
+   draw->matrix_data                     = NULL;
 
    if (ca)
-      draw->coords                   = (struct video_coords*)&ca->coords;
+      draw->coords                       = ca;
 
    switch (draw->pipeline_id)
    {
       case VIDEO_SHADER_MENU:
       case VIDEO_SHADER_MENU_2:
-      case VIDEO_SHADER_MENU_3:
-         /* TODO/FIXME - implement */
-#if 0
+      {
+         /* Create a pipeline vertex buffer from the coordinate
+          * array data if it doesn't already exist.
+          * Adapted from d3d10 gfx_display_d3d10_draw_pipeline. */
+         if (!d3d9_hlsl_menu_pipeline_vbo && ca->vertices)
          {
-            struct uniform_info uniform_param  = {0};
-            t                                 += 0.01;
+            unsigned i;
+            Vertex *verts    = NULL;
+            unsigned vcount  = ca->vertices;
 
-            uniform_param.enabled              = true;
-            uniform_param.lookup.enable        = true;
-            uniform_param.lookup.add_prefix    = true;
-            uniform_param.lookup.idx           = draw->pipeline_id;
-            uniform_param.lookup.type          = SHADER_PROGRAM_VERTEX;
-            uniform_param.type                 = UNIFORM_1F;
-            uniform_param.lookup.ident         = "time";
-            uniform_param.result.f.v0          = t;
+            d3d9_hlsl_menu_pipeline_vbo = NULL;
+                  if (!SUCCEEDED(IDirect3DDevice9_CreateVertexBuffer(
+                              d3d->dev,
+                              vcount * sizeof(Vertex),
+                              D3DUSAGE_WRITEONLY, 0,
+                              D3DPOOL_DEFAULT,
+                              (LPDIRECT3DVERTEXBUFFER9*)&d3d9_hlsl_menu_pipeline_vbo, NULL)))
+                     d3d9_hlsl_menu_pipeline_vbo = NULL;
+
+            if (d3d9_hlsl_menu_pipeline_vbo)
+            {
+               IDirect3DVertexBuffer9_Lock(
+                     (LPDIRECT3DVERTEXBUFFER9)d3d9_hlsl_menu_pipeline_vbo,
+                     0, 0, (void**)&verts, 0);
+
+               if (verts)
+               {
+                  for (i = 0; i < vcount; i++)
+                  {
+                     verts[i].x     = ca->vertex[i * 2 + 0];
+                     verts[i].y     = ca->vertex[i * 2 + 1];
+                     verts[i].z     = 0.5f;
+                     verts[i].u     = 0.0f;
+                     verts[i].v     = 0.0f;
+                     verts[i].color = D3DCOLOR_ARGB(0xFF, 0xFF, 0xFF, 0xFF);
+                  }
+
+                  IDirect3DVertexBuffer9_Unlock(
+                        (LPDIRECT3DVERTEXBUFFER9)d3d9_hlsl_menu_pipeline_vbo);
+               }
+            }
          }
-#endif
+
+         if (d3d9_hlsl_menu_pipeline_vbo)
+         {
+            IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
+                  (LPDIRECT3DVERTEXBUFFER9)d3d9_hlsl_menu_pipeline_vbo,
+                  0, sizeof(Vertex));
+         }
+
+         draw->coords->vertices = ca->vertices;
+
+         /* Set pipeline blend state — ribbon uses multiplicative blend
+          * (DESTCOLOR + ONE) matching D3D11's blend_pipeline. */
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_SRCBLEND,  D3DBLEND_DESTCOLOR);
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_DESTBLEND, D3DBLEND_ONE);
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_ALPHABLENDENABLE, true);
          break;
+      }
+
+      case VIDEO_SHADER_MENU_3:
+      case VIDEO_SHADER_MENU_4:
+      case VIDEO_SHADER_MENU_5:
+      case VIDEO_SHADER_MENU_6:
+      {
+         static struct video_coords blank_coords = {0};
+
+         /* Fullscreen quad for snow/bokeh/snowflake effects */
+         if (!d3d9_hlsl_menu_fullscreen_vbo)
+         {
+            Vertex verts[4];
+            verts[0].x = 0.0f; verts[0].y = 0.0f; verts[0].z = 0.0f;
+            verts[0].u = 0.0f; verts[0].v = 1.0f;
+            verts[0].color = D3DCOLOR_ARGB(0xFF, 0xFF, 0xFF, 0xFF);
+            verts[1].x = 1.0f; verts[1].y = 0.0f; verts[1].z = 0.0f;
+            verts[1].u = 1.0f; verts[1].v = 1.0f;
+            verts[1].color = D3DCOLOR_ARGB(0xFF, 0xFF, 0xFF, 0xFF);
+            verts[2].x = 0.0f; verts[2].y = 1.0f; verts[2].z = 0.0f;
+            verts[2].u = 0.0f; verts[2].v = 0.0f;
+            verts[2].color = D3DCOLOR_ARGB(0xFF, 0xFF, 0xFF, 0xFF);
+            verts[3].x = 1.0f; verts[3].y = 1.0f; verts[3].z = 0.0f;
+            verts[3].u = 1.0f; verts[3].v = 0.0f;
+            verts[3].color = D3DCOLOR_ARGB(0xFF, 0xFF, 0xFF, 0xFF);
+
+            if (SUCCEEDED(IDirect3DDevice9_CreateVertexBuffer(
+                        d3d->dev, 4 * sizeof(Vertex),
+                        D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
+                        (LPDIRECT3DVERTEXBUFFER9*)&d3d9_hlsl_menu_fullscreen_vbo, NULL)))
+            {
+               void *lock = NULL;
+               IDirect3DVertexBuffer9_Lock(
+                     (LPDIRECT3DVERTEXBUFFER9)d3d9_hlsl_menu_fullscreen_vbo,
+                     0, 0, &lock, 0);
+               if (lock)
+               {
+                  memcpy(lock, verts, sizeof(verts));
+                  IDirect3DVertexBuffer9_Unlock(
+                        (LPDIRECT3DVERTEXBUFFER9)d3d9_hlsl_menu_fullscreen_vbo);
+               }
+            }
+         }
+
+         if (d3d9_hlsl_menu_fullscreen_vbo)
+         {
+            IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
+                  (LPDIRECT3DVERTEXBUFFER9)d3d9_hlsl_menu_fullscreen_vbo,
+                  0, sizeof(Vertex));
+         }
+
+         /* Use separate coords to avoid mutating the shared
+          * ca->vertices (which ribbon needs at 8064). */
+         blank_coords.vertices = 4;
+         draw->coords          = &blank_coords;
+
+         /* Set blend state for particle effects */
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA);
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_ALPHABLENDENABLE, true);
+         break;
+      }
+
+      default:
+         return;
+   }
+
+   /* Update time uniform - mirrors d3d10 ubo_values.time increment.
+    * Wrap at 65536 to keep fp32 increments precise. 0.01 stays
+    * exactly representable up to t ~ 167772 (where 0.5*ulp first
+    * exceeds 0.01), so 65536 has wide margin and wraps roughly
+    * every 30 h of cumulative menu time, making the discontinuity
+    * effectively unobservable. */
+   t += 0.01f;
+   if (t > 65536.0f)
+      t -= 65536.0f;
+
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      if (_chain
+            && draw->pipeline_id <= VIDEO_SHADER_MENU
+            && draw->pipeline_id >= VIDEO_SHADER_MENU_6
+            && hlsl_d3d9_pipeline_ready(_chain, d3d->dev,
+               VIDEO_SHADER_MENU - draw->pipeline_id))
+      {
+         unsigned idx = VIDEO_SHADER_MENU - draw->pipeline_id;
+         hlsl_pass_data_t *pd = &_chain->pipeline_data[idx];
+
+         /* Set time uniform for all pipeline shaders */
+         d3d9_hlsl_set_param_1f(pd->vs_bytecode, pd->vs_bytecode_dwords,
+               true, d3d->dev, "time", &t);
+         d3d9_hlsl_set_param_1f(pd->ps_bytecode, pd->ps_bytecode_dwords,
+               false, d3d->dev, "time", &t);
+
+         /* Set OutputSize for snow/bokeh/snowflake shaders */
+         if (draw->pipeline_id <= VIDEO_SHADER_MENU_3)
+         {
+            D3DVIEWPORT9 vp;
+            IDirect3DDevice9_GetViewport(d3d->dev, &vp);
+            {
+               float output_size[4];
+               int reg;
+               output_size[0] = (float)vp.Width;
+               output_size[1] = (float)vp.Height;
+               output_size[2] = 0.0f;
+               output_size[3] = 0.0f;
+               /* Set OutputSize as a full register (float2 occupies one register) */
+               reg = d3d9_hlsl_ctab_find_register(
+                     pd->vs_bytecode, pd->vs_bytecode_dwords,
+                     "OutputSize", NULL, NULL);
+               if (reg >= 0)
+                  d3d9_hlsl_set_vs_const(d3d->dev, reg, output_size, 1);
+               reg = d3d9_hlsl_ctab_find_register(
+                     pd->ps_bytecode, pd->ps_bytecode_dwords,
+                     "OutputSize", NULL, NULL);
+               if (reg >= 0)
+                  d3d9_hlsl_set_ps_const(d3d->dev, reg, output_size, 1);
+            }
+         }
+
+         /* Set alpha for ribbon shaders */
+         if (draw->pipeline_id >= VIDEO_SHADER_MENU_2)
+         {
+            float alpha_val = draw->color ? draw->color[3] : 1.0f;
+            d3d9_hlsl_set_param_1f(pd->vs_bytecode, pd->vs_bytecode_dwords,
+                  true, d3d->dev, "alpha", &alpha_val);
+            d3d9_hlsl_set_param_1f(pd->ps_bytecode, pd->ps_bytecode_dwords,
+                  false, d3d->dev, "alpha", &alpha_val);
+         }
+      }
+      else if (_chain)
+      {
+         d3d9_hlsl_set_param_1f(
+               _chain->stock_data.vs_bytecode,
+               _chain->stock_data.vs_bytecode_dwords, true,
+               d3d->dev, "IN.frame_count", &t);
+         d3d9_hlsl_set_param_1f(
+               _chain->stock_data.ps_bytecode,
+               _chain->stock_data.ps_bytecode_dwords, false,
+               d3d->dev, "IN.frame_count", &t);
+      }
    }
 }
 
-void gfx_display_d3d9_hlsl_scissor_begin(
-      void *data,
-      unsigned video_width, unsigned video_height,
-      int x, int y, unsigned width, unsigned height)
+static void gfx_display_d3d9_hlsl_scissor_begin(void *data, unsigned video_dims,
+      int x, int y, unsigned dims)
 {
+   unsigned width        = VIDEO_SCALE_W(dims);
+   unsigned height       = VIDEO_SCALE_H(dims);
    RECT rect;
    d3d9_video_t *d3d9 = (d3d9_video_t*)data;
 
@@ -354,9 +1410,10 @@ void gfx_display_d3d9_hlsl_scissor_begin(
    IDirect3DDevice9_SetScissorRect(d3d9->dev, &rect);
 }
 
-void gfx_display_d3d9_hlsl_scissor_end(void *data,
-      unsigned video_width, unsigned video_height)
+static void gfx_display_d3d9_hlsl_scissor_end(void *data, unsigned video_dims)
 {
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
    RECT rect;
    d3d9_video_t   *d3d9 = (d3d9_video_t*)data;
 
@@ -371,88 +1428,661 @@ void gfx_display_d3d9_hlsl_scissor_end(void *data,
    IDirect3DDevice9_SetScissorRect(d3d9->dev, &rect);
 }
 
-gfx_display_ctx_driver_t gfx_display_ctx_d3d9_hlsl = {
-   gfx_display_d3d9_hlsl_draw,
-   gfx_display_d3d9_hlsl_draw_pipeline,
-   gfx_display_d3d9_hlsl_blend_begin,
-   gfx_display_d3d9_hlsl_blend_end,
-   gfx_display_d3d9_hlsl_get_default_mvp,
-   gfx_display_d3d9_hlsl_get_default_vertices,
-   gfx_display_d3d9_hlsl_get_default_tex_coords,
-   FONT_DRIVER_RENDER_D3D9_API,
-   GFX_VIDEO_DRIVER_DIRECT3D9_HLSL,
-   "d3d9_hlsl",
-   false,
-   gfx_display_d3d9_hlsl_scissor_begin,
-   gfx_display_d3d9_hlsl_scissor_end
-};
+/*
+ * FONT DRIVER
+ */
+
+typedef struct
+{
+   LPDIRECT3DTEXTURE9            texture;
+   const font_renderer_driver_t *font_driver;
+   void                         *font_data;
+   struct font_atlas             *atlas;
+   unsigned                      tex_dims;
+   /* Scratch buffer to avoid per-line malloc/free in font rendering */
+   Vertex                       *scratch_verts;
+   unsigned                      scratch_capacity; /* in Vertex count */
+} d3d9_font_t;
+
+static void *d3d9_font_init(void *data,
+      const char *font_path, float font_size,
+      bool is_threaded)
+{
+   unsigned i, j;
+   d3d9_video_t    *d3d  = (d3d9_video_t*)data;
+   d3d9_font_t *font = (d3d9_font_t*)calloc(1, sizeof(*font));
+
+   if (!font)
+      return NULL;
+
+   if (!font_renderer_create_default(
+            &font->font_driver, &font->font_data,
+            font_path, font_size, FONT_ATLAS_FORMAT_A8))
+   {
+      free(font);
+      return NULL;
+   }
+
+   font->atlas      = font->font_driver->get_atlas(font->font_data);
+   /* The atlas may grow, up to the largest texture the device takes;
+    * the draw remakes the texture when the atlas's size has changed */
+   {
+      D3DCAPS9 caps;
+      if (     SUCCEEDED(IDirect3DDevice9_GetDeviceCaps(d3d->dev, &caps))
+            && caps.MaxTextureWidth  > 0
+            && caps.MaxTextureHeight > 0)
+         font->atlas->max_dims = VIDEO_SCALE_PACK(
+               caps.MaxTextureWidth, caps.MaxTextureHeight);
+   }
+   font->tex_dims   = VIDEO_SCALE_PACK(font->atlas->width,
+         font->atlas->height);
+
+   /* Create an A8R8G8B8 texture from the A8 atlas buffer.
+    * D3D9 doesn't universally support D3DFMT_A8
+    * as a texture format, so we expand it. */
+   font->texture    = NULL;
+   d3d9_tex_create(d3d->dev,
+         VIDEO_SCALE_W(font->tex_dims), VIDEO_SCALE_H(font->tex_dims), 1,
+         0, D3DFMT_A8R8G8B8,
+         (LPDIRECT3DTEXTURE9*)&font->texture);
+
+   if (font->texture)
+   {
+      D3DLOCKED_RECT lr;
+
+      if (SUCCEEDED(d3d9_tex_lock(
+                  font->texture, 0, &lr, NULL, 0)))
+      {
+         for (j = 0; j < font->atlas->height; j++)
+         {
+            uint32_t       *dst = (uint32_t*)((uint8_t*)lr.pBits + j * lr.Pitch);
+            const uint8_t  *src = font->atlas->buffer + j * font->atlas->width;
+            for (i = 0; i < font->atlas->width; i++)
+               dst[i] = D3DCOLOR_ARGB(src[i], 0xFF, 0xFF, 0xFF);
+         }
+         d3d9_tex_unlock(font->texture, 0, true);
+      }
+   }
+
+   font->atlas->dirty = false;
+   return font;
+}
+
+static void d3d9_font_free(void *data, bool is_threaded)
+{
+   d3d9_font_t *font = (d3d9_font_t*)data;
+
+   if (!font)
+      return;
+
+   if (font->font_driver && font->font_data)
+      font->font_driver->free(font->font_data);
+
+   if (font->texture)
+      IDirect3DTexture9_Release(font->texture);
+
+   free(font->scratch_verts);
+   free(font);
+}
+
+static int d3d9_font_get_message_width(void *data, const char *msg,
+      size_t msg_len, float scale)
+{
+   d3d9_font_t *font = (d3d9_font_t*)data;
+   if (!font)
+      return 0;
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
+}
+
+/* Emit a single glyph quad (6 vertices for two triangles)
+ * into the output vertex array. Returns the number of
+ * vertices written (always 6). */
+static INLINE unsigned d3d9_font_emit_quad(
+      Vertex *pv,
+      float x, float y, float w, float h,
+      float tex_u, float tex_v, float tex_w, float tex_h,
+      D3DCOLOR color)
+{
+   /* Triangle 1: top-left, top-right, bottom-left */
+   pv[0].x     = x;
+   pv[0].y     = y;
+   pv[0].z     = 0.5f;
+   pv[0].u     = tex_u;
+   pv[0].v     = tex_v;
+   pv[0].color = color;
+
+   pv[1].x     = x + w;
+   pv[1].y     = y;
+   pv[1].z     = 0.5f;
+   pv[1].u     = tex_u + tex_w;
+   pv[1].v     = tex_v;
+   pv[1].color = color;
+
+   pv[2].x     = x;
+   pv[2].y     = y + h;
+   pv[2].z     = 0.5f;
+   pv[2].u     = tex_u;
+   pv[2].v     = tex_v + tex_h;
+   pv[2].color = color;
+
+   /* Triangle 2: top-right, bottom-right, bottom-left */
+   pv[3].x     = x + w;
+   pv[3].y     = y;
+   pv[3].z     = 0.5f;
+   pv[3].u     = tex_u + tex_w;
+   pv[3].v     = tex_v;
+   pv[3].color = color;
+
+   pv[4].x     = x + w;
+   pv[4].y     = y + h;
+   pv[4].z     = 0.5f;
+   pv[4].u     = tex_u + tex_w;
+   pv[4].v     = tex_v + tex_h;
+   pv[4].color = color;
+
+   pv[5].x     = x;
+   pv[5].y     = y + h;
+   pv[5].z     = 0.5f;
+   pv[5].u     = tex_u;
+   pv[5].v     = tex_v + tex_h;
+   pv[5].color = color;
+
+   return 6;
+}
+
+/* Get or grow the scratch vertex buffer for font rendering.
+ * Avoids per-line calloc/free on the hot path. */
+static INLINE Vertex *d3d9_font_get_scratch(
+      d3d9_font_t *font, unsigned needed)
+{
+   if (needed > font->scratch_capacity)
+   {
+      unsigned new_cap = needed > 1536 ? needed : 1536; /* 256 glyphs * 6 verts */
+      Vertex *tmp = (Vertex*)realloc(font->scratch_verts, new_cap * sizeof(Vertex));
+      if (!tmp)
+         return NULL;
+      font->scratch_verts    = tmp;
+      font->scratch_capacity = new_cap;
+   }
+   memset(font->scratch_verts, 0, needed * sizeof(Vertex));
+   return font->scratch_verts;
+}
+
+static void d3d9_font_bind_atlas(d3d9_video_t *d3d, d3d9_font_t *font)
+{
+   IDirect3DDevice9_SetTexture(d3d->dev, 0,
+         (IDirect3DBaseTexture9*)font->texture);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+}
+
+/* A line's glyphs, @vs shadow vertices at @start and @vf foreground
+ * ones @fg_off further, drawn where they were written in the menu's
+ * vertex buffer */
+static void d3d9_font_draw_vbuf(d3d9_video_t *d3d, d3d9_font_t *font,
+      unsigned start, unsigned fg_off, unsigned vs, unsigned vf)
+{
+   d3d9_menu_vbuf_unmap(d3d);
+   if (!vs && !vf)
+      return;
+   d3d9_font_bind_atlas(d3d, font);
+   IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
+         (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+         0, sizeof(Vertex));
+   if (vs)
+      IDirect3DDevice9_DrawPrimitive(d3d->dev, D3DPT_TRIANGLELIST,
+            start, vs / 3);
+   if (vf)
+      IDirect3DDevice9_DrawPrimitive(d3d->dev, D3DPT_TRIANGLELIST,
+            start + fg_off, vf / 3);
+}
+
+/* Draws @vert_count glyph vertices from @verts with the atlas bound,
+ * and puts the menu's vertex stream back. */
+static void d3d9_font_draw_verts(d3d9_video_t *d3d, d3d9_font_t *font,
+      Vertex *verts, unsigned vert_count)
+{
+   d3d9_font_bind_atlas(d3d, font);
+
+   IDirect3DDevice9_DrawPrimitiveUP(d3d->dev,
+         D3DPT_TRIANGLELIST,
+         vert_count / 3,
+         verts,
+         sizeof(Vertex));
+
+   IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
+         (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+         0, sizeof(Vertex));
+}
+
+static void d3d9_font_render_msg(
+      void *userdata, void *data,
+      const char *msg, size_t msg_len,
+      const struct font_params *params)
+{
+   font_params_resolved_t rp;
+   float x, y, scale, drop_mod, drop_alpha;
+   enum text_alignment text_align;
+   int drop_x, drop_y;
+   unsigned r, g, b, alpha;
+   D3DCOLOR color, color_dark = 0;
+   struct font_line_metrics *line_metrics = NULL;
+   float line_height;
+   d3d9_font_t *font  = (d3d9_font_t*)data;
+   d3d9_video_t     *d3d   = (d3d9_video_t*)userdata;
+   unsigned          width  = 0;
+   unsigned          height = 0;
+
+   if (!font || !msg || !*msg)
+      return;
+   if (!d3d)
+      return;
+
+   width  = VIDEO_SCALE_W(d3d->vp.full_dims);
+   height = VIDEO_SCALE_H(d3d->vp.full_dims);
+   if (!width || !height)
+      return;
+
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   text_align = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   r          = rp.rgba[0];
+   g          = rp.rgba[1];
+   b          = rp.rgba[2];
+   alpha           = rp.rgba[3];
+   color      = D3DCOLOR_ARGB(alpha, r, g, b);
+
+
+   font->font_driver->get_line_metrics(font->font_data, &line_metrics);
+   line_height = line_metrics->height * scale / height;
+
+   /* Enable alpha blending for font rendering */
+   IDirect3DDevice9_SetRenderState(d3d->dev,
+         D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA);
+   IDirect3DDevice9_SetRenderState(d3d->dev,
+         D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+   IDirect3DDevice9_SetRenderState(d3d->dev,
+         D3DRS_ALPHABLENDENABLE, true);
+
+   /* Use top-down ortho: Y=0→top, Y=1→bottom, matching Ozone coords.
+    * Row-major layout for mul(vector, matrix) in the stock HLSL vertex shader. */
+   {
+      static const float topdown_ortho[16] = {
+          2.0f,  0.0f, 0.0f, 0.0f,
+          0.0f, -2.0f, 0.0f, 0.0f,
+          0.0f,  0.0f, 1.0f, 0.0f,
+         -1.0f,  1.0f, 0.0f, 1.0f
+      };
+      IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev,
+            0, topdown_ortho, 4);
+   }
+
+   /* Update atlas texture if dirty */
+   /* Asked for before anything is laid out: it may have grown, which
+    * marks it dirty, and the texture is remade below at its new size
+    * before any texture coordinate is taken from it */
+   if (font->font_driver && font->font_data)
+      font->atlas = font->font_driver->get_atlas(font->font_data);
+
+   if (font->atlas->dirty)
+   {
+      /* If the atlas dimensions changed (grew), we must recreate
+       * the texture to match, otherwise glyphs added after init
+       * will have wrong UVs or missing data. */
+      bool respecified = false;
+
+      if (font->tex_dims != VIDEO_SCALE_PACK(font->atlas->width,
+               font->atlas->height))
+      {
+         respecified      = true;
+         if (font->texture)
+            IDirect3DTexture9_Release(font->texture);
+
+         font->tex_dims   = VIDEO_SCALE_PACK(font->atlas->width,
+               font->atlas->height);
+         font->texture    = NULL;
+         d3d9_tex_create(d3d->dev,
+               VIDEO_SCALE_W(font->tex_dims), VIDEO_SCALE_H(font->tex_dims), 1,
+               0, D3DFMT_A8R8G8B8,
+               (LPDIRECT3DTEXTURE9*)&font->texture);
+      }
+
+      if (font->texture)
+      {
+         unsigned r;
+         /* A recreated texture has no previous contents, so the whole
+          * atlas is converted; otherwise each dirty rectangle the font
+          * renderers tracked. Managed pool textures track locked
+          * sub-rects natively. */
+         unsigned rects = respecified
+            ? 1 : font_atlas_dirty_rects(font->atlas);
+         for (r = 0; r < rects; r++)
+         {
+            unsigned i, j, xy0, xy1, x0, y0, x1, y1;
+            D3DLOCKED_RECT lr;
+            RECT rect;
+            font_atlas_dirty_rect(font->atlas, r, &xy0, &xy1);
+            x0 = VIDEO_SCALE_W(xy0);
+            y0 = VIDEO_SCALE_H(xy0);
+            x1 = VIDEO_SCALE_W(xy1);
+            y1 = VIDEO_SCALE_H(xy1);
+
+            if (     respecified
+                  || x1 <= x0 || y1 <= y0
+                  || x1 > (unsigned)font->atlas->width
+                  || y1 > (unsigned)font->atlas->height)
+            {
+               x0 = 0;
+               y0 = 0;
+               x1 = font->atlas->width;
+               y1 = font->atlas->height;
+            }
+            rect.left   = (LONG)x0;
+            rect.top    = (LONG)y0;
+            rect.right  = (LONG)x1;
+            rect.bottom = (LONG)y1;
+
+            if (SUCCEEDED(d3d9_tex_lock(
+                        font->texture, 0, &lr, &rect, 0)))
+            {
+               /* lr.pBits addresses the top-left of the locked rect */
+               for (j = 0; j < y1 - y0; j++)
+               {
+                  uint32_t       *dst = (uint32_t*)((uint8_t*)lr.pBits
+                        + j * lr.Pitch);
+                  const uint8_t  *src = font->atlas->buffer
+                        + (size_t)(y0 + j) * font->atlas->width + x0;
+                  for (i = 0; i < x1 - x0; i++)
+                     dst[i] = D3DCOLOR_ARGB(src[i], 0xFF, 0xFF, 0xFF);
+               }
+               d3d9_tex_unlock(font->texture, 0, true);
+            }
+         }
+      }
+      font->atlas->dirty = false;
+   }
+
+   /* Render each line, handling newlines like d3d10 does.
+    * Callers in d3d9_hlsl_frame wrap in BeginScene/EndScene. */
+
+   /* Set vertex declaration and stock shader for DrawPrimitiveUP */
+   IDirect3DDevice9_SetVertexDeclaration(d3d->dev,
+         (LPDIRECT3DVERTEXDECLARATION9)d3d->menu_display.decl);
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      if (_chain)
+      {
+         IDirect3DDevice9_SetVertexShader(d3d->dev, (LPDIRECT3DVERTEXSHADER9)(&_chain->stock_shader)->vprg);
+         IDirect3DDevice9_SetPixelShader(d3d->dev, (LPDIRECT3DPIXELSHADER9)(&_chain->stock_shader)->fprg);
+      }
+   }
+
+   {
+      bool has_drop                    = drop_x || drop_y;
+      bool line_ok                     = false;
+      bool line_vbuf                   = false;
+      unsigned vb_start                = 0;
+      unsigned fg_off                  = 0;
+      Vertex *verts_s                  = NULL;
+      Vertex *verts_f                  = NULL;
+      unsigned vs                      = 0;
+      unsigned vf                      = 0;
+      int lx_s                         = 0;
+      int ly_s                         = 0;
+      int lx_f                         = 0;
+      int ly_f                         = 0;
+      float inv_vp_w                   = 0.0f;
+      float inv_vp_h                   = 0.0f;
+      float inv_tex_w                  = 0.0f;
+      float inv_tex_h                  = 0.0f;
+      const struct font_glyph* (*get_glyph)(void*, uint32_t)
+                                       = font->font_driver->get_glyph;
+      void *font_data                  = font->font_data;
+      const struct font_glyph *glyph_q = get_glyph(font_data, '?');
+
+      if (has_drop)
+      {
+         unsigned r_dark     = r * drop_mod;
+         unsigned g_dark     = g * drop_mod;
+         unsigned b_dark     = b * drop_mod;
+         unsigned alpha_dark = alpha * drop_alpha;
+         color_dark          = D3DCOLOR_ARGB(alpha_dark, r_dark, g_dark, b_dark);
+      }
+
+      /* One pass per line: each glyph is looked up once and written
+       * to the line's shadow run and its foreground run, drawn in
+       * that order, the shadow behind. */
+#define D3D9_FONT_QUAD(dst, px, py, glyph, col) \
+      d3d9_font_emit_quad(dst, \
+            ((px) + (glyph)->draw_offset_x * scale) * inv_vp_w, \
+            ((py) + (glyph)->draw_offset_y * scale) * inv_vp_h, \
+            VIDEO_SCALE_W((glyph)->dims) * scale * inv_vp_w, \
+            VIDEO_SCALE_H((glyph)->dims) * scale * inv_vp_h, \
+            VIDEO_SCALE_W((glyph)->atlas_pos) * inv_tex_w, \
+            VIDEO_SCALE_H((glyph)->atlas_pos) * inv_tex_h, \
+            VIDEO_SCALE_W((glyph)->dims) * inv_tex_w, \
+            VIDEO_SCALE_H((glyph)->dims) * inv_tex_h, \
+            col)
+#define FONT_LAYOUT_ALIGNED (text_align == TEXT_ALIGN_RIGHT \
+            || text_align == TEXT_ALIGN_CENTER)
+#define FONT_LAYOUT_SKIP(line, bytes) ((bytes) == 0)
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+      do \
+      { \
+         float line_y = y - (float)(line) * line_height; \
+         float fx     = x; \
+         (void)(count); \
+         vs = vf = 0; \
+         fg_off    = (unsigned)(bytes) * 6; \
+         line_vbuf = !!(verts_s = d3d9_menu_vbuf_map(d3d, \
+                  (unsigned)(bytes) * 12, &vb_start)); \
+         if (!line_vbuf) \
+            verts_s = d3d9_font_get_scratch(font, (bytes) * 12); \
+         if (!(line_ok = !!verts_s)) \
+            break; \
+         verts_f   = verts_s + fg_off; \
+         inv_vp_w  = 1.0f / (float)width; \
+         inv_vp_h  = 1.0f / (float)height; \
+         inv_tex_w = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims); \
+         inv_tex_h = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims); \
+         if (text_align == TEXT_ALIGN_RIGHT) \
+            fx -= (float)((line_width) * scale) / (float)width; \
+         else if (text_align == TEXT_ALIGN_CENTER) \
+            fx -= (float)((line_width) * scale) / (float)width / 2.0f; \
+         lx_f = roundf(fx * width); \
+         ly_f = roundf((1.0f - line_y) * height); \
+         if (has_drop) \
+         { \
+            float sx = x + scale * drop_x / (float)width; \
+            if (text_align == TEXT_ALIGN_RIGHT) \
+               sx -= (float)((line_width) * scale) / (float)width; \
+            else if (text_align == TEXT_ALIGN_CENTER) \
+               sx -= (float)((line_width) * scale) / (float)width / 2.0f; \
+            lx_s = roundf(sx * width); \
+            ly_s = roundf((1.0f - (line_y + scale * drop_y \
+                        / (float)height)) * height); \
+         } \
+      } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+      do \
+      { \
+         /* This driver keeps its own truncating pens */ \
+         (void)(pen_x); \
+         (void)(pen_y); \
+         if (!line_ok) \
+            break; \
+         if (has_drop) \
+         { \
+            vs   += D3D9_FONT_QUAD(&verts_s[vs], lx_s, ly_s, glyph, \
+                  color_dark); \
+            lx_s += (glyph)->advance_x * scale; \
+            ly_s += (glyph)->advance_y * scale; \
+         } \
+         vf   += D3D9_FONT_QUAD(&verts_f[vf], lx_f, ly_f, glyph, color); \
+         lx_f += (glyph)->advance_x * scale; \
+         ly_f += (glyph)->advance_y * scale; \
+      } while (0)
+#define FONT_LAYOUT_LINE_END() \
+      do \
+      { \
+         if (line_vbuf) \
+         { \
+            line_vbuf = false; \
+            d3d9_font_draw_vbuf(d3d, font, vb_start, fg_off, vs, vf); \
+            break; \
+         } \
+         if (vs) \
+            d3d9_font_draw_verts(d3d, font, verts_s, vs); \
+         if (vf) \
+            d3d9_font_draw_verts(d3d, font, verts_f, vf); \
+      } while (0)
+#include "../font_layout.h"
+#undef D3D9_FONT_QUAD
+   }
+
+}
+
+static const struct font_glyph *d3d9_font_get_glyph(
+      void *data, uint32_t code)
+{
+   d3d9_font_t *font = (d3d9_font_t*)data;
+   if (font && font->font_driver)
+      return font->font_driver->get_glyph(
+            (void*)font->font_data, code);
+   return NULL;
+}
+
+static bool d3d9_font_get_line_metrics(
+      void *data, struct font_line_metrics **metrics)
+{
+   d3d9_font_t *font = (d3d9_font_t*)data;
+   if (font && font->font_driver && font->font_data)
+   {
+      font->font_driver->get_line_metrics(font->font_data, metrics);
+      return true;
+   }
+   return false;
+}
 
 /*
  * VIDEO DRIVER
  */
 
-static void *d3d9_hlsl_get_constant_by_name(LPD3DXCONSTANTTABLE prog, const char *name)
+/* Look up a shader uniform register from compiled bytecode CTAB.
+ * Returns the register index or -1 if not found. */
+/* Set a float shader uniform by name. */
+static INLINE void d3d9_hlsl_set_param_1f(
+      const DWORD *bytecode, size_t bytecode_dwords,
+      bool is_vertex,
+      LPDIRECT3DDEVICE9 dev, const char *name, const void *value)
 {
-   char lbl[64];
-   lbl[0] = '\0';
-   snprintf(lbl, sizeof(lbl), "$%s", name);
-   return d3d9x_constant_table_get_constant_by_name(prog, NULL, lbl);
+   int reg;
+   if (!bytecode || !bytecode_dwords || !name || !*name)
+      return;
+   reg = d3d9_hlsl_ctab_find_register(bytecode, bytecode_dwords, name, NULL, NULL);
+   if (reg >= 0)
+   {
+      float v4[4];
+      v4[0] = *(const float*)value;
+      v4[1] = 0.0f;
+      v4[2] = 0.0f;
+      v4[3] = 0.0f;
+      if (is_vertex)
+         d3d9_hlsl_set_vs_const(dev, reg, v4, 1);
+      else
+         d3d9_hlsl_set_ps_const(dev, reg, v4, 1);
+   }
 }
 
-static INLINE void d3d9_hlsl_set_param_2f(LPD3DXCONSTANTTABLE prog, LPDIRECT3DDEVICE9 userdata, const char *name, const void *values)
-{
-   D3DXHANDLE param         = (D3DXHANDLE)d3d9_hlsl_get_constant_by_name(prog, name);
-   if (param)
-      d3d9x_constant_table_set_float_array(userdata, prog, (void*)param, values, 2);
-}
-
-static INLINE void d3d9_hlsl_set_param_1f(LPD3DXCONSTANTTABLE prog, LPDIRECT3DDEVICE9 userdata, const char *name, const void *value)
-{
-   D3DXHANDLE param         = (D3DXHANDLE)d3d9_hlsl_get_constant_by_name(prog, name);
-   float *val               = (float*)value;
-   if (param)
-      d3d9x_constant_table_set_float(prog, userdata, (void*)param, *val);
-}
-
-static INLINE void d3d9_hlsl_bind_program(LPDIRECT3DDEVICE9 dev,
-      struct shader_pass *pass)
-{
-   IDirect3DDevice9_SetVertexShader(dev, (LPDIRECT3DVERTEXSHADER9)pass->vprg);
-   IDirect3DDevice9_SetPixelShader(dev, (LPDIRECT3DPIXELSHADER9)pass->fprg);
-}
-
-static INLINE void d3d9_hlsl_set_param_matrix(LPD3DXCONSTANTTABLE prog, LPDIRECT3DDEVICE9 userdata,
-      const char *name, const void *values)
-{
-   D3DXHANDLE param         = (D3DXHANDLE)d3d9_hlsl_get_constant_by_name(prog, name);
-   if (param)
-      d3d9x_constant_table_set_matrix(userdata, prog, (void*)param, (D3DMATRIX*)values);
-}
-
+/* Set a 4x4 matrix shader uniform by name. */
 static bool d3d9_hlsl_load_program_from_file(
       LPDIRECT3DDEVICE9 dev,
       struct shader_pass *pass,
       const char *prog)
 {
-   ID3DXBuffer *listing_f                    = NULL;
-   ID3DXBuffer *listing_v                    = NULL;
-   ID3DXBuffer *code_f                       = NULL;
-   ID3DXBuffer *code_v                       = NULL;
+   D3DBlob code_f = NULL;
+   D3DBlob code_v = NULL;
+   wchar_t wpath[PATH_MAX_LENGTH];
 
-   if (string_is_empty(prog))
+   if (!prog || !*prog)
       return false;
 
-   if (!d3d9x_compile_shader_from_file(prog, NULL, NULL,
-            "main_fragment", "ps_3_0", 0, &code_f, &listing_f, &pass->ftable))
+   /* Convert path to wide string for d3d_compile_from_file */
+   mbstowcs(wpath, prog, PATH_MAX_LENGTH);
+
+   if (!d3d_compile_from_file(wpath, "main_fragment", "ps_3_0", &code_f))
    {
-      RARCH_ERR("Could not compile fragment shader program (%s)..\n", prog);
-      goto error;
+      RARCH_ERR("[D3D9 HLSL] Could not compile fragment shader program (%s).\n", prog);
+      return false;
    }
-   if (!d3d9x_compile_shader_from_file(prog, NULL, NULL,
-            "main_vertex", "vs_3_0", 0, &code_v, &listing_v, &pass->vtable))
+   if (!d3d_compile_from_file(wpath, "main_vertex", "vs_3_0", &code_v))
    {
-      RARCH_ERR("Could not compile vertex shader program (%s)..\n", prog);
-      goto error;
+      RARCH_ERR("[D3D9 HLSL] Could not compile vertex shader program (%s).\n", prog);
+      code_f->lpVtbl->Release(code_f);
+      return false;
+   }
+
+   pass->ftable = NULL;
+   pass->vtable = NULL;
+
+   IDirect3DDevice9_CreatePixelShader(dev,
+         (const DWORD*)code_f->lpVtbl->GetBufferPointer(code_f),
+         (LPDIRECT3DPIXELSHADER9*)&pass->fprg);
+   IDirect3DDevice9_CreateVertexShader(dev,
+         (const DWORD*)code_v->lpVtbl->GetBufferPointer(code_v),
+         (LPDIRECT3DVERTEXSHADER9*)&pass->vprg);
+   code_f->lpVtbl->Release(code_f);
+   code_v->lpVtbl->Release(code_v);
+
+   return true;
+}
+
+static DWORD *d3d9_hlsl_dup_bytecode(D3DBlob blob, size_t *out_dwords);
+
+static bool d3d9_hlsl_load_program_ex(
+      LPDIRECT3DDEVICE9 dev,
+      struct shader_pass *pass,
+      const char *prog,
+      hlsl_pass_data_t *pd)
+{
+   D3DBlob code_f    = NULL;
+   D3DBlob code_v    = NULL;
+   size_t prog_len   = strlen(prog);
+
+   if (!d3d_compile(prog, prog_len, "stock", "main_fragment", "ps_3_0", &code_f))
+   {
+      RARCH_ERR("[D3D9 HLSL] Could not compile stock fragment shader.\n");
+      return false;
+   }
+   if (!d3d_compile(prog, prog_len, "stock", "main_vertex", "vs_3_0", &code_v))
+   {
+      RARCH_ERR("[D3D9 HLSL] Could not compile stock vertex shader.\n");
+      code_f->lpVtbl->Release(code_f);
+      return false;
+   }
+
+   pass->ftable = NULL;
+   pass->vtable = NULL;
+
+   if (pd)
+   {
+      pd->ps_bytecode = d3d9_hlsl_dup_bytecode(code_f, &pd->ps_bytecode_dwords);
+      pd->vs_bytecode = d3d9_hlsl_dup_bytecode(code_v, &pd->vs_bytecode_dwords);
+      hlsl_uniform_map_from_bytecode(&pd->vs_map, pd->vs_bytecode, pd->vs_bytecode_dwords);
+      hlsl_uniform_map_from_bytecode(&pd->ps_map, pd->ps_bytecode, pd->ps_bytecode_dwords);
    }
 
    IDirect3DDevice9_CreatePixelShader(dev,
@@ -465,119 +2095,10 @@ static bool d3d9_hlsl_load_program_from_file(
    code_v->lpVtbl->Release(code_v);
 
    return true;
-
-error:
-   RARCH_ERR("Cg/HLSL error:\n");
-   if (listing_f)
-   {
-      RARCH_ERR("Fragment:\n%s\n", (char*)listing_f->lpVtbl->GetBufferPointer(listing_f));
-      listing_f->lpVtbl->Release(listing_f);
-   }
-   if (listing_v)
-   {
-      RARCH_ERR("Vertex:\n%s\n", (char*)listing_v->lpVtbl->GetBufferPointer(listing_v));
-      listing_v->lpVtbl->Release(listing_v);
-   }
-
-   return false;
-}
-
-static bool d3d9_hlsl_load_program(
-      LPDIRECT3DDEVICE9 dev,
-      struct shader_pass *pass,
-      const char *prog)
-{
-   ID3DXBuffer *listing_f = NULL;
-   ID3DXBuffer *listing_v = NULL;
-   ID3DXBuffer *code_f    = NULL;
-   ID3DXBuffer *code_v    = NULL;
-   size_t prog_len        = strlen(prog);
-
-   if (!d3d9x_compile_shader(prog, prog_len, NULL, NULL,
-            "main_fragment", "ps_3_0", 0, &code_f, &listing_f,
-            &pass->ftable ))
-   {
-      RARCH_ERR("Could not compile stock fragment shader..\n");
-      goto error;
-   }
-   if (!d3d9x_compile_shader(prog, prog_len, NULL, NULL,
-            "main_vertex", "vs_3_0", 0, &code_v, &listing_v,
-            &pass->vtable ))
-   {
-      RARCH_ERR("Could not compile stock vertex shader..\n");
-      goto error;
-   }
-
-   IDirect3DDevice9_CreatePixelShader(dev,
-         (const DWORD*)code_f->lpVtbl->GetBufferPointer(code_f),
-         (LPDIRECT3DPIXELSHADER9*)&pass->fprg);
-   IDirect3DDevice9_CreateVertexShader(dev,
-         (const DWORD*)code_v->lpVtbl->GetBufferPointer(code_v),
-         (LPDIRECT3DVERTEXSHADER9*)&pass->vprg);
-   code_f->lpVtbl->Release(code_f);
-   code_v->lpVtbl->Release(code_v);
-
-   return true;
-
-error:
-   RARCH_ERR("Cg/HLSL error:\n");
-   if (listing_f)
-   {
-      RARCH_ERR("Fragment:\n%s\n", (char*)listing_f->lpVtbl->GetBufferPointer(listing_f));
-      listing_f->lpVtbl->Release(listing_f);
-   }
-   if (listing_v)
-   {
-      RARCH_ERR("Vertex:\n%s\n", (char*)listing_v->lpVtbl->GetBufferPointer(listing_v));
-      listing_v->lpVtbl->Release(listing_v);
-   }
-   return false;
-}
-
-static void hlsl_d3d9_renderchain_set_shader_params(
-      d3d9_renderchain_t *chain,
-      LPDIRECT3DDEVICE9 dev,
-      struct shader_pass *pass,
-      unsigned video_w, unsigned video_h,
-      unsigned tex_w, unsigned tex_h,
-      unsigned vp_width, unsigned vp_height)
-{
-   float frame_cnt;
-   float video_size[2];
-   float texture_size[2];
-   float output_size[2];
-   LPD3DXCONSTANTTABLE fprg                 = (LPD3DXCONSTANTTABLE)pass->ftable;
-   LPD3DXCONSTANTTABLE vprg                 = (LPD3DXCONSTANTTABLE)pass->vtable;
-
-   video_size[0]                            = video_w;
-   video_size[1]                            = video_h;
-   texture_size[0]                          = tex_w;
-   texture_size[1]                          = tex_h;
-   output_size[0]                           = vp_width;
-   output_size[1]                           = vp_height;
-
-   d3d9x_constant_table_set_defaults(dev, fprg);
-   d3d9x_constant_table_set_defaults(dev, vprg);
-
-   d3d9_hlsl_set_param_2f(vprg, dev, "IN.video_size",      &video_size);
-   d3d9_hlsl_set_param_2f(fprg, dev, "IN.video_size",      &video_size);
-   d3d9_hlsl_set_param_2f(vprg, dev, "IN.texture_size",    &texture_size);
-   d3d9_hlsl_set_param_2f(fprg, dev, "IN.texture_size",    &texture_size);
-   d3d9_hlsl_set_param_2f(vprg, dev, "IN.output_size",     &output_size);
-   d3d9_hlsl_set_param_2f(fprg, dev, "IN.output_size",     &output_size);
-
-   frame_cnt = chain->frame_count;
-
-   if (pass->info.pass->frame_count_mod)
-      frame_cnt         = chain->frame_count
-         % pass->info.pass->frame_count_mod;
-
-   d3d9_hlsl_set_param_1f(fprg, dev, "IN.frame_count",     &frame_cnt);
-   d3d9_hlsl_set_param_1f(vprg, dev, "IN.frame_count",     &frame_cnt);
 }
 
 static bool hlsl_d3d9_renderchain_init_shader_fvf(
-      d3d9_renderchain_t *chain,
+      d3d9_hlsl_renderchain_t *chain,
       struct shader_pass *pass)
 {
    static const D3DVERTEXELEMENT9 decl[4] =
@@ -591,62 +2112,137 @@ static bool hlsl_d3d9_renderchain_init_shader_fvf(
       D3DDECL_END()
    };
 
-   return d3d9_vertex_declaration_new(chain->dev,
-         decl, (void**)&pass->vertex_decl);
+   return (SUCCEEDED(IDirect3DDevice9_CreateVertexDeclaration(chain->dev,
+               (const D3DVERTEXELEMENT9*)decl, (IDirect3DVertexDeclaration9**)&pass->vertex_decl)));
 }
+
+#ifdef DEBUG
+/* HLSL CTAB (constant table) bytecode dumper.
+ * Logs the contents of the CTAB embedded in compiled HLSL bytecode.
+ * Only active in debug builds; provided for shader bring-up and diagnostics. */
+static void d3d9_hlsl_ctab_dump(const DWORD *bytecode, size_t bytecode_dwords,
+      const char *label)
+{
+   size_t pos;
+   const DWORD CTAB_TAG = 0x42415443;
+   if (!bytecode || bytecode_dwords < 2) return;
+   for (pos = 1; pos < bytecode_dwords; )
+   {
+      DWORD token = bytecode[pos];
+      DWORD opcode = token & 0xFFFF;
+      if (opcode == 0xFFFF) break;
+      if (opcode == 0xFFFE)
+      {
+         DWORD comment_dwords = (token >> 16) & 0x7FFF;
+         if (pos + 1 + comment_dwords > bytecode_dwords) break;
+         if (comment_dwords >= 6 && bytecode[pos + 1] == CTAB_TAG)
+         {
+            const uint8_t *cs = (const uint8_t*)&bytecode[pos + 1];
+            size_t ctb = comment_dwords * sizeof(DWORD);
+            const uint8_t *hdr = cs + 4;
+            size_t ha = ctb - 4;
+            DWORD nc, cio, ci;
+            if (ha < 28) return;
+            nc = *(const DWORD*)(hdr + 12);
+            cio = *(const DWORD*)(hdr + 16);
+            RARCH_LOG("[D3D9 HLSL] CTAB %s (%u constants):\n", label, (unsigned)nc);
+            for (ci = 0; ci < nc; ci++)
+            {
+               size_t eo = cio + ci * 20;
+               if (eo + 20 > ha) break;
+               {
+                  const uint8_t *e = hdr + eo;
+                  DWORD no = *(const DWORD*)(e + 0);
+                  WORD rs = *(const WORD*)(e + 4);
+                  WORD ri = *(const WORD*)(e + 6);
+                  WORD rc = *(const WORD*)(e + 8);
+                  const char *cn = (no < ha) ? (const char*)(hdr + no) : "?";
+                  RARCH_LOG("  [%u] '%s' set=%u reg=c%u cnt=%u\n",
+                        ci, cn, (unsigned)rs, (unsigned)ri, (unsigned)rc);
+               }
+            }
+            return;
+         }
+         pos += 1 + comment_dwords; continue;
+      }
+      pos++;
+   }
+}
+#endif
+static bool d3d9_hlsl_load_program_from_file_ex(
+      LPDIRECT3DDEVICE9 dev,
+      struct shader_pass *pass,
+      const char *prog,
+      hlsl_pass_data_t *pd);
 
 static bool hlsl_d3d9_renderchain_create_first_pass(
       LPDIRECT3DDEVICE9 dev,
-      d3d9_renderchain_t *chain,
+      hlsl_renderchain_t *hlsl_chain,
       const struct LinkInfo *info,
       unsigned _fmt)
 {
    int i;
    struct shader_pass pass       = { 0 };
+   d3d9_hlsl_renderchain_t *chain     = &hlsl_chain->chain;
    unsigned fmt                  =
         (_fmt == RETRO_PIXEL_FORMAT_RGB565)
       ? D3D9_RGB565_FORMAT
       : D3D9_XRGB8888_FORMAT;
 
    pass.info                     = *info;
-   pass.last_width               = 0;
-   pass.last_height              = 0;
+   pass.last_dims                = 0;
    pass.attrib_map               = (struct unsigned_vector_list*)
       unsigned_vector_list_new();
 
    chain->prev.ptr               = 0;
 
-   for (i = 0; i < TEXTURES; i++)
    {
       int32_t filter             = d3d_translate_filter(info->pass->filter);
-      chain->prev.last_width[i]  = 0;
-      chain->prev.last_height[i] = 0;
-      chain->prev.vertex_buf[i]  = (LPDIRECT3DVERTEXBUFFER9)
-         d3d9_vertex_buffer_new(
-            chain->dev, 4 * sizeof(struct Vertex),
-            D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, NULL);
+      for (i = 0; i < TEXTURES; i++)
+      {
+         chain->prev.last_dims[i]   = 0;
+         chain->prev.vertex_buf[i]  = NULL;
+            if (!SUCCEEDED(IDirect3DDevice9_CreateVertexBuffer(
+                        chain->dev,
+                        4 * sizeof(struct Vertex),
+                        D3DUSAGE_WRITEONLY, 0,
+                        D3DPOOL_DEFAULT,
+                        (LPDIRECT3DVERTEXBUFFER9*)&chain->prev.vertex_buf[i], NULL)))
+               chain->prev.vertex_buf[i] = NULL;
 
-      if (!chain->prev.vertex_buf[i])
-         return false;
+         if (!chain->prev.vertex_buf[i])
+            return false;
 
-      chain->prev.tex[i] = (LPDIRECT3DTEXTURE9)
-         d3d9_texture_new(chain->dev,
-            info->tex_w, info->tex_h, 1, 0, fmt,
-            D3DPOOL_MANAGED, 0, 0, 0, NULL, NULL, false);
+         chain->prev.tex[i] = NULL;
+         d3d9_tex_create(chain->dev,
+               VIDEO_SCALE_W(info->tex_dims),
+               VIDEO_SCALE_H(info->tex_dims), 1, 0,
+               (D3DFORMAT)fmt,
+               (LPDIRECT3DTEXTURE9*)&chain->prev.tex[i]);
 
-      if (!chain->prev.tex[i])
-         return false;
+         if (!chain->prev.tex[i])
+            return false;
 
-      IDirect3DDevice9_SetTexture(chain->dev, 0, (IDirect3DBaseTexture9*)chain->prev.tex[i]);
-      IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_MINFILTER, filter);
-      IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_MAGFILTER, filter);
-      IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_ADDRESSU,  D3DTADDRESS_BORDER);
-      IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_ADDRESSV,  D3DTADDRESS_BORDER);
-      IDirect3DDevice9_SetTexture(chain->dev, 0, (IDirect3DBaseTexture9*)NULL);
+         IDirect3DDevice9_SetTexture(chain->dev, 0, (IDirect3DBaseTexture9*)chain->prev.tex[i]);
+         IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_MINFILTER, filter);
+         IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_MAGFILTER, filter);
+         IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_ADDRESSU,  D3DTADDRESS_BORDER);
+         IDirect3DDevice9_SetSamplerState(dev,   0, D3DSAMP_ADDRESSV,  D3DTADDRESS_BORDER);
+         IDirect3DDevice9_SetTexture(chain->dev, 0, (IDirect3DBaseTexture9*)NULL);
+      }
    }
 
-   d3d9_hlsl_load_program_from_file(chain->dev,
-         &pass, info->pass->source.path);
+   /* Try to compile the per-pass shader.  If the source path is empty
+    * (stock-shader mode), this returns false and pass.vprg/fprg stay NULL
+    * — exactly the same as before. */
+   hlsl_uniform_map_init(&hlsl_chain->pass_data[0].vs_map);
+   hlsl_uniform_map_init(&hlsl_chain->pass_data[0].ps_map);
+   hlsl_chain->pass_data[0].vs_bytecode = NULL;
+   hlsl_chain->pass_data[0].ps_bytecode = NULL;
+   d3d9_hlsl_load_program_from_file_ex(chain->dev,
+         &pass, info->pass->source.path,
+         &hlsl_chain->pass_data[0]);
+   hlsl_chain->pass_data_count = 1;
 
    if (!hlsl_d3d9_renderchain_init_shader_fvf(chain, &pass))
       return false;
@@ -654,119 +2250,503 @@ static bool hlsl_d3d9_renderchain_create_first_pass(
    return true;
 }
 
-static void hlsl_d3d9_renderchain_calc_and_set_shader_mvp(
-      hlsl_renderchain_t *chain,
-      struct shader_pass *pass,
-      unsigned vp_width, unsigned vp_height,
+/* The MVP a pass draws with, its quad turned @rotation quarter turns */
+static const float *d3d9_hlsl_rotation_mvp(d3d9_video_t *d3d,
       unsigned rotation)
 {
-   struct d3d_matrix proj, ortho, rot, matrix;
-
-   d3d_matrix_identity(&ortho);
-   d3d_matrix_ortho_off_center_lh(&ortho, 0,
-         vp_width, 0, vp_height, 0, 1);
-   d3d_matrix_identity(&rot);
-   d3d_matrix_rotation_z(&rot, rotation * (D3D_PI / 2.0));
-   d3d_matrix_multiply(&proj, &ortho, &rot);
-   d3d_matrix_transpose(&matrix, &proj);
-
-   d3d9_hlsl_set_param_matrix((LPD3DXCONSTANTTABLE)pass->vtable,
-         chain->chain.dev, "modelViewProj", (const void*)&matrix);
-}
-
-static INLINE void d3d9_hlsl_renderchain_set_vertices_on_change(
-      d3d9_renderchain_t *chain,
-      struct shader_pass *pass,
-      unsigned width, unsigned height,
-      unsigned out_width, unsigned out_height,
-      unsigned vp_width, unsigned vp_height,
-      unsigned rotation
-      )
-{
-   struct Vertex vert[4];
-   void *verts       = NULL;
-   const struct
-      LinkInfo *info = (const struct LinkInfo*)&pass->info;
-   float _u          = (float)(width)  / info->tex_w;
-   float _v          = (float)(height) / info->tex_h;
-
-   pass->last_width  = width;
-   pass->last_height = height;
-
-   /* Copied from D3D8 driver */
-   vert[0].x        =  0.0f;
-   vert[0].y        =  1.0f;
-   vert[0].z        =  1.0f;
-
-   vert[1].x        =  1.0f;
-   vert[1].y        =  1.0f;
-   vert[1].z        =  1.0f;
-
-   vert[2].x        =  0.0f;
-   vert[2].y        =  0.0f;
-   vert[2].z        =  1.0f;
-
-   vert[3].x        =  1.0f;
-   vert[3].y        =  0.0f;
-   vert[3].z        =  1.0f;
-
-   vert[0].u        = 0.0f;
-   vert[0].v        = 0.0f;
-   vert[1].v        = 0.0f;
-   vert[2].u        = 0.0f;
-   vert[1].u        = _u;
-   vert[2].v        = _v;
-   vert[3].u        = _u;
-   vert[3].v        = _v;
-
-   vert[0].color    = 0xFFFFFFFF;
-   vert[1].color    = 0xFFFFFFFF;
-   vert[2].color    = 0xFFFFFFFF;
-   vert[3].color    = 0xFFFFFFFF;
-
-   /* Align texels and vertices.
-    *
-    * Fixes infamous 'half-texel offset' issue of D3D9
-    *	http://msdn.microsoft.com/en-us/library/bb219690%28VS.85%29.aspx.
-    */
-   /* Maybe we do need something like this left out for now */
-#if 0
-   for (i = 0; i < 4; i++)
+   /* Flat arrays matching register/column layout for
+    * SetVertexShaderConstantF + HLSL mul(matrix, vector).
+    * Each group of 4 = one register = one column.
+    * clip.x = c0.x*x + c1.x*y + c2.x*z + c3.x*w
+    * clip.y = c0.y*x + c1.y*y + c2.y*z + c3.y*w */
+   static const float rot90[16]  = {
+       0, 2, 0, 0, -2, 0, 0, 0, 0, 0, 1, 0, 1,-1, 0, 1 };
+   static const float rot180[16] = {
+      -2, 0, 0, 0,  0,-2, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1 };
+   static const float rot270[16] = {
+       0,-2, 0, 0,  2, 0, 0, 0, 0, 0, 1, 0,-1, 1, 0, 1 };
+   switch (rotation)
    {
-      vert[i].x    -= 0.5f;
-      vert[i].y    += 0.5f;
+      case 1: return rot90;
+      case 2: return rot180;
+      case 3: return rot270;
+      default: break;
    }
-#endif
-
-   IDirect3DVertexBuffer9_Lock(pass->vertex_buf, 0, 0, &verts, 0);
-   memcpy(verts, vert, sizeof(vert));
-   IDirect3DVertexBuffer9_Unlock(pass->vertex_buf);
+   return (const float*)&d3d->mvp;
 }
 
-
-static void hlsl_d3d9_renderchain_set_vertices(
+static void d3d9_hlsl_renderchain_render_pass(
       d3d9_video_t *d3d,
       hlsl_renderchain_t *chain,
       struct shader_pass *pass,
+      unsigned pass_index,
       unsigned width, unsigned height,
-      unsigned out_width, unsigned out_height,
-      unsigned vp_width, unsigned vp_height,
-      uint64_t frame_count,
-      unsigned rotation)
+      D3DVIEWPORT9 *vp,
+      const float *mvp_data,
+      unsigned out_dims)
 {
-   if (pass->last_width != width || pass->last_height != height)
-      d3d9_hlsl_renderchain_set_vertices_on_change(&chain->chain,
-            pass, width, height, out_width, out_height,
-            vp_width, vp_height, rotation);
+   unsigned i;
+   const hlsl_pass_data_t *pd = NULL;
+   int32_t filter;
+   /* The output's size: the viewport's, unless it is cut from it */
+   unsigned vp_width          = out_dims ? VIDEO_SCALE_W(out_dims) : vp->Width;
+   unsigned vp_height         = out_dims ? VIDEO_SCALE_H(out_dims) : vp->Height;
 
-   hlsl_d3d9_renderchain_calc_and_set_shader_mvp(chain, pass,
-         vp_width, vp_height, rotation);
-   hlsl_d3d9_renderchain_set_shader_params(&chain->chain,
-         chain->chain.dev,
-         pass,
-         width, height,
-         pass->info.tex_w, pass->info.tex_h,
-         vp_width, vp_height);
+   IDirect3DDevice9_SetViewport(chain->chain.dev, vp);
+
+   /* === Set vertices === */
+   if (pass->last_dims != VIDEO_SCALE_PACK(width, height))
+   {
+      struct Vertex vert[4];
+      void *verts       = NULL;
+      float _u          = (float)(width)
+         / VIDEO_SCALE_W(pass->info.tex_dims);
+      float _v          = (float)(height)
+         / VIDEO_SCALE_H(pass->info.tex_dims);
+
+      vert[0].x        =  0.0f;
+      vert[0].y        =  1.0f;
+      vert[0].z        =  1.0f;
+
+      vert[1].x        =  1.0f;
+      vert[1].y        =  1.0f;
+      vert[1].z        =  1.0f;
+
+      vert[2].x        =  0.0f;
+      vert[2].y        =  0.0f;
+      vert[2].z        =  1.0f;
+
+      vert[3].x        =  1.0f;
+      vert[3].y        =  0.0f;
+      vert[3].z        =  1.0f;
+
+      vert[0].u        = 0.0f;
+      vert[0].v        = 0.0f;
+      vert[1].v        = 0.0f;
+      vert[2].u        = 0.0f;
+      vert[1].u        = _u;
+      vert[2].v        = _v;
+      vert[3].u        = _u;
+      vert[3].v        = _v;
+
+      vert[0].color    = 0xFFFFFFFF;
+      vert[1].color    = 0xFFFFFFFF;
+      vert[2].color    = 0xFFFFFFFF;
+      vert[3].color    = 0xFFFFFFFF;
+
+      if (FAILED(IDirect3DVertexBuffer9_Lock(pass->vertex_buf,
+                  0, 0, &verts, 0)))
+         return;
+      memcpy(verts, vert, sizeof(vert));
+      IDirect3DVertexBuffer9_Unlock(pass->vertex_buf);
+      pass->last_dims = VIDEO_SCALE_PACK(width, height);
+   }
+
+   /* Determine the pass data to use for uniform upload */
+   if (pass->vprg && pass->fprg
+         && pass_index > 0 && pass_index <= chain->pass_data_count)
+      pd = &chain->pass_data[pass_index - 1];
+
+   /* === Render pass === */
+   filter       = d3d_translate_filter(pass->info.pass->filter);
+
+   if (pd)
+   {
+      IDirect3DDevice9_SetVertexShader(chain->chain.dev,
+            (LPDIRECT3DVERTEXSHADER9)pass->vprg);
+      IDirect3DDevice9_SetPixelShader(chain->chain.dev,
+            (LPDIRECT3DPIXELSHADER9)pass->fprg);
+   }
+   else
+   {
+      IDirect3DDevice9_SetVertexShader(chain->chain.dev,
+            (LPDIRECT3DVERTEXSHADER9)(&chain->stock_shader)->vprg);
+      IDirect3DDevice9_SetPixelShader(chain->chain.dev,
+            (LPDIRECT3DPIXELSHADER9)(&chain->stock_shader)->fprg);
+   }
+
+   IDirect3DDevice9_SetTexture(chain->chain.dev, 0,
+         (IDirect3DBaseTexture9*)pass->tex);
+
+   /* Upload MVP to c0 (stock shader) */
+   IDirect3DDevice9_SetVertexShaderConstantF(chain->chain.dev,
+         0, mvp_data, 4);
+
+   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+         0, D3DSAMP_MINFILTER, filter);
+   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+         0, D3DSAMP_MAGFILTER, filter);
+
+   IDirect3DDevice9_SetVertexDeclaration(
+         chain->chain.dev, pass->vertex_decl);
+   IDirect3DDevice9_SetStreamSource(
+         chain->chain.dev, 0, pass->vertex_buf,
+         0, sizeof(struct Vertex));
+
+   /* Per-pass shader binding (only when we have compiled programs) */
+   if (pd)
+   {
+      if (pd->vs_map.mvp >= 0)
+         IDirect3DDevice9_SetVertexShaderConstantF(chain->chain.dev,
+               pd->vs_map.mvp, mvp_data, 4);
+
+      {
+         float video_size[2];
+         float texture_size[2];
+         float output_size[2];
+         float frame_cnt;
+
+         video_size[0]   = (float)VIDEO_SCALE_W(pass->last_dims);
+         video_size[1]   = (float)VIDEO_SCALE_H(pass->last_dims);
+         texture_size[0] = (float)VIDEO_SCALE_W(pass->info.tex_dims);
+         texture_size[1] = (float)VIDEO_SCALE_H(pass->info.tex_dims);
+         output_size[0]  = (float)vp_width;
+         output_size[1]  = (float)vp_height;
+
+         if (pass->info.pass->frame_count_mod)
+            frame_cnt = (float)(chain->chain.frame_count
+                  % pass->info.pass->frame_count_mod);
+         else
+            /* SM2/SM3 has no uint registers, so frame_count must be
+             * bound as a float. fp32 mantissa is 23 bits, so values
+             * above 2^24 cannot be represented exactly. Mask to 24
+             * bits when the shader pass has not declared its own
+             * modulo, to keep the cast bit-exact in long sessions. */
+            frame_cnt = (float)(chain->chain.frame_count & 0xFFFFFFu);
+
+         if (pd->ps_map.video_size >= 0
+               && pd->ps_map.video_size == pd->ps_map.texture_size)
+         {
+            float packed0[4];
+            float packed1[4];
+            packed0[0] = video_size[0];
+            packed0[1] = video_size[1];
+            packed0[2] = texture_size[0];
+            packed0[3] = texture_size[1];
+            packed1[0] = output_size[0];
+            packed1[1] = output_size[1];
+            packed1[2] = frame_cnt;
+            packed1[3] = 1.0f;
+            d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.video_size, packed0, 1);
+            d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.output_size, packed1, 1);
+         }
+         else
+         {
+            float vs4[4];
+            float ts4[4];
+            vs4[0] = video_size[0];
+            vs4[1] = video_size[1];
+            vs4[2] = 0.0f;
+            vs4[3] = 0.0f;
+            ts4[0] = texture_size[0];
+            ts4[1] = texture_size[1];
+            ts4[2] = 0.0f;
+            ts4[3] = 0.0f;
+            d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.video_size,   vs4, 1);
+            d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.texture_size, ts4, 1);
+            if (pd->ps_map.output_size >= 0
+                  && pd->ps_map.output_size == pd->ps_map.frame_count)
+            {
+               float packed[4];
+               packed[0] = output_size[0];
+               packed[1] = output_size[1];
+               packed[2] = frame_cnt;
+               packed[3] = 1.0f;
+               d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.output_size, packed, 1);
+            }
+            else
+            {
+               float os4[4];
+               float fc4[4];
+               os4[0] = output_size[0];
+               os4[1] = output_size[1];
+               os4[2] = 0.0f;
+               os4[3] = 0.0f;
+               fc4[0] = frame_cnt;
+               fc4[1] = 0.0f;
+               fc4[2] = 0.0f;
+               fc4[3] = 0.0f;
+               d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.output_size,  os4, 1);
+               d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.frame_count,  fc4, 1);
+            }
+         }
+
+         /* Same for VS */
+         if (pd->vs_map.video_size >= 0
+               && pd->vs_map.video_size == pd->vs_map.texture_size)
+         {
+            float packed0[4];
+            float packed1[4];
+            packed0[0] = video_size[0];
+            packed0[1] = video_size[1];
+            packed0[2] = texture_size[0];
+            packed0[3] = texture_size[1];
+            packed1[0] = output_size[0];
+            packed1[1] = output_size[1];
+            packed1[2] = frame_cnt;
+            packed1[3] = 1.0f;
+            d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.video_size, packed0, 1);
+            d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.output_size, packed1, 1);
+         }
+         else
+         {
+            float vs4[4];
+            float ts4[4];
+            vs4[0] = video_size[0];
+            vs4[1] = video_size[1];
+            vs4[2] = 0.0f;
+            vs4[3] = 0.0f;
+            ts4[0] = texture_size[0];
+            ts4[1] = texture_size[1];
+            ts4[2] = 0.0f;
+            ts4[3] = 0.0f;
+            d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.video_size,   vs4, 1);
+            d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.texture_size, ts4, 1);
+            if (pd->vs_map.output_size >= 0
+                  && pd->vs_map.output_size == pd->vs_map.frame_count)
+            {
+               float packed[4];
+               packed[0] = output_size[0];
+               packed[1] = output_size[1];
+               packed[2] = frame_cnt;
+               packed[3] = 1.0f;
+               d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.output_size, packed, 1);
+            }
+            else
+            {
+               float os4[4];
+               float fc4[4];
+               os4[0] = output_size[0];
+               os4[1] = output_size[1];
+               os4[2] = 0.0f;
+               os4[3] = 0.0f;
+               fc4[0] = frame_cnt;
+               fc4[1] = 0.0f;
+               fc4[2] = 0.0f;
+               fc4[3] = 0.0f;
+               d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.output_size,  os4, 1);
+               d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.frame_count,  fc4, 1);
+            }
+         }
+      }
+
+      /* Bind ORIG texture */
+      {
+         struct shader_pass *first_pass = (struct shader_pass*)
+            &chain->chain.passes->data[0];
+         int ps_idx = pd->ps_map.orig_texture;
+
+         if (ps_idx >= 0)
+         {
+            int32_t orig_filter = d3d_translate_filter(
+                  first_pass->info.pass->filter);
+            IDirect3DDevice9_SetTexture(chain->chain.dev,
+                  ps_idx, (IDirect3DBaseTexture9*)first_pass->tex);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                  ps_idx, D3DSAMP_MINFILTER, orig_filter);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                  ps_idx, D3DSAMP_MAGFILTER, orig_filter);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                  ps_idx, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                  ps_idx, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+            unsigned_vector_list_append(chain->chain.bound_tex, ps_idx);
+         }
+
+         {
+            float vs[4];
+            float ts[4];
+            vs[0] = (float)VIDEO_SCALE_W(first_pass->last_dims);
+            vs[1] = (float)VIDEO_SCALE_H(first_pass->last_dims);
+            vs[2] = 0.0f;
+            vs[3] = 0.0f;
+            ts[0] = (float)VIDEO_SCALE_W(first_pass->info.tex_dims);
+            ts[1] = (float)VIDEO_SCALE_H(first_pass->info.tex_dims);
+            ts[2] = 0.0f;
+            ts[3] = 0.0f;
+            d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.orig_video_size,   vs, 1);
+            d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.orig_texture_size, ts, 1);
+            d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.orig_video_size,   vs, 1);
+            d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.orig_texture_size, ts, 1);
+         }
+      }
+
+      /* Bind PREV textures */
+      {
+         int32_t prev_filter = d3d_translate_filter(
+               chain->chain.passes->data[0].info.pass->filter);
+         float ts[4];
+
+         ts[0] = (float)VIDEO_SCALE_W(
+               chain->chain.passes->data[0].info.tex_dims);
+         ts[1] = (float)VIDEO_SCALE_H(
+               chain->chain.passes->data[0].info.tex_dims);
+         ts[2] = 0.0f;
+         ts[3] = 0.0f;
+
+         for (i = 0; i < TEXTURES - 1; i++)
+         {
+            int ps_idx = pd->ps_map.prev_texture[i];
+            if (ps_idx >= 0)
+            {
+               LPDIRECT3DTEXTURE9 tex = chain->chain.prev.tex[
+                  (chain->chain.prev.ptr - (i + 1)) & TEXTURESMASK];
+               IDirect3DDevice9_SetTexture(chain->chain.dev,
+                     ps_idx, (IDirect3DBaseTexture9*)tex);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_MINFILTER, prev_filter);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_MAGFILTER, prev_filter);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+               unsigned_vector_list_append(chain->chain.bound_tex, ps_idx);
+            }
+
+            {
+               float vs[4];
+               vs[0] = (float)VIDEO_SCALE_W(chain->chain.prev.last_dims[
+                     (chain->chain.prev.ptr - (i + 1)) & TEXTURESMASK]);
+               vs[1] = (float)VIDEO_SCALE_H(chain->chain.prev.last_dims[
+                     (chain->chain.prev.ptr - (i + 1)) & TEXTURESMASK]);
+               vs[2] = 0.0f;
+               vs[3] = 0.0f;
+               d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.prev_video_size[i],   vs, 1);
+               d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.prev_texture_size[i], ts, 1);
+               d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.prev_video_size[i],   vs, 1);
+               d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.prev_texture_size[i], ts, 1);
+            }
+         }
+      }
+
+      /* Bind LUT textures */
+      for (i = 0; i < chain->chain.luts->count; i++)
+      {
+         int ps_idx = d3d9_hlsl_ctab_find_register(
+               pd->ps_bytecode, pd->ps_bytecode_dwords,
+               chain->chain.luts->data[i].id, NULL, NULL);
+         if (ps_idx >= 0)
+         {
+            int32_t lut_filter = chain->chain.luts->data[i].smooth ? 2 : 1;
+            IDirect3DDevice9_SetTexture(chain->chain.dev, ps_idx, (IDirect3DBaseTexture9*)chain->chain.luts->data[i].tex);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev, ps_idx, D3DSAMP_MAGFILTER, lut_filter);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev, ps_idx, D3DSAMP_MINFILTER, lut_filter);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev, ps_idx, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+            IDirect3DDevice9_SetSamplerState(chain->chain.dev, ps_idx, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+            unsigned_vector_list_append(chain->chain.bound_tex, ps_idx);
+         }
+      }
+
+      /* Bind intermediate PASSn textures (2+ indices behind) */
+      if (pass_index >= 3)
+      {
+         for (i = 1; i < pass_index - 1; i++)
+         {
+            struct shader_pass *cp = (struct shader_pass*)
+               &chain->chain.passes->data[i];
+            int ps_idx = pd->ps_map.pass_texture[i - 1];
+
+            if (ps_idx >= 0)
+            {
+               int32_t pf = d3d_translate_filter(cp->info.pass->filter);
+               IDirect3DDevice9_SetTexture(chain->chain.dev,
+                     ps_idx, (IDirect3DBaseTexture9*)cp->tex);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_MINFILTER, pf);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_MAGFILTER, pf);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+               IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+                     ps_idx, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+               unsigned_vector_list_append(chain->chain.bound_tex, ps_idx);
+            }
+
+            {
+               float vs[4];
+               float ts[4];
+               vs[0] = (float)VIDEO_SCALE_W(cp->last_dims);
+               vs[1] = (float)VIDEO_SCALE_H(cp->last_dims);
+               vs[2] = 0.0f;
+               vs[3] = 0.0f;
+               ts[0] = (float)VIDEO_SCALE_W(cp->info.tex_dims);
+               ts[1] = (float)VIDEO_SCALE_H(cp->info.tex_dims);
+               ts[2] = 0.0f;
+               ts[3] = 0.0f;
+               d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.pass_video_size[i-1],   vs, 1);
+               d3d9_hlsl_set_vs_const(chain->chain.dev, pd->vs_map.pass_texture_size[i-1], ts, 1);
+               d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.pass_video_size[i-1],   vs, 1);
+               d3d9_hlsl_set_ps_const(chain->chain.dev, pd->ps_map.pass_texture_size[i-1], ts, 1);
+            }
+         }
+      }
+
+      /* Upload shader parameters */
+      for (i = 0; i < d3d->shader.num_parameters; i++)
+      {
+         float val[4];
+         int ps_reg   = d3d9_hlsl_ctab_find_register(
+               pd->ps_bytecode, pd->ps_bytecode_dwords,
+               d3d->shader.parameters[i].id, NULL, NULL);
+         int vs_reg   = d3d9_hlsl_ctab_find_register(
+               pd->vs_bytecode, pd->vs_bytecode_dwords,
+               d3d->shader.parameters[i].id, NULL, NULL);
+         val[0] = video_shader_param_get(&d3d->shader.parameters[i]);
+         val[1] = 0.0f;
+         val[2] = 0.0f;
+         val[3] = 0.0f;
+         d3d9_hlsl_set_ps_const(chain->chain.dev, ps_reg, val, 1);
+         d3d9_hlsl_set_vs_const(chain->chain.dev, vs_reg, val, 1);
+      }
+   }
+
+   IDirect3DDevice9_BeginScene(chain->chain.dev);
+   IDirect3DDevice9_DrawPrimitive(chain->chain.dev,
+         D3DPT_TRIANGLESTRIP, 0, 2);
+   IDirect3DDevice9_EndScene(chain->chain.dev);
+
+   /* So we don't render with linear filter into render targets,
+    * which apparently looked odd (too blurry). */
+   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+         0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+         0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+
+   /* Unbind all bound textures and vertex streams. */
+   {
+      int j;
+      for (j = 0; j < (int) chain->chain.bound_tex->count; j++)
+      {
+         IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+               chain->chain.bound_tex->data[j], D3DSAMP_MINFILTER, D3DTEXF_POINT);
+         IDirect3DDevice9_SetSamplerState(chain->chain.dev,
+               chain->chain.bound_tex->data[j], D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+         IDirect3DDevice9_SetTexture(chain->chain.dev,
+               chain->chain.bound_tex->data[j], (IDirect3DBaseTexture9*)NULL);
+      }
+
+      for (j = 0; j < (int) chain->chain.bound_vert->count; j++)
+         IDirect3DDevice9_SetStreamSource(chain->chain.dev, chain->chain.bound_vert->data[j], 0, 0, 0);
+   }
+
+   if (chain->chain.bound_tex)
+      chain->chain.bound_tex->count = 0;
+
+   if (chain->chain.bound_vert)
+      chain->chain.bound_vert->count = 0;
+}
+
+/* A pass's vertex and fragment programs, which hold a reference each
+ * from when they were made */
+static void d3d9_hlsl_release_programs(struct shader_pass *pass)
+{
+   if (pass->vprg)
+      IDirect3DVertexShader9_Release((LPDIRECT3DVERTEXSHADER9)pass->vprg);
+   if (pass->fprg)
+      IDirect3DPixelShader9_Release((LPDIRECT3DPIXELSHADER9)pass->fprg);
+   pass->vprg = NULL;
+   pass->fprg = NULL;
 }
 
 static void d3d9_hlsl_deinit_progs(hlsl_renderchain_t *chain)
@@ -788,27 +2768,78 @@ static void d3d9_hlsl_deinit_progs(hlsl_renderchain_t *chain)
                chain->chain.passes->data[i].vertex_decl);
       }
    }
+
+   /* Free per-pass bytecodes */
+   {
+      unsigned i;
+      for (i = 0; i < chain->pass_data_count; i++)
+         hlsl_pass_data_free(&chain->pass_data[i]);
+      chain->pass_data_count = 0;
+   }
+   hlsl_pass_data_free(&chain->stock_data);
+
+   /* The passes' programs and the stock one */
+   {
+      size_t i;
+      for (i = 0; i < chain->chain.passes->count; i++)
+         d3d9_hlsl_release_programs(&chain->chain.passes->data[i]);
+      d3d9_hlsl_release_programs(&chain->stock_shader);
+   }
+
+   /* The menu effects compiled so far */
+   {
+      unsigned i;
+      for (i = 0; i < 6; i++)
+      {
+         if (!(chain->pipeline_ready & (1u << i)))
+            continue;
+         d3d9_hlsl_release_programs(&chain->pipeline_shaders[i]);
+         hlsl_pass_data_free(&chain->pipeline_data[i]);
+      }
+      chain->pipeline_ready = 0;
+      chain->pipeline_tried = 0;
+   }
 }
 
-static void d3d9_hlsl_destroy_resources(hlsl_renderchain_t *chain)
+/* Menu effect @idx's program (0..5: ribbon, simple ribbon, simple snow,
+ * snow, bokeh, snowflake), compiled the first time the effect is drawn
+ * rather than all six when the chain is made: at most one is ever on
+ * screen. False when it cannot be had, and the effect is not drawn; one
+ * that will not compile is not tried again until the chain is remade. */
+static bool hlsl_d3d9_pipeline_ready(hlsl_renderchain_t *chain,
+      LPDIRECT3DDEVICE9 dev, unsigned idx)
 {
-   size_t i;
-
-   for (i = 0; i < TEXTURES; i++)
+   const char *src;
+   uint8_t bit;
+   if (idx > 5)
+      return false;
+   bit = (uint8_t)(1u << idx);
+   if (chain->pipeline_ready & bit)
+      return true;
+   if (chain->pipeline_tried & bit)
+      return false;
+   chain->pipeline_tried |= bit;
+   switch (idx)
    {
-      if (chain->chain.prev.tex[i])
-         IDirect3DTexture9_Release(chain->chain.prev.tex[i]);
-      if (chain->chain.prev.vertex_buf[i])
-         d3d9_vertex_buffer_free(chain->chain.prev.vertex_buf[i], NULL);
+      case 0:  src = hlsl_ribbon_program;        break;
+      case 1:  src = hlsl_ribbon_simple_program; break;
+      case 2:  src = hlsl_simple_snow_program;   break;
+      case 3:  src = hlsl_snow_program;          break;
+      case 4:  src = hlsl_bokeh_program;         break;
+      default: src = hlsl_snowflake_program;     break;
    }
-
-   d3d9_hlsl_deinit_progs(chain);
-
-   for (i = 0; i < chain->chain.luts->count; i++)
+   hlsl_uniform_map_init(&chain->pipeline_data[idx].vs_map);
+   hlsl_uniform_map_init(&chain->pipeline_data[idx].ps_map);
+   chain->pipeline_data[idx].vs_bytecode = NULL;
+   chain->pipeline_data[idx].ps_bytecode = NULL;
+   if (!d3d9_hlsl_load_program_ex(dev, &chain->pipeline_shaders[idx], src,
+            &chain->pipeline_data[idx]))
    {
-      if (chain->chain.luts->data[i].tex)
-         IDirect3DTexture9_Release(chain->chain.luts->data[i].tex);
+      RARCH_WARN("[D3D9 HLSL] Could not compile menu effect %u, it is not drawn.\n", idx);
+      return false;
    }
+   chain->pipeline_ready |= bit;
+   return true;
 }
 
 static void hlsl_d3d9_renderchain_free(void *data)
@@ -818,8 +2849,46 @@ static void hlsl_d3d9_renderchain_free(void *data)
    if (!chain)
       return;
 
-   d3d9_hlsl_destroy_resources(chain);
-   d3d9_renderchain_destroy_passes_and_luts(&chain->chain);
+   /* Destroy resources */
+   {
+      size_t i;
+
+      for (i = 0; i < TEXTURES; i++)
+      {
+         if (chain->chain.prev.tex[i])
+            d3d9_sw_fb_release(chain->chain.sw_fb,
+                  chain->chain.prev.tex[i]);
+         if (chain->chain.prev.vertex_buf[i])
+            d3d9_vertex_buffer_free(chain->chain.prev.vertex_buf[i], NULL);
+      }
+
+      d3d9_hlsl_deinit_progs(chain);
+
+      for (i = 0; i < chain->chain.luts->count; i++)
+      {
+         if (chain->chain.luts->data[i].tex)
+            IDirect3DTexture9_Release(chain->chain.luts->data[i].tex);
+      }
+   }
+
+   /* Destroy passes and luts */
+   if (chain->chain.passes)
+   {
+      int i;
+
+      for (i = 0; i < (int) chain->chain.passes->count; i++)
+      {
+         if (chain->chain.passes->data[i].attrib_map)
+            free(chain->chain.passes->data[i].attrib_map);
+      }
+
+      shader_pass_vector_list_free(chain->chain.passes);
+   }
+
+   lut_info_vector_list_free(chain->chain.luts);
+   unsigned_vector_list_free(chain->chain.bound_tex);
+   unsigned_vector_list_free(chain->chain.bound_vert);
+
    free(chain);
 }
 
@@ -837,151 +2906,110 @@ static bool hlsl_d3d9_renderchain_init(
    chain->chain.frame_count                 = 0;
    chain->chain.pixel_size                  = (fmt == RETRO_PIXEL_FORMAT_RGB565) ? 2 : 4;
 
-   if (!hlsl_d3d9_renderchain_create_first_pass(dev, &chain->chain, info, fmt))
-      return false;
-   if (!d3d9_hlsl_load_program(chain->chain.dev, &chain->stock_shader, stock_hlsl_program))
+   if (!hlsl_d3d9_renderchain_create_first_pass(dev, chain, info, fmt))
       return false;
 
-   d3d9_hlsl_bind_program(dev, &chain->stock_shader);
+   hlsl_uniform_map_init(&chain->stock_data.vs_map);
+   hlsl_uniform_map_init(&chain->stock_data.ps_map);
+   chain->stock_data.vs_bytecode = NULL;
+   chain->stock_data.ps_bytecode = NULL;
+   if (!d3d9_hlsl_load_program_ex(chain->chain.dev, &chain->stock_shader,
+            stock_hlsl_program, &chain->stock_data))
+      return false;
+
+   IDirect3DDevice9_SetVertexShader(dev, (LPDIRECT3DVERTEXSHADER9)(&chain->stock_shader)->vprg);
+   IDirect3DDevice9_SetPixelShader(dev, (LPDIRECT3DPIXELSHADER9)(&chain->stock_shader)->fprg);
+
+   /* The menu effects' programs are compiled when first drawn; see
+    * hlsl_d3d9_pipeline_ready */
+   chain->pipeline_ready = 0;
+   chain->pipeline_tried = 0;
 
    return true;
 }
 
-static void hlsl_d3d9_renderchain_render_pass(
-      hlsl_renderchain_t *chain,
-      struct shader_pass *pass,
-      unsigned pass_index)
+/* The output size of @pass's scale for an input of @in_w x @in_h, into
+ * *out_w and *out_h */
+static void d3d9_hlsl_pass_out_size(const hlsl_renderchain_t *chain,
+      const struct shader_pass *pass, unsigned in_w, unsigned in_h,
+      unsigned *out_w, unsigned *out_h)
 {
-   /* Currently we override the passes shader program
-      with the stock shader as at least the last pass
-      is not setup correctly */
-#if 0
-   d3d9_hlsl_bind_program(chain->chain.dev, pass);
-#else
-   d3d9_hlsl_bind_program(chain->chain.dev, &chain->stock_shader);
-#endif
-
-   IDirect3DDevice9_SetTexture(chain->chain.dev, 0,
-         (IDirect3DBaseTexture9*)pass->tex);
-
-   /* D3D8 sets the sampler address modes -
-      I've left them out for the time being
-      but maybe this is a bug in d3d9 */
-#if 0
-   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
-         0, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
-   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
-         0, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
-#endif
-   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
-         0, D3DSAMP_MINFILTER,
-         d3d_translate_filter(pass->info.pass->filter));
-   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
-         0, D3DSAMP_MAGFILTER,
-         d3d_translate_filter(pass->info.pass->filter));
-
-   IDirect3DDevice9_SetVertexDeclaration(
-         chain->chain.dev, pass->vertex_decl);
-   IDirect3DDevice9_SetStreamSource(
-         chain->chain.dev, 0, pass->vertex_buf,
-         0,sizeof(struct Vertex));
-
-#if 0
-   /* Set orig texture. */
-   d3d9_hlsl_renderchain_bind_orig(chain, chain->dev, pass);
-
-   /* Set prev textures. */
-   d3d9_hlsl_renderchain_bind_prev(chain, chain->dev, pass);
-
-   /* Set lookup textures */
-   for (i = 0; i < chain->luts->count; i++)
+   switch (pass->info.pass->fbo.type_x)
    {
-      CGparameter vparam;
-      CGparameter fparam = d3d9_hlsl_get_constant_by_name(
-            pass->fprg, chain->luts->data[i].id);
-      int bound_index    = -1;
+      case RARCH_SCALE_VIEWPORT:
+         *out_w = pass->info.pass->fbo.scale_x * chain->chain.out_vp->Width;
+         break;
+      case RARCH_SCALE_ABSOLUTE:
+         *out_w = pass->info.pass->fbo.abs_x;
+         break;
+      case RARCH_SCALE_INPUT:
+         *out_w = pass->info.pass->fbo.scale_x * in_w;
+         break;
+   }
+   switch (pass->info.pass->fbo.type_y)
+   {
+      case RARCH_SCALE_VIEWPORT:
+         *out_h = pass->info.pass->fbo.scale_y * chain->chain.out_vp->Height;
+         break;
+      case RARCH_SCALE_ABSOLUTE:
+         *out_h = pass->info.pass->fbo.abs_y;
+         break;
+      case RARCH_SCALE_INPUT:
+         *out_h = pass->info.pass->fbo.scale_y * in_h;
+         break;
+   }
+}
 
-      if (fparam)
+/* @chain's frame, @width x @height at @frame @pitch bytes a row, into
+ * its first pass's texture, and every pass before the last run. The
+ * last pass's input size goes into *last_dims. The render target is
+ * left as it was. */
+static void d3d9_hlsl_renderchain_run(d3d9_video_t *d3d,
+      hlsl_renderchain_t *chain, const void *frame,
+      unsigned width, unsigned height, unsigned pitch, unsigned *last_dims)
+{
+   unsigned i;
+   LPDIRECT3DSURFACE9 back_buffer = NULL;
+   LPDIRECT3DSURFACE9 target;
+   unsigned current_width         = width;
+   unsigned current_height        = height;
+   unsigned out_width             = 0;
+   unsigned out_height            = 0;
+   struct shader_pass *first_pass = (struct shader_pass*)
+      &chain->chain.passes->data[0];
+
+   first_pass->tex         = chain->chain.prev.tex[chain->chain.prev.ptr];
+   first_pass->vertex_buf  = chain->chain.prev.vertex_buf[
+      chain->chain.prev.ptr];
+   first_pass->last_dims   = chain->chain.prev.last_dims[
+      chain->chain.prev.ptr];
+
+#ifdef D3D9_HW_RENDER
+   if (chain->chain.hw_tex)
+      first_pass->tex      = chain->chain.hw_tex;
+   else
+#endif
+   /* Blit frame to first pass texture, unless the core wrote it there */
+   {
+      unsigned src_pitch = pitch;
+      const uint8_t *src = d3d9_sw_fb_src_begin(chain->chain.sw_fb, frame,
+            first_pass->tex, &src_pitch);
+      if (src)
       {
-         unsigned index  = cgGetParameterResourceIndex(fparam);
-         bound_index     = index;
-
-         d3d9_renderchain_add_lut_internal(chain, index, i);
-      }
-
-      vparam = d3d9_hlsl_get_constant_by_name(pass->vprg,
-            chain->luts->data[i].id);
-
-      if (vparam)
-      {
-         unsigned index = cgGetParameterResourceIndex(vparam);
-         if (index != (unsigned)bound_index)
-            d3d9_renderchain_add_lut_internal(chain, index, i);
+         d3d9_frame_put(chain->chain.sw_fb, chain->chain.dev,
+                  first_pass->tex, first_pass->info.tex_dims,
+                  first_pass->last_dims, src, src_pitch, width, height,
+                  chain->chain.pixel_size);
+         d3d9_sw_fb_src_end(chain->chain.sw_fb, frame, first_pass->tex);
       }
    }
 
-   /* We only bother binding passes which are two indices behind. */
-   if (pass_index >= 3)
-      d3d9_hlsl_renderchain_bind_pass(chain, chain->chain.dev,
-            pass, pass_index);
-#endif
-
-   IDirect3DDevice9_BeginScene(chain->chain.dev);
-   IDirect3DDevice9_DrawPrimitive(chain->chain.dev,
-         D3DPT_TRIANGLESTRIP, 0, 2);
-   IDirect3DDevice9_EndScene(chain->chain.dev);
-
-   /* So we don't render with linear filter into render targets,
-    * which apparently looked odd (too blurry). */
-   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
-         0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-   IDirect3DDevice9_SetSamplerState(chain->chain.dev,
-         0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-
-   d3d9_renderchain_unbind_all(&chain->chain);
-}
-
-static void hlsl_d3d9_renderchain_render(
-      d3d9_video_t *d3d,
-      const void *frame,
-      unsigned width, unsigned height,
-      unsigned pitch, unsigned rotation)
-{
-   LPDIRECT3DSURFACE9 back_buffer, target;
-   unsigned i, current_width, current_height,
-          out_width = 0, out_height = 0;
-   struct shader_pass *last_pass    = NULL;
-   struct shader_pass *first_pass   = NULL;
-   hlsl_renderchain_t *chain        = (hlsl_renderchain_t*)
-      d3d->renderchain_data;
-
-   d3d9_renderchain_start_render(&chain->chain);
-
-   current_width                  = width;
-   current_height                 = height;
-
-   first_pass                     = (struct shader_pass*)
-      &chain->chain.passes->data[0];
-
-   d3d9_convert_geometry(
-         &first_pass->info,
-         &out_width, &out_height,
-         current_width, current_height, chain->chain.out_vp);
-
-   d3d9_blit_to_texture(first_pass->tex,
-         frame,
-         first_pass->info.tex_w,
-         first_pass->info.tex_h,
-         width,
-         height,
-         first_pass->last_width,
-         first_pass->last_height,
-         pitch,
-         chain->chain.pixel_size);
-
-   /* Grab back buffer. */
-   d3d9_device_get_render_target(
-         chain->chain.dev, 0, (void**)&back_buffer);
+   if (chain->chain.passes->count > 1 && chain->chain.dev)
+   {
+      if (!SUCCEEDED(IDirect3DDevice9_GetRenderTarget(chain->chain.dev,
+                  0, (LPDIRECT3DSURFACE9*)&back_buffer)))
+         back_buffer = NULL;
+   }
 
    /* In-between render target passes. */
    for (i = 0; i < chain->chain.passes->count - 1; i++)
@@ -993,16 +3021,15 @@ static void hlsl_d3d9_renderchain_render(
          &chain->chain.passes->data[i + 1];
 
       IDirect3DTexture9_GetSurfaceLevel(
-		      (LPDIRECT3DTEXTURE9)to_pass->tex, 0, (IDirect3DSurface9**)&target);
+			      (LPDIRECT3DTEXTURE9)to_pass->tex, 0, (IDirect3DSurface9**)&target);
       IDirect3DDevice9_SetRenderTarget(chain->chain.dev, 0, target);
 
-      d3d9_convert_geometry(&from_pass->info,
-            &out_width, &out_height,
-            current_width, current_height, chain->chain.out_vp);
+      d3d9_hlsl_pass_out_size(chain, from_pass, current_width,
+            current_height, &out_width, &out_height);
 
       /* Clear out whole FBO. */
-      viewport.Width  = to_pass->info.tex_w;
-      viewport.Height = to_pass->info.tex_h;
+      viewport.Width  = VIDEO_SCALE_W(to_pass->info.tex_dims);
+      viewport.Height = VIDEO_SCALE_H(to_pass->info.tex_dims);
       viewport.MinZ   = 0.0f;
       viewport.MaxZ   = 1.0f;
 
@@ -1015,62 +3042,71 @@ static void hlsl_d3d9_renderchain_render(
       viewport.Width  = out_width;
       viewport.Height = out_height;
 
-      IDirect3DDevice9_SetViewport(
-            chain->chain.dev, (D3DVIEWPORT9*)&viewport);
-
-      hlsl_d3d9_renderchain_set_vertices(
+      d3d9_hlsl_renderchain_render_pass(
             d3d,
             chain, from_pass,
+            i + 1,
             current_width, current_height,
-            out_width, out_height,
-            out_width, out_height,
-            chain->chain.frame_count, 0);
-
-      hlsl_d3d9_renderchain_render_pass(chain,
-            from_pass,
-            i + 1);
+            &viewport, (const float*)&d3d->mvp, 0);
 
       current_width  = out_width;
       current_height = out_height;
       IDirect3DSurface9_Release(target);
    }
 
-   /* Final pass */
-   IDirect3DDevice9_SetRenderTarget(chain->chain.dev, 0, back_buffer);
-
-   last_pass = (struct shader_pass*)&chain->chain.passes->
-      data[chain->chain.passes->count - 1];
-
-   d3d9_convert_geometry(&last_pass->info,
-         &out_width, &out_height,
-         current_width, current_height, chain->chain.out_vp);
-
-   IDirect3DDevice9_SetViewport(
-         chain->chain.dev, (D3DVIEWPORT9*)chain->chain.out_vp);
-
-   hlsl_d3d9_renderchain_set_vertices(
-         d3d,
-         chain, last_pass,
-         current_width, current_height,
-         out_width, out_height,
-         chain->chain.out_vp->Width,
-         chain->chain.out_vp->Height,
-         chain->chain.frame_count, rotation);
-
-   hlsl_d3d9_renderchain_render_pass(chain, last_pass,
-         chain->chain.passes->count);
-
-   chain->chain.frame_count++;
-
    if (back_buffer)
+   {
+      IDirect3DDevice9_SetRenderTarget(chain->chain.dev, 0, back_buffer);
       IDirect3DSurface9_Release(back_buffer);
+   }
+   *last_dims = VIDEO_SCALE_PACK(current_width, current_height);
+}
 
-   d3d9_renderchain_end_render(&chain->chain);
-   d3d9_hlsl_bind_program(chain->chain.dev, &chain->stock_shader);
-   hlsl_d3d9_renderchain_calc_and_set_shader_mvp(
-         chain, &chain->stock_shader,
-         chain->chain.out_vp->Width,
-         chain->chain.out_vp->Height, 0);
+/* @chain's last pass, of an input @last_dims, into the render target's
+ * @vp with @mvp; @out_dims its output's size, 0 for @vp's */
+static void d3d9_hlsl_renderchain_last(d3d9_video_t *d3d,
+      hlsl_renderchain_t *chain, unsigned last_dims, D3DVIEWPORT9 *vp,
+      const float *mvp, unsigned out_dims)
+{
+   struct shader_pass *last_pass = (struct shader_pass*)
+      &chain->chain.passes->data[chain->chain.passes->count - 1];
+   d3d9_hlsl_renderchain_render_pass(d3d, chain, last_pass,
+         chain->chain.passes->count,
+         VIDEO_SCALE_W(last_dims), VIDEO_SCALE_H(last_dims),
+         vp, mvp, out_dims);
+}
+
+/* Past @chain's frame: its count, and its history moved on */
+static void d3d9_hlsl_renderchain_end(hlsl_renderchain_t *chain)
+{
+   chain->chain.frame_count++;
+   chain->chain.prev.last_dims[chain->chain.prev.ptr] =
+      chain->chain.passes->data[0].last_dims;
+   chain->chain.prev.ptr = (chain->chain.prev.ptr + 1) & TEXTURESMASK;
+}
+
+static void hlsl_d3d9_renderchain_render(
+      d3d9_video_t *d3d,
+      const void *frame,
+      unsigned width, unsigned height,
+      unsigned pitch, unsigned rotation)
+{
+   unsigned last_dims;
+   hlsl_renderchain_t *chain        = (hlsl_renderchain_t*)
+      d3d->renderchain_data;
+
+   d3d9_hlsl_renderchain_run(d3d, chain, frame, width, height, pitch,
+         &last_dims);
+   d3d9_hlsl_renderchain_last(d3d, chain, last_dims, chain->chain.out_vp,
+         d3d9_hlsl_rotation_mvp(d3d, rotation), 0);
+   d3d9_hlsl_renderchain_end(chain);
+
+   IDirect3DDevice9_SetVertexShader(chain->chain.dev, (LPDIRECT3DVERTEXSHADER9)(&chain->stock_shader)->vprg);
+   IDirect3DDevice9_SetPixelShader(chain->chain.dev, (LPDIRECT3DPIXELSHADER9)(&chain->stock_shader)->fprg);
+
+   if (chain->stock_data.vs_map.mvp >= 0)
+      IDirect3DDevice9_SetVertexShaderConstantF(chain->chain.dev,
+            chain->stock_data.vs_map.mvp, (const float*)&d3d->mvp, 4);
 }
 
 static bool hlsl_d3d9_renderchain_add_pass(
@@ -1078,44 +3114,4250 @@ static bool hlsl_d3d9_renderchain_add_pass(
       const struct LinkInfo *info)
 {
    struct shader_pass pass;
+   LPDIRECT3DTEXTURE9      tex;
+   LPDIRECT3DVERTEXBUFFER9 vertbuf = NULL;
 
    pass.info                   = *info;
-   pass.last_width             = 0;
-   pass.last_height            = 0;
+   pass.last_dims              = 0;
    pass.attrib_map             = (struct unsigned_vector_list*)
       unsigned_vector_list_new();
    pass.pool                   = D3DPOOL_DEFAULT;
 
-   d3d9_hlsl_load_program_from_file(
-         chain->chain.dev, &pass, info->pass->source.path);
+   {
+      unsigned idx = chain->pass_data_count;
+      if (idx < GFX_MAX_SHADERS + 1)
+      {
+         hlsl_uniform_map_init(&chain->pass_data[idx].vs_map);
+         hlsl_uniform_map_init(&chain->pass_data[idx].ps_map);
+         chain->pass_data[idx].vs_bytecode = NULL;
+         chain->pass_data[idx].ps_bytecode = NULL;
+         d3d9_hlsl_load_program_from_file_ex(
+               chain->chain.dev, &pass, info->pass->source.path,
+               &chain->pass_data[idx]);
+         chain->pass_data_count++;
+      }
+      else
+         d3d9_hlsl_load_program_from_file(
+               chain->chain.dev, &pass, info->pass->source.path);
+   }
 
-   if (hlsl_d3d9_renderchain_init_shader_fvf(&chain->chain, &pass))
-      return d3d9_renderchain_add_pass(&chain->chain, &pass,
-            info);
+   if (!hlsl_d3d9_renderchain_init_shader_fvf(&chain->chain, &pass))
+      return false;
+
+   if (!SUCCEEDED(IDirect3DDevice9_CreateVertexBuffer(
+               chain->chain.dev,
+               4 * sizeof(struct Vertex),
+               D3DUSAGE_WRITEONLY, 0,
+               D3DPOOL_DEFAULT,
+               (LPDIRECT3DVERTEXBUFFER9*)&vertbuf, NULL)))
+      return false;
+
+   pass.vertex_buf = vertbuf;
+
+   tex = NULL;
+   IDirect3DDevice9_CreateTexture(chain->chain.dev,
+         VIDEO_SCALE_W(info->tex_dims),
+         VIDEO_SCALE_H(info->tex_dims),
+         1,
+         D3DUSAGE_RENDERTARGET,
+         (chain->chain.passes->data[
+         chain->chain.passes->count - 1].info.pass->fbo.flags & FBO_SCALE_FLAG_FP_FBO)
+         ? D3DFMT_A32B32G32R32F : D3D9_ARGB8888_FORMAT,
+         D3DPOOL_DEFAULT,
+         (struct IDirect3DTexture9**)&tex, NULL);
+
+   if (!tex)
+      return false;
+
+   pass.tex        = tex;
+
+   IDirect3DDevice9_SetTexture(chain->chain.dev, 0, (IDirect3DBaseTexture9*)pass.tex);
+   IDirect3DDevice9_SetSamplerState(chain->chain.dev, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+   IDirect3DDevice9_SetSamplerState(chain->chain.dev, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+   IDirect3DDevice9_SetTexture(chain->chain.dev, 0, (IDirect3DBaseTexture9*)NULL);
+
+   shader_pass_vector_list_append(chain->chain.passes, pass);
+
+   return true;
+}
+
+/* =====================================================================
+ * CTAB-aware shader binding for multi-pass shader presets.
+ *
+ * These functions are used when a shader preset is loaded and per-pass
+ * programs are available.  They use the CTAB uniform maps to set
+ * parameters via SetVertexShaderConstantF / SetPixelShaderConstantF
+ * and bind ORIG/PREV/PASS/LUT textures at the correct sampler slots.
+ *
+ * The stock-shader path does NOT use these functions — it continues
+ * to use the existing no-op stubs, preserving identical behaviour.
+ * ===================================================================== */
+
+static DWORD *d3d9_hlsl_dup_bytecode(D3DBlob blob, size_t *out_dwords)
+{
+   size_t byte_size = blob->lpVtbl->GetBufferSize(blob);
+   size_t dwords    = byte_size / sizeof(DWORD);
+   DWORD *buf       = (DWORD*)malloc(byte_size);
+   if (buf)
+   {
+      memcpy(buf, blob->lpVtbl->GetBufferPointer(blob), byte_size);
+      *out_dwords = dwords;
+   }
+   else
+      *out_dwords = 0;
+   return buf;
+}
+
+/* Read a file into a malloc'd null-terminated string. Caller frees. */
+static char *d3d9_hlsl_read_file(const char *path, size_t *out_len)
+{
+   int64_t len;
+   char *buf = NULL;
+   RFILE *fp = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   if (!fp)
+      return NULL;
+
+   len = filestream_get_size(fp);
+   if (len <= 0)
+   {
+      filestream_close(fp);
+      return NULL;
+   }
+
+   buf = (char*)malloc((size_t)len + 1);
+   if (!buf)
+   {
+      filestream_close(fp);
+      return NULL;
+   }
+
+   filestream_read(fp, buf, (size_t)len);
+   buf[len] = '\0';
+   filestream_close(fp);
+
+   if (out_len)
+      *out_len = (size_t)len;
+   return buf;
+}
+
+/* Simple #include preprocessor for Cg/HLSL shader files.
+ *
+ * Scans the source for lines matching:
+ *   #include "filename"
+ * and replaces them with the contents of the referenced file,
+ * resolved relative to base_dir.  Handles recursive includes
+ * up to 16 levels deep. Returns a malloc'd string. */
+/* Simple preprocessor state for #ifdef/#ifndef/#else/#endif.
+ * Supports nesting up to 32 levels deep. */
+#define PREPROC_MAX_DEPTH 32
+
+typedef struct {
+   const char *names[64];
+   const char *values[64]; /* NULL = defined but no value (flag only) */
+   unsigned count;
+} preproc_defines_t;
+
+static void preproc_defines_init(preproc_defines_t *d)
+{
+   unsigned i;
+   for (i = 0; i < d->count; i++)
+   {
+      free((void*)d->names[i]);
+      d->names[i] = NULL;
+      d->values[i] = NULL;
+   }
+   d->count = 0;
+}
+
+static bool preproc_is_defined(const preproc_defines_t *d, const char *name, size_t name_len)
+{
+   unsigned i;
+   for (i = 0; i < d->count; i++)
+      if (strlen(d->names[i]) == name_len && strncmp(d->names[i], name, name_len) == 0)
+         return true;
    return false;
+}
+
+
+static void preproc_add_define(preproc_defines_t *d, const char *name, const char *value)
+{
+   if (d->count < 64)
+   {
+      d->names[d->count]  = name;
+      d->values[d->count] = value;
+      d->count++;
+   }
+}
+
+static bool d3d9_hlsl_is_ident_char(char c);
+
+static preproc_defines_t s_defines = { {NULL}, {NULL}, 0 };
+
+static char *d3d9_hlsl_preprocess_includes(
+      const char *source, const char *base_dir, unsigned depth)
+{
+   size_t src_len = strlen(source);
+   size_t cap     = src_len * 2 + 1;
+   size_t pos     = 0;
+   char *out      = (char*)malloc(cap);
+   const char *p  = source;
+
+   /* Conditional compilation stack */
+   bool   cond_active[PREPROC_MAX_DEPTH]; /* is this level's branch active? */
+   bool   cond_done[PREPROC_MAX_DEPTH];   /* has any branch been taken? */
+   int    cond_depth = 0;
+   bool   output_enabled = true;
+
+   /* Reset defines at the top-level call (depth 0) so each shader
+    * file gets a fresh set of preprocessor definitions. */
+   if (depth == 0)
+      preproc_defines_init(&s_defines);
+
+   if (!out || depth > 16)
+      return out;
+
+   /* Initialize top-level as active */
+   cond_active[0] = true;
+   cond_done[0]   = true;
+
+   while (*p)
+   {
+      const char *line_end = strchr(p, '\n');
+      size_t line_len;
+      const char *s;
+
+      if (!line_end)
+         line_end = p + strlen(p);
+      else
+         line_end++;
+
+      line_len = (size_t)(line_end - p);
+
+      /* Skip leading whitespace to check for preprocessor directives */
+      s = p;
+      while (s < line_end && (*s == ' ' || *s == '\t'))
+         s++;
+
+      if (*s == '#')
+      {
+         const char *dir = s + 1;
+         while (dir < line_end && (*dir == ' ' || *dir == '\t'))
+            dir++;
+
+         /* #ifdef NAME */
+         if (strncmp(dir, "ifdef", 5) == 0 && (dir[5] == ' ' || dir[5] == '\t'))
+         {
+            const char *nm = dir + 5;
+            const char *nm_end;
+            while (*nm == ' ' || *nm == '\t') nm++;
+            nm_end = nm;
+            while (nm_end < line_end && *nm_end != ' ' && *nm_end != '\t'
+                  && *nm_end != '\r' && *nm_end != '\n')
+               nm_end++;
+
+            if (cond_depth < PREPROC_MAX_DEPTH - 1)
+            {
+               cond_depth++;
+               if (output_enabled)
+               {
+                  bool def = preproc_is_defined(&s_defines, nm, (size_t)(nm_end - nm));
+                  cond_active[cond_depth] = def;
+                  cond_done[cond_depth]   = def;
+                  output_enabled          = def;
+               }
+               else
+               {
+                  cond_active[cond_depth] = false;
+                  cond_done[cond_depth]   = true; /* parent inactive */
+               }
+            }
+            p = line_end;
+            continue;
+         }
+
+         /* #ifndef NAME */
+         if (strncmp(dir, "ifndef", 6) == 0 && (dir[6] == ' ' || dir[6] == '\t'))
+         {
+            const char *nm = dir + 6;
+            const char *nm_end;
+            while (*nm == ' ' || *nm == '\t') nm++;
+            nm_end = nm;
+            while (nm_end < line_end && *nm_end != ' ' && *nm_end != '\t'
+                  && *nm_end != '\r' && *nm_end != '\n')
+               nm_end++;
+
+            if (cond_depth < PREPROC_MAX_DEPTH - 1)
+            {
+               cond_depth++;
+               if (output_enabled)
+               {
+                  bool def = preproc_is_defined(&s_defines, nm, (size_t)(nm_end - nm));
+                  cond_active[cond_depth] = !def;
+                  cond_done[cond_depth]   = !def;
+                  output_enabled          = !def;
+               }
+               else
+               {
+                  cond_active[cond_depth] = false;
+                  cond_done[cond_depth]   = true;
+               }
+            }
+            p = line_end;
+            continue;
+         }
+
+         /* #if defined(X) / #if !defined(X) / #if defined(X) || defined(Y) */
+         if (strncmp(dir, "if", 2) == 0 && (dir[2] == ' ' || dir[2] == '\t'))
+         {
+            const char *expr = dir + 2;
+            bool result = false;
+
+            while (*expr == ' ' || *expr == '\t') expr++;
+
+            /* Evaluate compound defined() expressions with || and && */
+            {
+               bool have_result = false;
+               bool current_op_is_or = true; /* default: first term */
+
+               while (expr < line_end)
+               {
+                  bool negate = false;
+                  bool term_result = false;
+
+                  while (*expr == ' ' || *expr == '\t' || *expr == '(') expr++;
+                  if (*expr == '!')
+                  {
+                     negate = true;
+                     expr++;
+                     while (*expr == ' ' || *expr == '\t') expr++;
+                  }
+
+                  if (strncmp(expr, "defined", 7) == 0)
+                  {
+                     const char *nm, *nm_end;
+                     expr += 7;
+                     while (*expr == ' ' || *expr == '\t') expr++;
+                     if (*expr == '(') expr++;
+                     while (*expr == ' ' || *expr == '\t') expr++;
+                     nm = expr;
+                     nm_end = nm;
+                     while (nm_end < line_end && d3d9_hlsl_is_ident_char(*nm_end))
+                        nm_end++;
+                     term_result = preproc_is_defined(&s_defines, nm, (size_t)(nm_end - nm));
+                     if (negate) term_result = !term_result;
+                     expr = nm_end;
+                     while (*expr == ')' || *expr == ' ' || *expr == '\t') expr++;
+                     have_result = true;
+                  }
+                  else
+                     break; /* Can't parse further */
+
+                  if (current_op_is_or)
+                     result = have_result ? (result || term_result) : term_result;
+                  else
+                     result = result && term_result;
+
+                  /* Check for || or && */
+                  if (expr + 1 < line_end && expr[0] == '|' && expr[1] == '|')
+                  { current_op_is_or = true; expr += 2; continue; }
+                  if (expr + 1 < line_end && expr[0] == '&' && expr[1] == '&')
+                  { current_op_is_or = false; expr += 2; continue; }
+                  break;
+               }
+
+               if (have_result)
+               {
+                  if (cond_depth < PREPROC_MAX_DEPTH - 1)
+                  {
+                     cond_depth++;
+                     if (output_enabled)
+                     {
+                        cond_active[cond_depth] = result;
+                        cond_done[cond_depth]   = result;
+                        output_enabled          = result;
+                     }
+                     else
+                     {
+                        cond_active[cond_depth] = false;
+                        cond_done[cond_depth]   = true;
+                     }
+                  }
+                  p = line_end;
+                  continue;
+               }
+            }
+
+            /* Unhandled #if expression — treat as unknown (skip block) */
+            if (cond_depth < PREPROC_MAX_DEPTH - 1)
+            {
+               cond_depth++;
+               cond_active[cond_depth] = false;
+               cond_done[cond_depth]   = false;
+               if (output_enabled)
+                  output_enabled = false;
+            }
+            p = line_end;
+            continue;
+         }
+
+         /* #elif defined(X) / #elif defined(X) || defined(Y) */
+         if (strncmp(dir, "elif", 4) == 0 && (dir[4] == ' ' || dir[4] == '\t'))
+         {
+            if (cond_depth > 0)
+            {
+               bool parent_active = (cond_depth <= 1) || cond_active[cond_depth - 1];
+               if (parent_active && !cond_done[cond_depth])
+               {
+                  /* Evaluate the elif condition */
+                  const char *expr = dir + 4;
+                  bool result = false;
+
+                  while (*expr == ' ' || *expr == '\t') expr++;
+
+                  /* Evaluate compound defined() expressions */
+                  {
+                     bool have_result = false;
+                     bool current_op_is_or = true;
+
+                     while (expr < line_end)
+                     {
+                        bool negate = false;
+                        bool term_result = false;
+
+                        while (*expr == ' ' || *expr == '\t' || *expr == '(') expr++;
+                        if (*expr == '!')
+                        {
+                           negate = true;
+                           expr++;
+                           while (*expr == ' ' || *expr == '\t') expr++;
+                        }
+
+                        if (strncmp(expr, "defined", 7) == 0)
+                        {
+                           const char *nm, *nm_end;
+                           expr += 7;
+                           while (*expr == ' ' || *expr == '\t') expr++;
+                           if (*expr == '(') expr++;
+                           while (*expr == ' ' || *expr == '\t') expr++;
+                           nm = expr;
+                           nm_end = nm;
+                           while (nm_end < line_end && d3d9_hlsl_is_ident_char(*nm_end))
+                              nm_end++;
+                           term_result = preproc_is_defined(&s_defines, nm, (size_t)(nm_end - nm));
+                           if (negate) term_result = !term_result;
+                           expr = nm_end;
+                           while (*expr == ')' || *expr == ' ' || *expr == '\t') expr++;
+                           have_result = true;
+                        }
+                        else
+                           break;
+
+                        if (current_op_is_or)
+                           result = have_result ? (result || term_result) : term_result;
+                        else
+                           result = result && term_result;
+
+                        if (expr + 1 < line_end && expr[0] == '|' && expr[1] == '|')
+                        { current_op_is_or = true; expr += 2; continue; }
+                        if (expr + 1 < line_end && expr[0] == '&' && expr[1] == '&')
+                        { current_op_is_or = false; expr += 2; continue; }
+                        break;
+                     }
+
+                     if (have_result && result)
+                     {
+                        cond_active[cond_depth] = true;
+                        cond_done[cond_depth]   = true;
+                        output_enabled          = true;
+                     }
+                     else
+                     {
+                        cond_active[cond_depth] = false;
+                        output_enabled          = false;
+                     }
+                  }
+               }
+               else
+               {
+                  cond_active[cond_depth] = false;
+                  output_enabled          = false;
+               }
+            }
+            p = line_end;
+            continue;
+         }
+
+         /* #else */
+         if (strncmp(dir, "else", 4) == 0
+               && (dir[4] == '\r' || dir[4] == '\n' || dir[4] == ' '
+                  || dir[4] == '\t' || dir[4] == '\0'))
+         {
+            if (cond_depth > 0)
+            {
+               /* Check if parent is active */
+               bool parent_active = (cond_depth <= 1) || cond_active[cond_depth - 1];
+               if (parent_active && !cond_done[cond_depth])
+               {
+                  cond_active[cond_depth] = true;
+                  cond_done[cond_depth]   = true;
+                  output_enabled          = true;
+               }
+               else
+               {
+                  cond_active[cond_depth] = false;
+                  output_enabled          = false;
+               }
+            }
+            p = line_end;
+            continue;
+         }
+
+         /* #endif */
+         if (strncmp(dir, "endif", 5) == 0
+               && (dir[5] == '\r' || dir[5] == '\n' || dir[5] == ' '
+                  || dir[5] == '\t' || dir[5] == '\0'))
+         {
+            if (cond_depth > 0)
+               cond_depth--;
+            /* Recalculate output_enabled */
+            output_enabled = true;
+            {
+               int i;
+               for (i = 1; i <= cond_depth; i++)
+                  if (!cond_active[i])
+                  { output_enabled = false; break; }
+            }
+            p = line_end;
+            continue;
+         }
+
+         /* #define NAME [value] — parse and store for expansion */
+         if (output_enabled && strncmp(dir, "define", 6) == 0
+               && (dir[6] == ' ' || dir[6] == '\t'))
+         {
+            const char *nm = dir + 6;
+            const char *nm_end;
+            while (*nm == ' ' || *nm == '\t') nm++;
+            nm_end = nm;
+            while (nm_end < line_end && d3d9_hlsl_is_ident_char(*nm_end))
+               nm_end++;
+
+            /* Mark as defined for #ifdef checks */
+            if (*nm_end != '(')
+            {
+               size_t nlen = (size_t)(nm_end - nm);
+               char *name_copy = (char*)malloc(nlen + 1);
+               if (name_copy)
+               {
+                  memcpy(name_copy, nm, nlen);
+                  name_copy[nlen] = '\0';
+                  preproc_add_define(&s_defines, name_copy, NULL);
+               }
+            }
+            /* Line is output below by the regular output path */
+         }
+
+         /* #include handling (only when output is enabled) */
+         if (output_enabled && strncmp(dir, "include", 7) == 0)
+         {
+            const char *q = dir + 7;
+            while (q < line_end && (*q == ' ' || *q == '\t'))
+               q++;
+
+            if (*q == '"' || *q == '<')
+            {
+               char close_char    = (*q == '"') ? '"' : '>';
+               const char *name_start = q + 1;
+               const char *name_end   = strchr(name_start, close_char);
+
+               if (name_end && name_end < line_end)
+               {
+                  char inc_path[PATH_MAX_LENGTH];
+                  char inc_name[PATH_MAX_LENGTH];
+                  size_t name_len_n = (size_t)(name_end - name_start);
+                  char *inc_src;
+
+                  if (name_len_n >= sizeof(inc_name))
+                     name_len_n = sizeof(inc_name) - 1;
+                  memcpy(inc_name, name_start, name_len_n);
+                  inc_name[name_len_n] = '\0';
+
+                  fill_pathname_join(inc_path, base_dir, inc_name,
+                        sizeof(inc_path));
+
+                  inc_src = d3d9_hlsl_read_file(inc_path, NULL);
+                  if (!inc_src)
+                     RARCH_WARN("[D3D9 HLSL] Could not open include: %s\n", inc_path);
+                  if (inc_src)
+                  {
+                     char inc_dir[PATH_MAX_LENGTH];
+                     char *resolved_inc;
+                     strlcpy(inc_dir, inc_path, sizeof(inc_dir));
+                     path_basedir(inc_dir);
+
+                     resolved_inc = d3d9_hlsl_preprocess_includes(
+                           inc_src, inc_dir, depth + 1);
+                     free(inc_src);
+
+                     if (resolved_inc)
+                     {
+                        size_t resolved_len = strlen(resolved_inc);
+                        while (pos + resolved_len + 2 >= cap)
+                        {
+                           char *tmp;
+                           cap *= 2;
+                           if (!(tmp = (char*)realloc(out, cap)))
+                           { free(out); free(resolved_inc); return NULL; }
+                           out = tmp;
+                        }
+                        memcpy(out + pos, resolved_inc, resolved_len);
+                        pos += resolved_len;
+                        if (resolved_len > 0 && resolved_inc[resolved_len - 1] != '\n')
+                           out[pos++] = '\n';
+                        free(resolved_inc);
+                     }
+
+                     p = line_end;
+                     continue;
+                  }
+               }
+            }
+         }
+      }
+
+      /* Output the line if enabled (and not a consumed preprocessor directive) */
+      if (output_enabled)
+      {
+         while (pos + line_len + 1 >= cap)
+         {
+            char *tmp;
+            cap *= 2;
+            if (!(tmp = (char*)realloc(out, cap)))
+            { free(out); return NULL; }
+            out = tmp;
+         }
+         memcpy(out + pos, p, line_len);
+         pos += line_len;
+      }
+
+      p = line_end;
+   }
+
+   out[pos] = '\0';
+   return out;
+}
+
+/* =====================================================================
+ * Cg → HLSL source-level fixups
+ *
+ * 1. Whole-word rename 'texture' → '_texture' (HLSL reserved keyword)
+ * 2. Extract 'uniform <type> <name>' parameters from function signatures
+ *    and hoist them to global scope.  HLSL requires semantics on every
+ *    VS/PS input parameter; Cg's 'uniform' qualifier marks parameters
+ *    that are set by the runtime (not vertex-stream data) which have
+ *    no semantic.  Moving them to global scope makes them plain globals
+ *    that the HLSL compiler treats as constants (matching CTAB layout).
+ * ===================================================================== */
+
+static bool d3d9_hlsl_is_ident_char(char c)
+{
+   return (c >= 'A' && c <= 'Z')
+       || (c >= 'a' && c <= 'z')
+       || (c >= '0' && c <= '9')
+       || c == '_';
+}
+
+/* Append a string to a dynamic buffer, growing as needed. */
+static bool d3d9_hlsl_buf_append(char **buf, size_t *pos, size_t *cap,
+      const char *str, size_t len)
+{
+   while (*pos + len + 1 >= *cap)
+   {
+      char  *tmp;
+      *cap *= 2;
+      /* realloc-into-tmp: the pre-patch '*buf = realloc(*buf, *cap)'
+       * form leaked the old buffer on OOM (self-assign overwrites
+       * the only pointer to it with NULL).  On failure free the old
+       * buffer and clear the caller's pointer so they don't double-
+       * free or use a now-invalid pointer. */
+      if (!(tmp = (char*)realloc(*buf, *cap)))
+      {
+         free(*buf);
+         *buf = NULL;
+         return false;
+      }
+      *buf = tmp;
+   }
+   memcpy(*buf + *pos, str, len);
+   *pos += len;
+   return true;
+}
+
+/* Add TEXCOORD semantics to struct members that lack them.
+ * Simple approach: find struct { ... } blocks, check if they qualify,
+ * and rewrite the block with semantics added.
+ *
+ * Returns a malloc'd modified copy, or NULL if no changes needed. */
+static char *d3d9_hlsl_add_struct_semantics(const char *source)
+{
+   /* Known structs to skip — these are uniform/input structs that
+    * must NOT get TEXCOORD semantics added to their members.
+    * 'input' is the Cg compat struct for video_size/texture_size/etc.
+    * 'in_vertex' is a dummy struct for the vertex input macro. */
+   static const char *skip_names[] = {
+      "input",
+      "in_vertex",
+      NULL
+   };
+   const char *p = source;
+   int texcoord_counter = 2;
+
+   /* First pass: find if any struct qualifies. If not, return NULL early. */
+   bool any_qualify = false;
+   {
+      const char *s = source;
+      while ((s = strstr(s, "struct")) != NULL)
+      {
+         if ((s == source || !d3d9_hlsl_is_ident_char(s[-1]))
+               && !d3d9_hlsl_is_ident_char(s[6]))
+         {
+            const char *nm = s + 6;
+            const char *nm_end;
+            size_t nm_len;
+            bool skip = false;
+            int i;
+
+            while (*nm == ' ' || *nm == '\t' || *nm == '\n' || *nm == '\r') nm++;
+            nm_end = nm;
+            while (d3d9_hlsl_is_ident_char(*nm_end)) nm_end++;
+            nm_len = (size_t)(nm_end - nm);
+            if (nm_len == 0) { s++; continue; }
+
+            for (i = 0; skip_names[i]; i++)
+               if (strlen(skip_names[i]) == nm_len
+                     && strncmp(nm, skip_names[i], nm_len) == 0)
+               { skip = true; break; }
+
+            if (!skip)
+            {
+               /* Find { ... } */
+               const char *ob = nm_end;
+               while (*ob && *ob != '{' && *ob != ';') ob++;
+               if (*ob == '{')
+               {
+                  const char *cb = ob + 1;
+                  int d = 1;
+                  bool any_no_sem = false, has_sampler = false, any_mem = false;
+                  while (*cb && d > 0)
+                  {
+                     if (*cb == '{') d++;
+                     else if (*cb == '}') d--;
+                     else if (d == 1 && strncmp(cb, "sampler", 7) == 0) has_sampler = true;
+                     else if (*cb == ';' && d == 1)
+                     {
+                        any_mem = true;
+                        /* Check if this specific member has ':' */
+                        {
+                           const char *ms = cb - 1;
+                           bool mem_has_sem = false;
+                           while (ms > ob && *ms != ';' && *ms != '{')
+                           {
+                              if (*ms == ':') mem_has_sem = true;
+                              ms--;
+                           }
+                           if (!mem_has_sem)
+                              any_no_sem = true;
+                        }
+                     }
+                     cb++;
+                  }
+                  if (any_mem && any_no_sem && !has_sampler)
+                     any_qualify = true;
+               }
+            }
+         }
+         s++;
+      }
+   }
+
+   if (!any_qualify)
+      return NULL;
+
+
+   /* Second pass: copy source, rewriting qualifying structs */
+   {
+      size_t src_len = strlen(source);
+      size_t cap = src_len + 1024;
+      size_t opos = 0;
+      char *out = (char*)malloc(cap);
+      if (!out) return NULL;
+
+      p = source;
+      while (*p)
+      {
+         if (strncmp(p, "struct", 6) == 0
+               && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+               && !d3d9_hlsl_is_ident_char(p[6]))
+         {
+            const char *nm = p + 6;
+            const char *nm_end;
+            size_t nm_len;
+            bool skip = false;
+            int i;
+
+            while (*nm == ' ' || *nm == '\t' || *nm == '\n' || *nm == '\r') nm++;
+            nm_end = nm;
+            while (d3d9_hlsl_is_ident_char(*nm_end)) nm_end++;
+            nm_len = (size_t)(nm_end - nm);
+
+            if (nm_len == 0) { p++; continue; }
+            for (i = 0; skip_names[i]; i++)
+               if (strlen(skip_names[i]) == nm_len
+                     && strncmp(nm, skip_names[i], nm_len) == 0)
+               { skip = true; break; }
+
+            if (!skip)
+            {
+               const char *ob = nm_end;
+               while (*ob && *ob != '{' && *ob != ';') ob++;
+               if (*ob == '{')
+               {
+                  const char *cb = ob + 1;
+                  int d = 1;
+                  bool any_no_sem = false, has_sampler = false, any_mem = false;
+                  while (*cb && d > 0)
+                  {
+                     if (*cb == '{') d++;
+                     else if (*cb == '}') d--;
+                     else if (d == 1 && strncmp(cb, "sampler", 7) == 0) has_sampler = true;
+                     else if (*cb == ';' && d == 1)
+                     {
+                        any_mem = true;
+                        {
+                           const char *ms = cb - 1;
+                           bool mem_has_sem = false;
+                           while (ms > ob && *ms != ';' && *ms != '{')
+                           {
+                              if (*ms == ':') mem_has_sem = true;
+                              ms--;
+                           }
+                           if (!mem_has_sem)
+                              any_no_sem = true;
+                        }
+                     }
+                     cb++;
+                  }
+
+                  if (any_mem && any_no_sem && !has_sampler)
+                  {
+                     /* Copy from p to ob (inclusive of '{') */
+                     {
+                        size_t len = (size_t)(ob + 1 - p);
+                        while (opos + len + 1 >= cap)
+                        {
+                           char *tmp;
+                           cap *= 2;
+                           if (!(tmp = (char*)realloc(out, cap)))
+                           { free(out); return NULL; }
+                           out = tmp;
+                        }
+                        memcpy(out + opos, p, len);
+                        opos += len;
+                     }
+
+                     /* Copy struct body, inserting TEXCOORD only before
+                      * ';' on members that don't already have ':' */
+                     /* First, scan for existing TEXCOORD indices to avoid conflicts */
+                     {
+                        const char *scan_tc = ob + 1;
+                        while (scan_tc < cb - 1)
+                        {
+                           if (strncmp(scan_tc, "TEXCOORD", 8) == 0)
+                           {
+                              int idx = 0;
+                              const char *dp = scan_tc + 8;
+                              while (*dp >= '0' && *dp <= '9')
+                              {
+                                 idx = idx * 10 + (*dp - '0');
+                                 dp++;
+                              }
+                              if (idx >= texcoord_counter)
+                                 texcoord_counter = idx + 1;
+                           }
+                           scan_tc++;
+                        }
+                     }
+                     {
+                        const char *mp = ob + 1;
+                        while (mp < cb - 1)
+                        {
+                           if (*mp == ';')
+                           {
+                              /* Check if this member already has ':' */
+                              bool has_colon = false;
+                              {
+                                 size_t bi = opos;
+                                 while (bi > 0 && out[bi-1] != ';' && out[bi-1] != '{')
+                                 {
+                                    if (out[bi-1] == ':') has_colon = true;
+                                    bi--;
+                                 }
+                              }
+                              if (!has_colon)
+                              {
+                                 char sem[32];
+                                 size_t sl = snprintf(sem, sizeof(sem),
+                                       " : TEXCOORD%d", texcoord_counter++);
+                                 while (opos + sl + 2 >= cap)
+                                 {
+                                    char *tmp;
+                                    cap *= 2;
+                                    if (!(tmp = (char*)realloc(out, cap)))
+                                    { free(out); return NULL; }
+                                    out = tmp;
+                                 }
+                                 memcpy(out + opos, sem, sl);
+                                 opos += sl;
+                              }
+                           }
+                           while (opos + 2 >= cap)
+                           {
+                              char *tmp;
+                              cap *= 2;
+                              if (!(tmp = (char*)realloc(out, cap)))
+                              { free(out); return NULL; }
+                              out = tmp;
+                           }
+                           out[opos++] = *mp++;
+                        }
+                     }
+
+                     /* Copy '}' and advance past struct */
+                     while (opos + 2 >= cap)
+                     {
+                        char *tmp;
+                        cap *= 2;
+                        if (!(tmp = (char*)realloc(out, cap)))
+                        { free(out); return NULL; }
+                        out = tmp;
+                     }
+                     out[opos++] = '}';
+                     p = cb;
+                     continue;
+                  }
+               }
+            }
+         }
+
+         /* Regular char */
+         while (opos + 2 >= cap)
+         {
+            char *tmp;
+            cap *= 2;
+            if (!(tmp = (char*)realloc(out, cap)))
+            { free(out); return NULL; }
+            out = tmp;
+         }
+         out[opos++] = *p++;
+      }
+
+      out[opos] = '\0';
+      return out;
+   }
+}
+
+/* Decompose sampler members out of structs for HLSL SM3.0 compatibility.
+ *
+ * HLSL SM3.0 doesn't allow samplers to be members of compound types.
+ * This pass:
+ *  1. Removes 'sampler2D _texture;' lines from struct bodies
+ *  2. For each 'uniform <structtype> VARNAME;', emits a standalone
+ *     'sampler2D VARNAME__texture;' declaration
+ *  3. Replaces 'VARNAME._texture' with 'VARNAME__texture' everywhere
+ *
+ * Returns a malloc'd modified copy, or NULL if no changes needed. */
+static char *d3d9_hlsl_decompose_struct_samplers(const char *source)
+{
+   /* Collect struct names that contain sampler members */
+   const char *sampler_structs[16];
+   size_t sampler_struct_lens[16];
+   unsigned sampler_struct_count = 0;
+
+   /* Collect instance variable names of those structs */
+   const char *instance_names[32];
+   size_t instance_name_lens[32];
+   unsigned instance_count = 0;
+
+   size_t src_len, cap, opos;
+   char *out;
+   const char *p;
+   bool modified = false;
+
+   /* Pass 1: find structs with sampler members */
+   {
+      const char *s = source;
+      while ((s = strstr(s, "struct")) != NULL)
+      {
+         if ((s == source || !d3d9_hlsl_is_ident_char(s[-1]))
+               && !d3d9_hlsl_is_ident_char(s[6]))
+         {
+            const char *nm = s + 6;
+            const char *nm_end;
+            while (*nm == ' ' || *nm == '\t' || *nm == '\n' || *nm == '\r') nm++;
+            nm_end = nm;
+            while (d3d9_hlsl_is_ident_char(*nm_end)) nm_end++;
+
+            if (nm_end > nm)
+            {
+               /* Find struct body */
+               const char *ob = nm_end;
+               while (*ob && *ob != '{' && *ob != ';') ob++;
+               if (*ob == '{')
+               {
+                  const char *cb = ob + 1;
+                  int d = 1;
+                  bool has_sampler = false;
+                  while (*cb && d > 0)
+                  {
+                     if (*cb == '{') d++;
+                     else if (*cb == '}') d--;
+                     else if (d == 1 && strncmp(cb, "sampler", 7) == 0)
+                        has_sampler = true;
+                     cb++;
+                  }
+                  if (has_sampler && sampler_struct_count < 16)
+                  {
+                     sampler_structs[sampler_struct_count] = nm;
+                     sampler_struct_lens[sampler_struct_count] = (size_t)(nm_end - nm);
+                     sampler_struct_count++;
+                  }
+               }
+            }
+         }
+         s++;
+      }
+   }
+
+   if (sampler_struct_count == 0)
+      return NULL;
+
+   /* Pass 2: find instances of sampler-containing structs
+    * Pattern: 'uniform <structname> VARNAME;' or just '<structname> VARNAME;' at global scope */
+   {
+      const char *s = source;
+      unsigned si;
+      while (*s)
+      {
+         for (si = 0; si < sampler_struct_count; si++)
+         {
+            size_t slen = sampler_struct_lens[si];
+            if (strncmp(s, sampler_structs[si], slen) == 0
+                  && !d3d9_hlsl_is_ident_char(s[slen])
+                  && (s == source || !d3d9_hlsl_is_ident_char(s[-1])
+                     || (s >= source + 8
+                        && strncmp(s - 8, "uniform ", 8) == 0)))
+            {
+               /* Find instance name after struct type */
+               const char *vn = s + slen;
+               const char *vn_end;
+               while (*vn == ' ' || *vn == '\t') vn++;
+               vn_end = vn;
+               while (d3d9_hlsl_is_ident_char(*vn_end)) vn_end++;
+
+               if (vn_end > vn && instance_count < 32)
+               {
+                  instance_names[instance_count] = vn;
+                  instance_name_lens[instance_count] = (size_t)(vn_end - vn);
+                  instance_count++;
+               }
+            }
+         }
+         s++;
+      }
+   }
+
+   /* Pass 3: rewrite source */
+   src_len = strlen(source);
+   cap = src_len + instance_count * 64 + 1024;
+   opos = 0;
+   out = (char*)malloc(cap);
+   if (!out) return NULL;
+
+   p = source;
+   while (*p)
+   {
+      /* Remove sampler member lines from sampler-containing structs.
+       * Look for lines containing 'sampler' followed by ';' */
+      {
+         /* Simpler approach: detect 'sampler2D _texture;' or 'sampler2D _texture ;'
+          * as a standalone line (with optional leading whitespace) */
+         {
+            /* Check if we're at line start */
+            if (p == source || p[-1] == '\n')
+            {
+               const char *ls = p;
+               while (*ls == ' ' || *ls == '\t') ls++;
+               /* Skip optional 'uniform' keyword */
+               if (strncmp(ls, "uniform", 7) == 0
+                     && !d3d9_hlsl_is_ident_char(ls[7]))
+               {
+                  ls += 7;
+                  while (*ls == ' ' || *ls == '\t') ls++;
+               }
+               if (strncmp(ls, "sampler2D", 9) == 0
+                     && !d3d9_hlsl_is_ident_char(ls[9]))
+               {
+                  const char *after_type = ls + 9;
+                  while (*after_type == ' ' || *after_type == '\t') after_type++;
+                  if (strncmp(after_type, "_texture", 8) == 0
+                        && !d3d9_hlsl_is_ident_char(after_type[8]))
+                  {
+                     /* Check this is inside a struct (find ';' on this line) */
+                     const char *semi = after_type + 8;
+                     while (*semi == ' ' || *semi == '\t') semi++;
+                     /* Skip optional ': SEMANTIC' annotation */
+                     if (*semi == ':')
+                     {
+                        semi++;
+                        while (*semi && *semi != ';' && *semi != '\n') semi++;
+                     }
+                     if (*semi == ';')
+                     {
+                        /* Check if we're inside a struct body by looking
+                         * for a preceding '{' without a matching '}' */
+                        /* Simple heuristic: skip this line */
+                        const char *nl = strchr(semi, '\n');
+                        if (nl) p = nl + 1; else p = semi + 1 + strlen(semi + 1);
+                        modified = true;
+                        continue;
+                     }
+                  }
+               }
+            }
+         }
+      }
+
+      /* After 'uniform <structname> VARNAME;', add 'sampler2D VARNAME__texture;' */
+      {
+         unsigned ii;
+         for (ii = 0; ii < instance_count; ii++)
+         {
+            size_t ilen = instance_name_lens[ii];
+            if (strncmp(p, instance_names[ii], ilen) == 0
+                  && !d3d9_hlsl_is_ident_char(p[ilen])
+                  && (p == source || !d3d9_hlsl_is_ident_char(p[-1])))
+            {
+               /* Check if followed by ';' (this is the declaration) */
+               const char *after = p + ilen;
+               while (*after == ' ' || *after == '\t') after++;
+               if (*after == ';')
+               {
+                  /* Copy 'VARNAME;' then add sampler declaration */
+                  size_t chunk = (size_t)(after + 1 - p);
+                  while (opos + chunk + ilen + 40 >= cap)
+                  {
+                     char *tmp;
+                     cap *= 2;
+                     if (!(tmp = (char*)realloc(out, cap)))
+                     { free(out); return NULL; }
+                     out = tmp;
+                  }
+                  memcpy(out + opos, p, chunk);
+                  opos += chunk;
+
+                  /* Add newline + sampler declaration */
+                  opos += snprintf(out + opos, cap - opos,
+                        "\nsampler2D %.*s__texture;",
+                        (int)ilen, instance_names[ii]);
+
+                  p = after + 1;
+                  modified = true;
+                  continue;
+               }
+            }
+         }
+      }
+
+      /* Replace ._texture with __texture globally.
+       * Any struct member access on _texture should be decomposed
+       * since _texture was our renamed sampler member.
+       * Special case: in #define macros with ## token pasting,
+       * use ##__texture to preserve correct token pasting. */
+      if (*p == '.' && strncmp(p + 1, "_texture", 8) == 0
+            && !d3d9_hlsl_is_ident_char(p[9]))
+      {
+         /* Check if preceded by ## (token paste operator) */
+         bool has_paste = (opos >= 2 && out[opos-1] == '#' && out[opos-2] == '#');
+         /* Also check for ##<identifier>. before ._texture:
+          * e.g. ##c._texture — the ## was before the identifier, not before the dot */
+         if (!has_paste && opos >= 1 && d3d9_hlsl_is_ident_char(out[opos-1]))
+         {
+            /* Scan back past the identifier to see if ## precedes it */
+            size_t bi = opos - 1;
+            while (bi > 0 && d3d9_hlsl_is_ident_char(out[bi-1])) bi--;
+            if (bi >= 2 && out[bi-1] == '#' && out[bi-2] == '#')
+               has_paste = true;
+         }
+
+         while (opos + 14 >= cap)
+         {
+            char *tmp;
+            cap *= 2;
+            if (!(tmp = (char*)realloc(out, cap)))
+            { free(out); return NULL; }
+            out = tmp;
+         }
+
+         if (has_paste)
+         {
+            memcpy(out + opos, "##__texture", 11);
+            opos += 11;
+         }
+         else
+         {
+            memcpy(out + opos, "__texture", 9);
+            opos += 9;
+         }
+         p += 9; /* skip ._texture */
+         modified = true;
+         continue;
+      }
+
+      /* Regular char */
+      while (opos + 2 >= cap)
+      {
+         char *tmp;
+         cap *= 2;
+         if (!(tmp = (char*)realloc(out, cap)))
+         { free(out); return NULL; }
+         out = tmp;
+      }
+      out[opos++] = *p++;
+   }
+
+   if (!modified)
+   {
+      free(out);
+      return NULL;
+   }
+
+   out[opos] = '\0';
+   return out;
+}
+
+#ifdef _MSC_VER
+#pragma optimize("", off) /* Avoid MSVC ICE on complex function */
+#endif
+static char *d3d9_hlsl_fixup_cg_source(const char *source)
+{
+   size_t src_len     = strlen(source);
+   size_t cap         = src_len * 2 + 4096;
+   size_t pos         = 0;
+   char  *out         = (char*)malloc(cap);
+   const char *p      = source;
+   int    paren_depth = 0;
+   int    brace_depth = 0;  /* track { } to know when we're at global scope */
+   size_t last_func_start = 0;
+
+   /* Track struct names for constructor replacement */
+   const char *struct_names[64];
+   size_t      struct_name_lens[64];
+   unsigned    struct_count = 0;
+
+   if (!out)
+      return NULL;
+
+   while (*p)
+   {
+      /* Skip #define lines entirely — don't apply any fixups to
+       * preprocessor macro definitions. Check if we're at a line start. */
+      {
+         bool at_line_start = (p == source || p[-1] == '\n');
+         if (at_line_start)
+         {
+            const char *d = p;
+            while (*d == ' ' || *d == '\t') d++;
+            if (*d == '#')
+            {
+               const char *dir = d + 1;
+               while (*dir == ' ' || *dir == '\t') dir++;
+               if (strncmp(dir, "define", 6) == 0
+                     && (dir[6] == ' ' || dir[6] == '\t'))
+               {
+                  /* Find the macro name */
+                  const char *mname = dir + 6;
+                  const char *mname_end;
+                  const char *eol;
+
+                  while (*mname == ' ' || *mname == '\t') mname++;
+                  mname_end = mname;
+                  while (d3d9_hlsl_is_ident_char(*mname_end)) mname_end++;
+
+                  /* Find end of line (with continuation) */
+                  eol = p;
+                  while (*eol)
+                  {
+                     const char *nl = strchr(eol, '\n');
+                     if (!nl) { eol += strlen(eol); break; }
+                     if (nl > eol && nl[-1] == '\\')
+                     { eol = nl + 1; continue; }
+                     eol = nl + 1;
+                     break;
+                  }
+
+                  /* Check if this is COMPAT_IN_VERTEX or COMPAT_IN_FRAGMENT */
+                  {
+                     bool is_vertex = ((size_t)(mname_end - mname) == 16
+                           && strncmp(mname, "COMPAT_IN_VERTEX", 16) == 0);
+                     bool is_fragment = ((size_t)(mname_end - mname) == 18
+                           && strncmp(mname, "COMPAT_IN_FRAGMENT", 18) == 0);
+
+                  if (is_vertex || is_fragment)
+                  {
+                     /* Parse the macro value as a comma-separated param list.
+                      * Split into params WITH semantics (kept in #define) and
+                      * params WITHOUT (emitted as global declarations before). */
+                     const char *val_start = mname_end;
+                     while (*val_start == ' ' || *val_start == '\t') val_start++;
+
+                     /* Collect params */
+                     {
+                        const char *vp = val_start;
+                        const char *val_end = eol;
+                        char globals_buf[2048];
+                        char kept_buf[2048];
+                        size_t gpos = 0, kpos = 0;
+
+                        /* Trim trailing whitespace/newline from value */
+                        while (val_end > val_start
+                              && (val_end[-1] == '\n' || val_end[-1] == '\r'
+                                 || val_end[-1] == ' ' || val_end[-1] == '\t'))
+                           val_end--;
+
+                        while (vp < val_end)
+                        {
+                           const char *param_start = vp;
+                           const char *param_end;
+                           bool has_colon = false;
+
+                           /* Find end of this param */
+                           while (vp < val_end && *vp != ',')
+                           {
+                              if (*vp == ':') has_colon = true;
+                              vp++;
+                           }
+                           param_end = vp;
+                           if (vp < val_end) vp++; /* skip comma */
+
+                           /* Trim whitespace */
+                           while (param_start < param_end
+                                 && (*param_start == ' ' || *param_start == '\t'))
+                              param_start++;
+                           while (param_end > param_start
+                                 && (param_end[-1] == ' ' || param_end[-1] == '\t'))
+                              param_end--;
+
+                           if (param_end <= param_start)
+                              continue;
+
+                           if (has_colon)
+                           {
+                              /* Already has semantic — keep as-is */
+                              if (kpos > 0)
+                              { kept_buf[kpos++] = ','; kept_buf[kpos++] = ' '; }
+                              memcpy(kept_buf + kpos, param_start,
+                                    (size_t)(param_end - param_start));
+                              kpos += (size_t)(param_end - param_start);
+                           }
+                           else
+                           {
+                              /* No semantic. If 'uniform', extract as global.
+                               * Otherwise (struct param like 'in_vertex VIN'),
+                               * keep in #define but DO NOT add semantic —
+                               * just extract as a global uniform too. */
+                              const char *ds = param_start;
+                              bool is_uniform = false;
+                              if (strncmp(ds, "uniform", 7) == 0
+                                    && !d3d9_hlsl_is_ident_char(ds[7]))
+                              {
+                                 is_uniform = true;
+                                 ds += 7;
+                                 while (*ds == ' ' || *ds == '\t') ds++;
+                              }
+
+                              /* Check has two tokens (type + name) */
+                              {
+                                 const char *tk = ds;
+                                 while (tk < param_end && d3d9_hlsl_is_ident_char(*tk)) tk++;
+                                 while (tk < param_end && (*tk == ' ' || *tk == '\t')) tk++;
+                                 if (tk < param_end && d3d9_hlsl_is_ident_char(*tk))
+                                 {
+                                    if (is_uniform)
+                                    {
+                                       /* Uniform param — always extract as global */
+                                       gpos += snprintf(globals_buf + gpos,
+                                             sizeof(globals_buf) - gpos,
+                                             "uniform %.*s;\n",
+                                             (int)(param_end - ds), ds);
+                                    }
+                                    else if (is_vertex)
+                                    {
+                                       /* VS non-uniform struct param (in_vertex VIN)
+                                        * — extract as global since the struct has
+                                        * no meaningful semantics (just a dummy). */
+                                       gpos += snprintf(globals_buf + gpos,
+                                             sizeof(globals_buf) - gpos,
+                                             "static %.*s;\n",
+                                             (int)(param_end - ds), ds);
+                                    }
+                                    else
+                                    {
+                                       /* Non-uniform struct param (e.g. in_vertex VIN,
+                                        * out_vertex VOUT) — keep in #define as-is.
+                                        * These are vertex/rasterizer inputs with
+                                        * per-member semantics. */
+                                       if (kpos > 0)
+                                       { kept_buf[kpos++] = ','; kept_buf[kpos++] = ' '; }
+                                       memcpy(kept_buf + kpos, param_start,
+                                             (size_t)(param_end - param_start));
+                                       kpos += (size_t)(param_end - param_start);
+                                    }
+                                 }
+                                 else
+                                 {
+                                    /* Single token (macro?) — keep in #define */
+                                    if (kpos > 0)
+                                    { kept_buf[kpos++] = ','; kept_buf[kpos++] = ' '; }
+                                    memcpy(kept_buf + kpos, param_start,
+                                          (size_t)(param_end - param_start));
+                                    kpos += (size_t)(param_end - param_start);
+                                 }
+                              }
+                           }
+                        }
+                        kept_buf[kpos] = '\0';
+                        globals_buf[gpos] = '\0';
+
+                        /* Output: globals first (with dedup), then rewritten #define */
+                        if (gpos > 0)
+                        {
+                           /* Check each global line for duplicates before emitting */
+                           char *gl = globals_buf;
+                           while (*gl)
+                           {
+                              char *gl_end = strchr(gl, '\n');
+                              size_t gl_len;
+                              if (!gl_end) gl_end = gl + strlen(gl);
+                              else gl_end++;
+                              gl_len = (size_t)(gl_end - gl);
+
+                              /* Check if this declaration exists in output */
+                              out[pos] = '\0';
+                              if (!strstr(out, gl))
+                                 d3d9_hlsl_buf_append(&out, &pos, &cap, gl, gl_len);
+
+                              gl = gl_end;
+                           }
+                        }
+
+                        {
+                           char def_line[2048];
+                           size_t dl = snprintf(def_line, sizeof(def_line),
+                                 "#define %.*s %s\n",
+                                 (int)(mname_end - mname), mname,
+                                 kept_buf);
+                           d3d9_hlsl_buf_append(&out, &pos, &cap,
+                                 def_line, dl);
+                        }
+                     }
+
+                     p = eol;
+                     continue;
+                  }
+                  } /* is_vertex || is_fragment */
+
+                  /* Regular #define — copy verbatim */
+                  {
+                     size_t ll = (size_t)(eol - p);
+                     /* Copy #define line, but apply texture -> _texture rename */
+                     {
+                        const char *dp = p;
+                        const char *de = p + ll;
+                        while (dp < de)
+                        {
+                           if (strncmp(dp, "texture", 7) == 0
+                                 && (dp == p || !d3d9_hlsl_is_ident_char(dp[-1]))
+                                 && !d3d9_hlsl_is_ident_char(dp[7]))
+                           {
+                              if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "_texture", 8))
+                                 goto fail;
+                              dp += 7;
+                           }
+                           else
+                           {
+                              if (!d3d9_hlsl_buf_append(&out, &pos, &cap, dp, 1))
+                                 goto fail;
+                              dp++;
+                           }
+                        }
+                     }
+                     p = eol;
+                     continue;
+                  }
+               }
+            }
+         }
+      }
+
+      /* --- Track struct declarations for constructor replacement --- */
+      if (brace_depth == 0 && paren_depth == 0
+            && strncmp(p, "struct", 6) == 0
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+            && !d3d9_hlsl_is_ident_char(p[6]))
+      {
+         const char *nm = p + 6;
+         while (*nm == ' ' || *nm == '\t' || *nm == '\r' || *nm == '\n')
+            nm++;
+         if (d3d9_hlsl_is_ident_char(*nm))
+         {
+            const char *nm_end = nm;
+            while (d3d9_hlsl_is_ident_char(*nm_end)) nm_end++;
+            if (struct_count < 64)
+            {
+               struct_names[struct_count] = nm;
+               struct_name_lens[struct_count] = (size_t)(nm_end - nm);
+               struct_count++;
+            }
+         }
+         /* Don't consume — fall through to normal output */
+      }
+
+      /* --- Fix 1: whole-word 'texture' -> '_texture' --- */
+      if (strncmp(p, "texture", 7) == 0
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+            && !d3d9_hlsl_is_ident_char(p[7]))
+      {
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "_texture", 8))
+            goto fail;
+         p += 7;
+         continue;
+      }
+
+      /* --- Fix 1e: whole-word 'mod' -> 'fmod' ---
+       * Cg has mod(x,y), HLSL uses fmod(x,y). */
+      if (strncmp(p, "mod", 3) == 0
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+            && !d3d9_hlsl_is_ident_char(p[3]))
+      {
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "fmod", 4))
+            goto fail;
+         p += 3;
+         continue;
+      }
+
+      /* --- Fix 1f: standalone 'sampler' -> 'sampler2D' ---
+       * Cg uses 'sampler' as a generic type interchangeable with sampler2D.
+       * HLSL treats 'sampler' as SamplerState which is incompatible.
+       * Only match 'sampler' NOT followed by 1D/2D/3D/CUBE. */
+      if (strncmp(p, "sampler", 7) == 0
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+            && !d3d9_hlsl_is_ident_char(p[7])
+            && strncmp(p + 7, "2D", 2) != 0
+            && strncmp(p + 7, "1D", 2) != 0
+            && strncmp(p + 7, "3D", 2) != 0
+            && strncmp(p + 7, "CUBE", 4) != 0)
+      {
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "sampler2D", 9))
+            goto fail;
+         p += 7;
+         continue;
+      }
+
+      /* --- Fix 1g: whole-word 'fract' -> 'frac' ---
+       * Cg has fract(x), HLSL uses frac(x). */
+      if (strncmp(p, "fract", 5) == 0
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+            && !d3d9_hlsl_is_ident_char(p[5]))
+      {
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "frac", 4))
+            goto fail;
+         p += 5;
+         continue;
+      }
+
+      /* --- Fix 1h: GLSL type renames ---
+       * Some Cg shaders use GLSL types. */
+      if ((p == source || !d3d9_hlsl_is_ident_char(p[-1])))
+      {
+         /* vec4 -> float4 */
+         if (strncmp(p, "vec4", 4) == 0 && !d3d9_hlsl_is_ident_char(p[4]))
+         { if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "float4", 6)) goto fail; p += 4; continue; }
+         /* vec3 -> float3 */
+         if (strncmp(p, "vec3", 4) == 0 && !d3d9_hlsl_is_ident_char(p[4]))
+         { if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "float3", 6)) goto fail; p += 4; continue; }
+         /* vec2 -> float2 */
+         if (strncmp(p, "vec2", 4) == 0 && !d3d9_hlsl_is_ident_char(p[4]))
+         { if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "float2", 6)) goto fail; p += 4; continue; }
+         /* mat4 -> float4x4 */
+         if (strncmp(p, "mat4", 4) == 0 && !d3d9_hlsl_is_ident_char(p[4]))
+         { if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "float4x4", 8)) goto fail; p += 4; continue; }
+         /* mat3 -> float3x3 */
+         if (strncmp(p, "mat3", 4) == 0 && !d3d9_hlsl_is_ident_char(p[4]))
+         { if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "float3x3", 8)) goto fail; p += 4; continue; }
+         /* mix -> lerp */
+         if (strncmp(p, "mix", 3) == 0 && !d3d9_hlsl_is_ident_char(p[3]))
+         { if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "lerp", 4)) goto fail; p += 3; continue; }
+      }
+
+      /* --- Fix 1a: 'const' -> 'static const' at global scope ---
+       * D3DCompile with backwards compat treats global 'const' as a CTAB
+       * uniform instead of embedding the literal value. 'static const'
+       * forces the value to be embedded in the bytecode. */
+      if (brace_depth == 0 && paren_depth == 0
+            && strncmp(p, "const", 5) == 0
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+            && !d3d9_hlsl_is_ident_char(p[5]))
+      {
+         /* Check it's not already 'static const' */
+         bool already_static = false;
+         if (p >= source + 7 && strncmp(p - 7, "static ", 7) == 0)
+            already_static = true;
+         /* Check for 'const static' — swap to 'static const' */
+         {
+            const char *after = p + 5;
+            while (*after == ' ' || *after == '\t') after++;
+            if (strncmp(after, "static", 6) == 0
+                  && !d3d9_hlsl_is_ident_char(after[6]))
+            {
+               /* Emit 'static const' and skip past 'const static' */
+               if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "static const", 12))
+                  goto fail;
+               p = after + 6;
+               continue;
+            }
+         }
+         if (!already_static)
+         {
+            if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "static const", 12))
+               goto fail;
+            p += 5;
+            continue;
+         }
+      }
+
+      /* --- Fix 1a2: add 'static' to global float/int declarations with initializers ---
+       * D3DCompile treats global 'float x = val;' as a CTAB uniform,
+       * ignoring the initializer. 'static float x = val;' embeds it.
+       * Only at global scope, not preceded by 'uniform' or 'static'. */
+      if (brace_depth == 0 && paren_depth == 0
+            && (strncmp(p, "float", 5) == 0 || strncmp(p, "int", 3) == 0)
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1])))
+      {
+         /* Determine the type keyword length */
+         size_t tlen = 0;
+         if (strncmp(p, "float4x4", 8) == 0 && !d3d9_hlsl_is_ident_char(p[8]))
+            tlen = 8;
+         else if (strncmp(p, "float4", 6) == 0 && !d3d9_hlsl_is_ident_char(p[6]))
+            tlen = 6;
+         else if (strncmp(p, "float3x3", 8) == 0 && !d3d9_hlsl_is_ident_char(p[8]))
+            tlen = 8;
+         else if (strncmp(p, "float3", 6) == 0 && !d3d9_hlsl_is_ident_char(p[6]))
+            tlen = 6;
+         else if (strncmp(p, "float2", 6) == 0 && !d3d9_hlsl_is_ident_char(p[6]))
+            tlen = 6;
+         else if (strncmp(p, "float", 5) == 0 && !d3d9_hlsl_is_ident_char(p[5]))
+            tlen = 5;
+         else if (strncmp(p, "int", 3) == 0 && !d3d9_hlsl_is_ident_char(p[3]))
+            tlen = 3;
+
+         if (tlen > 0)
+         {
+            /* Check: skip whitespace, identifier, skip whitespace, '=' */
+            const char *tk = p + tlen;
+            while (*tk == ' ' || *tk == '\t') tk++;
+            if (d3d9_hlsl_is_ident_char(*tk))
+            {
+               while (d3d9_hlsl_is_ident_char(*tk)) tk++;
+               while (*tk == ' ' || *tk == '\t') tk++;
+               if (*tk == '=' && tk[1] != '=') /* '=' but not '==' */
+               {
+                  /* Check not already preceded by 'static' or 'uniform' */
+                  bool skip = false;
+                  if (p >= source + 7 && strncmp(p - 7, "static ", 7) == 0)
+                     skip = true;
+                  if (p >= source + 8 && strncmp(p - 8, "uniform ", 8) == 0)
+                     skip = true;
+                  /* Also check output buffer for 'static ' or 'uniform ' */
+                  if (!skip && pos >= 7 && strncmp(out + pos - 7, "static ", 7) == 0)
+                     skip = true;
+                  if (!skip && pos >= 8 && strncmp(out + pos - 8, "uniform ", 8) == 0)
+                     skip = true;
+                  if (!skip && pos >= 6 && strncmp(out + pos - 6, "const ", 6) == 0)
+                     skip = true;
+
+                  /* Skip if this variable is a shader parameter declared
+                   * via '#pragma parameter'.  Making it static would bake
+                   * the default value into the bytecode and prevent the
+                   * menu from adjusting it at runtime. */
+                  if (!skip)
+                  {
+                     const char *vn = p + tlen;
+                     const char *vn_end;
+                     while (*vn == ' ' || *vn == '\t') vn++;
+                     vn_end = vn;
+                     while (d3d9_hlsl_is_ident_char(*vn_end)) vn_end++;
+                     if (vn_end > vn)
+                     {
+                        size_t vn_len = (size_t)(vn_end - vn);
+                        const char *sp = source;
+                        while ((sp = strstr(sp, "#pragma parameter")) != NULL)
+                        {
+                           const char *pp = sp + 17; /* strlen("#pragma parameter") */
+                           while (*pp == ' ' || *pp == '\t') pp++;
+                           if (strncmp(pp, vn, vn_len) == 0
+                                 && !d3d9_hlsl_is_ident_char(pp[vn_len]))
+                           {
+                              skip = true;
+                              break;
+                           }
+                           sp = pp;
+                        }
+                     }
+                  }
+
+                  if (!skip)
+                  {
+                     if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "static ", 7))
+                        goto fail;
+                     /* Fall through to copy the type keyword normally */
+                  }
+               }
+            }
+         }
+      }
+
+      /* --- Fix 1b: strip 'uniform' from struct member declarations ---
+       * Cg allows 'uniform sampler2D tex' inside structs; HLSL doesn't. */
+      if (brace_depth > 0 && paren_depth == 0
+            && strncmp(p, "uniform", 7) == 0
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1]))
+            && !d3d9_hlsl_is_ident_char(p[7]))
+      {
+         /* Skip the 'uniform' keyword and trailing whitespace */
+         p += 7;
+         while (*p == ' ' || *p == '\t') p++;
+         continue;
+      }
+
+      /* --- Fix 1c: replace Cg struct constructors ---
+       * Cg: coords = tex_coords(a, b, c);
+       * HLSL: { tex_coords _sc = {a, b, c}; coords = _sc; }
+       *
+       * Detect: inside function body, identifier matching known struct
+       * name followed by '(', preceded by '=' in the output. */
+      if (brace_depth > 0 && paren_depth == 0
+            && d3d9_hlsl_is_ident_char(*p))
+      {
+         unsigned si;
+         for (si = 0; si < struct_count; si++)
+         {
+            size_t slen = struct_name_lens[si];
+            if (strncmp(p, struct_names[si], slen) == 0
+                  && !d3d9_hlsl_is_ident_char(p[slen])
+                  && (p == source || !d3d9_hlsl_is_ident_char(p[-1])))
+            {
+               /* Check if followed by '(' (with optional whitespace) */
+               const char *after_name = p + slen;
+               while (*after_name == ' ' || *after_name == '\t')
+                  after_name++;
+
+               if (*after_name == '(')
+               {
+                  /* Check if preceded by '=' in the output (assignment context) */
+                  size_t bi = pos;
+                  while (bi > 0 && (out[bi-1] == ' ' || out[bi-1] == '\t'))
+                     bi--;
+                  if (bi > 0 && out[bi-1] == '=')
+                  {
+                     /* Find the matching ')' */
+                     const char *args_start = after_name + 1;
+                     const char *args_end   = args_start;
+                     int depth = 1;
+                     while (*args_end && depth > 0)
+                     {
+                        if (*args_end == '(') depth++;
+                        else if (*args_end == ')') depth--;
+                        if (depth > 0) args_end++;
+                     }
+
+                     if (depth == 0)
+                     {
+                        /* Find the variable name before '=' by scanning
+                         * backwards in the output past '=' and whitespace */
+                        size_t var_end = bi - 1; /* before '=' */
+                        size_t var_start;
+                        char var_name[256];
+                        size_t var_len;
+                        char replacement[4096];
+                        size_t rlen;
+
+                        while (var_end > 0 && (out[var_end-1] == ' '
+                                 || out[var_end-1] == '\t'))
+                           var_end--;
+                        var_start = var_end;
+                        while (var_start > 0
+                              && (d3d9_hlsl_is_ident_char(out[var_start-1])
+                                 || out[var_start-1] == '.'))
+                           var_start--;
+
+                        var_len = var_end - var_start;
+                        if (var_len > 0 && var_len < sizeof(var_name))
+                        {
+                           size_t args_len = (size_t)(args_end - args_start);
+
+                           memcpy(var_name, out + var_start, var_len);
+                           var_name[var_len] = '\0';
+
+                           /* Build: { structname _sc = {args}; var = _sc; }
+                            * But we need to replace the "var =" already in the output.
+                            * Rewind output to var_start and write the replacement. */
+                           rlen = snprintf(replacement, sizeof(replacement),
+                                 "{ %.*s _sc = {%.*s}; %s = _sc; }",
+                                 (int)slen, struct_names[si],
+                                 (int)args_len, args_start,
+                                 var_name);
+
+                           /* Rewind output to var_start */
+                           pos = var_start;
+
+                           if (!d3d9_hlsl_buf_append(&out, &pos, &cap,
+                                    replacement, rlen))
+                              goto fail;
+
+                           /* Skip past ')' in source, and the ';' if present */
+                           p = args_end + 1; /* skip ')' */
+                           while (*p == ' ' || *p == '\t') p++;
+                           if (*p == ';') p++; /* skip ';' */
+
+                           goto struct_ctor_done;
+                        }
+                     }
+                  }
+               }
+            }
+         }
+struct_ctor_done:
+         if (si < struct_count)
+            continue; /* constructor was replaced */
+      }
+
+      /* --- Fix 1d: expand float3/4(scalar) to float3/4(s,s,...) ---
+       * Cg supports float3(x) as a splat constructor. HLSL requires
+       * the correct number of arguments.
+       * Note: float2(expr) is NOT expanded because it's usually
+       * float2(float2_expr) which is a valid HLSL cast. */
+      if (strncmp(p, "float", 5) == 0
+            && (p[5] >= '3' && p[5] <= '4')
+            && p[6] == '('
+            && (p == source || !d3d9_hlsl_is_ident_char(p[-1])))
+      {
+         int n_components = p[5] - '0';
+         /* Check if this is a single-argument call (no comma at depth 0) */
+         const char *args_start = p + 7;
+         const char *scan = args_start;
+         int depth = 1;
+         bool has_comma = false;
+         while (*scan && depth > 0)
+         {
+            if (*scan == '(') depth++;
+            else if (*scan == ')') { if (--depth == 0) break; }
+            else if (*scan == ',' && depth == 1) { has_comma = true; break; }
+            scan++;
+         }
+
+         if (!has_comma && depth == 0 && scan > args_start)
+         {
+            /* Single argument — Cg splat constructor float4(x) → all components.
+             * Use a cast (float4)(x) which handles both scalar and bool args
+             * correctly in HLSL. */
+            size_t arg_len = (size_t)(scan - args_start);
+            char arg[512];
+            if (arg_len < sizeof(arg))
+            {
+               char cast_buf[32];
+               size_t cast_len;
+               memcpy(arg, args_start, arg_len);
+               arg[arg_len] = '\0';
+
+               /* Emit ((floatN)(arg)) */
+               cast_len = snprintf(cast_buf, sizeof(cast_buf),
+                     "((float%d)(", n_components);
+               if (!d3d9_hlsl_buf_append(&out, &pos, &cap, cast_buf, cast_len))
+                  goto fail;
+               if (!d3d9_hlsl_buf_append(&out, &pos, &cap, arg, arg_len))
+                  goto fail;
+               if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "))", 2))
+                  goto fail;
+
+               p = scan + 1; /* skip past ')' */
+               continue;
+            }
+         }
+
+         /* Check for floatN(X, X, X, X) where all args are identical.
+          * Cg allows float4(float4_val, float4_val, ...) taking first
+          * N components. HLSL does not. Replace with just X. */
+         if (has_comma)
+         {
+            /* Re-scan to collect all arguments */
+            const char *a_start[4];
+            size_t a_len[4];
+            int a_count = 0;
+            const char *as = args_start;
+            int d2 = 1;
+            bool all_same = true;
+
+            a_start[0] = as;
+            while (*as && d2 > 0 && a_count < 4)
+            {
+               if (*as == '(') d2++;
+               else if (*as == ')') { if (--d2 == 0) break; }
+               else if (*as == ',' && d2 == 1)
+               {
+                  /* Trim whitespace from current arg */
+                  const char *ae = as;
+                  while (ae > a_start[a_count]
+                        && (ae[-1] == ' ' || ae[-1] == '\t'))
+                     ae--;
+                  while (a_start[a_count] < ae
+                        && (*a_start[a_count] == ' '
+                           || *a_start[a_count] == '\t'))
+                     a_start[a_count]++;
+                  a_len[a_count] = (size_t)(ae - a_start[a_count]);
+                  a_count++;
+                  if (a_count < 4)
+                     a_start[a_count] = as + 1;
+               }
+               as++;
+            }
+            /* Last argument */
+            if (d2 == 0 && a_count < 4)
+            {
+               const char *ae = as;
+               while (ae > a_start[a_count]
+                     && (ae[-1] == ' ' || ae[-1] == '\t'))
+                  ae--;
+               while (a_start[a_count] < ae
+                     && (*a_start[a_count] == ' '
+                        || *a_start[a_count] == '\t'))
+                  a_start[a_count]++;
+               a_len[a_count] = (size_t)(ae - a_start[a_count]);
+               a_count++;
+            }
+
+            if (a_count == n_components && a_count >= 3)
+            {
+               int ai;
+               for (ai = 1; ai < a_count; ai++)
+               {
+                  if (a_len[ai] != a_len[0]
+                        || strncmp(a_start[0], a_start[ai], a_len[0]) != 0)
+                  { all_same = false; break; }
+               }
+
+               if (all_same && a_len[0] > 0
+                     && d3d9_hlsl_is_ident_char(a_start[0][0])
+                     && !(a_start[0][0] >= '0' && a_start[0][0] <= '9'))
+               {
+                  if (!d3d9_hlsl_buf_append(&out, &pos, &cap, "(", 1))
+                     goto fail;
+                  if (!d3d9_hlsl_buf_append(&out, &pos, &cap,
+                           a_start[0], a_len[0]))
+                     goto fail;
+                  if (!d3d9_hlsl_buf_append(&out, &pos, &cap, ")", 1))
+                     goto fail;
+                  p = as + 1; /* skip past ')' */
+                  continue;
+               }
+            }
+         }
+      }
+
+      /* Track braces for scope detection */
+      if (*p == '{')
+      {
+         brace_depth++;
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, p, 1))
+            goto fail;
+         p++;
+         continue;
+      }
+      if (*p == '}')
+      {
+         if (brace_depth > 0) brace_depth--;
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, p, 1))
+            goto fail;
+         p++;
+         continue;
+      }
+
+      /* Track paren depth — only for function definitions, not macro calls.
+       * A function definition '(' is preceded by the function name identifier
+       * and the line looks like: <type> <name>( ... )
+       * We detect this by checking that:
+       *  - we're at paren_depth 0
+       *  - the '(' is preceded by an identifier (function name)
+       *  - the line does NOT start with '#' (not a preprocessor line)
+       *  - the line does NOT start with 'uniform' (not a uniform declaration) */
+      if (*p == '(')
+      {
+         if (paren_depth == 0 && brace_depth == 0)
+         {
+            /* Check if this looks like a function definition */
+            bool is_func_sig = false;
+
+            /* Look at the line start to rule out preprocessor/uniform lines */
+            {
+               size_t ls = pos;
+               while (ls > 0 && out[ls - 1] != '\n')
+                  ls--;
+               /* Skip whitespace at line start */
+               {
+                  size_t cs = ls;
+                  while (cs < pos && (out[cs] == ' ' || out[cs] == '\t'))
+                     cs++;
+                  /* Not a preprocessor line and not 'uniform' */
+                  if (cs < pos && out[cs] != '#'
+                        && strncmp(out + cs, "uniform", 7) != 0)
+                  {
+                     /* Check that '(' is preceded by an identifier
+                      * AND the function is main_vertex or main_fragment
+                      * (don't extract params from helper functions).
+                      * Scan backward past whitespace/newlines since the
+                      * name may be on a previous line: main_vertex\n  ( */
+                     {
+                        size_t ne = pos;
+                        while (ne > 0 && (out[ne - 1] == ' '
+                              || out[ne - 1] == '\t'
+                              || out[ne - 1] == '\r'
+                              || out[ne - 1] == '\n'))
+                           ne--;
+                        if (ne > 0 && d3d9_hlsl_is_ident_char(out[ne - 1]))
+                        {
+                           if ((ne >= 11 && strncmp(out + ne - 11, "main_vertex", 11) == 0
+                                    && (ne == 11 || !d3d9_hlsl_is_ident_char(out[ne - 12])))
+                                 || (ne >= 13 && strncmp(out + ne - 13, "main_fragment", 13) == 0
+                                    && (ne == 13 || !d3d9_hlsl_is_ident_char(out[ne - 14]))))
+                              is_func_sig = true;
+                        }
+                     }
+                  }
+               }
+               last_func_start = ls;
+            }
+
+            if (is_func_sig)
+               paren_depth++;
+            /* else: don't increment paren_depth for macro calls */
+         }
+         else
+            paren_depth++;
+
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, p, 1))
+            goto fail;
+         p++;
+         continue;
+      }
+
+      if (*p == ')')
+      {
+         if (paren_depth > 0)
+            paren_depth--;
+         if (!d3d9_hlsl_buf_append(&out, &pos, &cap, p, 1))
+            goto fail;
+         p++;
+         continue;
+      }
+
+      /* --- Fix 2: remove params without semantics from function sigs ---
+       *
+       * Catches both 'uniform <type> <name>' and plain '<type> <name>'
+       * where <name> has no ': SEMANTIC' annotation. These are Cg-style
+       * runtime parameters that can't be vertex-stream inputs in HLSL.
+       *
+       * We detect: inside parens, after '(' or ',', skip whitespace,
+       * if we see 'uniform' consume it, then look for '<ident> <ident>'
+       * NOT followed by ':'. */
+      if (paren_depth > 0 && brace_depth == 0)
+      {
+         /* Check if we're at the start of a parameter (after '(' or ',') */
+         bool at_param_start = false;
+         {
+            /* Scan backwards in output for the last non-whitespace char */
+            size_t si = pos;
+            while (si > 0 && (out[si-1] == ' ' || out[si-1] == '\t'
+                        || out[si-1] == '\r' || out[si-1] == '\n'))
+               si--;
+            if (si > 0 && (out[si-1] == '(' || out[si-1] == ','))
+               at_param_start = true;
+         }
+
+         if (at_param_start && d3d9_hlsl_is_ident_char(*p))
+         {
+            /* We're at the start of a parameter. Scan ahead to determine
+             * if this is a '<type> <name>' without ': SEMANTIC'.
+             * 
+             * Find the end of this param (next ',' or ')' at depth 0) */
+            const char *param_start = p;
+            const char *param_end   = p;
+            bool has_semantic       = false;
+            {
+               int d = 0;
+               const char *s = p;
+               while (*s)
+               {
+                  if (*s == '(') d++;
+                  else if (*s == ')')
+                  { if (d == 0) break; d--; }
+                  else if (*s == ',' && d == 0)
+                     break;
+                  else if (*s == ':' && d == 0)
+                     has_semantic = true;
+                  s++;
+               }
+               param_end = s;
+            }
+
+            if (!has_semantic)
+            {
+               /* This param has no semantic — it's a Cg uniform-style param.
+                * Extract it, optionally strip leading 'uniform', hoist to global.
+                *
+                * IMPORTANT: only extract if the declaration has at least
+                * two whitespace-separated tokens (type + name). A single
+                * identifier is likely a macro (e.g. COMPAT_IN_VERTEX)
+                * that D3DCompile will expand. */
+               const char *decl_start = param_start;
+               const char *decl_end   = param_end;
+               const char *trim;
+               size_t decl_len;
+               char decl_buf[512];
+               char hoist[540];
+               size_t hoist_len;
+               bool already_global;
+               bool has_two_tokens = false;
+
+               /* Check and skip 'uniform' keyword */
+               if (strncmp(decl_start, "uniform", 7) == 0
+                     && !d3d9_hlsl_is_ident_char(decl_start[7]))
+               {
+                  decl_start += 7;
+                  while (*decl_start == ' ' || *decl_start == '\t'
+                        || *decl_start == '\r' || *decl_start == '\n')
+                     decl_start++;
+               }
+
+               /* Skip 'in', 'out', 'inout' parameter qualifiers (Cg-specific).
+                * If present, this param is an interpolant, not a uniform —
+                * keep it in the function signature, don't extract. */
+               if (strncmp(decl_start, "inout", 5) == 0
+                     && !d3d9_hlsl_is_ident_char(decl_start[5]))
+               {
+                  goto skip_extraction;
+               }
+               else if (strncmp(decl_start, "in", 2) == 0
+                     && !d3d9_hlsl_is_ident_char(decl_start[2]))
+               {
+                  goto skip_extraction;
+               }
+               else if (strncmp(decl_start, "out", 3) == 0
+                     && !d3d9_hlsl_is_ident_char(decl_start[3]))
+               {
+                  goto skip_extraction;
+               }
+
+               /* Check for at least two tokens: skip first ident, skip space,
+                * check for second ident */
+               {
+                  const char *tk = decl_start;
+                  /* Skip first identifier */
+                  while (tk < decl_end && d3d9_hlsl_is_ident_char(*tk))
+                     tk++;
+                  /* Skip whitespace */
+                  while (tk < decl_end && (*tk == ' ' || *tk == '\t'
+                           || *tk == '\r' || *tk == '\n'))
+                     tk++;
+                  /* Check for second identifier */
+                  if (tk < decl_end && d3d9_hlsl_is_ident_char(*tk))
+                     has_two_tokens = true;
+               }
+
+               if (!has_two_tokens)
+                  goto skip_extraction;
+
+               /* Trim trailing whitespace */
+               trim = decl_end - 1;
+               while (trim > decl_start
+                     && (*trim == ' ' || *trim == '\t'
+                        || *trim == '\r' || *trim == '\n'))
+                  trim--;
+               decl_len = (size_t)(trim - decl_start + 1);
+
+               if (decl_len > 0 && decl_len < sizeof(decl_buf) - 1)
+               {
+                  memcpy(decl_buf, decl_start, decl_len);
+                  decl_buf[decl_len] = '\0';
+
+                  hoist_len = snprintf(hoist, sizeof(hoist),
+                        "uniform %s;\n", decl_buf);
+
+                  /* Check if already declared globally */
+                  out[pos] = '\0';
+                  {
+                     char decl_semi[520];
+                     snprintf(decl_semi, sizeof(decl_semi), "%s;", decl_buf);
+                     already_global = (strstr(out, hoist) != NULL)
+                                   || (strstr(out, decl_semi) != NULL);
+                  }
+
+                  if (!already_global)
+                  {
+                     while (pos + hoist_len + 1 >= cap)
+                     {
+                        char *tmp;
+                        cap *= 2;
+                        if (!(tmp = (char*)realloc(out, cap)))
+                        { free(out); return NULL; }
+                        out = tmp;
+                     }
+                     memmove(out + last_func_start + hoist_len,
+                           out + last_func_start, pos - last_func_start);
+                     memcpy(out + last_func_start, hoist, hoist_len);
+                     pos += hoist_len;
+                     last_func_start += hoist_len;
+                  }
+
+                  /* Remove param from source, handle commas */
+                  {
+                     const char *after = decl_end;
+                     if (*after == ',')
+                     {
+                        after++;
+                        while (*after == ' ' || *after == '\t'
+                              || *after == '\r' || *after == '\n')
+                           after++;
+                     }
+                     else if (*after == ')')
+                     {
+                        while (pos > 0 && (out[pos-1] == ' '
+                                 || out[pos-1] == '\t'
+                                 || out[pos-1] == '\r'
+                                 || out[pos-1] == '\n'))
+                           pos--;
+                        if (pos > 0 && out[pos-1] == ',')
+                           pos--;
+                     }
+                     p = after;
+                  }
+                  continue;
+               }
+            }
+skip_extraction:
+            ; /* label requires a statement */
+         }
+      }
+
+      /* Regular char */
+      if (!d3d9_hlsl_buf_append(&out, &pos, &cap, p, 1))
+         goto fail;
+      p++;
+   }
+
+   out[pos] = '\0';
+   return out;
+
+fail:
+   free(out);
+   return NULL;
+}
+#ifdef _MSC_VER
+#pragma optimize("", on)
+#endif
+
+/* Dynamically load D3DCompile and D3DPreprocess with
+ * D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY to accept Cg syntax. */
+
+typedef HRESULT (WINAPI *PFN_D3DCOMPILE)(
+      LPCVOID, SIZE_T, LPCSTR,
+      const void*, void*,
+      LPCSTR, LPCSTR, UINT, UINT,
+      void**, void**);
+
+typedef HRESULT (WINAPI *PFN_D3DPREPROCESS)(
+      LPCVOID, SIZE_T, LPCSTR,
+      const void*, void*,
+      void**, void**);
+
+#ifndef D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY
+#define D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY (1 << 12)
+#endif
+
+#ifndef D3DCOMPILE_OPTIMIZATION_LEVEL3
+#define D3DCOMPILE_OPTIMIZATION_LEVEL3 (1 << 15)
+#endif
+
+#ifndef D3DCOMPILE_PREFER_FLOW_CONTROL
+#define D3DCOMPILE_PREFER_FLOW_CONTROL (1 << 10)
+#endif
+
+static PFN_D3DCOMPILE    d3d9_pCompile    = NULL;
+static PFN_D3DPREPROCESS d3d9_pPreprocess = NULL;
+static bool d3d9_compiler_tried           = false;
+
+static void d3d9_hlsl_ensure_compiler(void)
+{
+   HMODULE dll = NULL;
+   const char *names[] = {
+      "d3dcompiler_47.dll",
+      "d3dcompiler_46.dll",
+      "d3dcompiler_43.dll",
+      NULL
+   };
+   int i;
+
+   if (d3d9_compiler_tried)
+      return;
+   d3d9_compiler_tried = true;
+
+   for (i = 0; names[i]; i++)
+   {
+      dll = GetModuleHandleA(names[i]);
+      if (!dll)
+         dll = LoadLibraryA(names[i]);
+      if (dll)
+      {
+         d3d9_pCompile    = (PFN_D3DCOMPILE)GetProcAddress(dll, "D3DCompile");
+         d3d9_pPreprocess = (PFN_D3DPREPROCESS)GetProcAddress(dll, "D3DPreprocess");
+         if (d3d9_pCompile)
+         {
+            RARCH_LOG("[D3D9 HLSL] Loaded D3DCompile from %s.\n", names[i]);
+            break;
+         }
+      }
+   }
+   if (!d3d9_pCompile)
+      RARCH_WARN("[D3D9 HLSL] Could not find D3DCompile, falling back.\n");
+}
+
+/* Full Cg→HLSL compilation pipeline:
+ *  1. D3DPreprocess to expand all #define macros
+ *  2. d3d9_hlsl_fixup_cg_source to fix texture keyword + uniform params
+ *  3. D3DCompile with backwards compat flag
+ *
+ * If D3DPreprocess is unavailable, skips step 1 and tries fixup on the
+ * raw source (works for shaders that don't use macros for uniform params). */
+static bool d3d9_hlsl_compile_cg_compat(
+      const char *source, size_t source_len,
+      const char *source_name,
+      const char *entry, const char *target,
+      D3DBlob *out_blob)
+{
+   D3DBlob error_blob = NULL;
+   HRESULT hr;
+
+   if (!out_blob)
+      return false;
+
+   d3d9_hlsl_ensure_compiler();
+
+   if (!d3d9_pCompile)
+      return d3d_compile(source, source_len, source_name,
+            entry, target, out_blob);
+
+   /* Our own preprocessor already handled #include, #ifdef, #ifndef,
+    * #else, #endif.  The caller (load_program_from_file_ex) also applied
+    * Cg→HLSL fixups, struct semantic insertion, and sampler decomposition,
+    * so we compile directly without further source transformations. */
+   {
+      hr = d3d9_pCompile(
+            source, source_len,
+            source_name,
+            NULL, NULL,
+            entry, target,
+            D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY,
+            0,
+            (void**)out_blob,
+            (void**)&error_blob);
+
+      if (FAILED(hr))
+      {
+         /* First attempt failed — retry with maximum optimization and
+          * flow-control preference.  Complex Cg shaders with many unrolled
+          * texture fetches (e.g. 29-tap FIR filters) can exceed SM3.0's
+          * temp register limit at default optimization.  Level 3 + flow
+          * control lets the compiler use loops and reduce register pressure. */
+         if (error_blob)
+         {
+            error_blob->lpVtbl->Release(error_blob);
+            error_blob = NULL;
+         }
+         if (*out_blob)
+         {
+            (*out_blob)->lpVtbl->Release(*out_blob);
+            *out_blob = NULL;
+         }
+
+         hr = d3d9_pCompile(
+               source, source_len,
+               source_name,
+               NULL, NULL,
+               entry, target,
+               D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY
+               | D3DCOMPILE_OPTIMIZATION_LEVEL3
+               | D3DCOMPILE_PREFER_FLOW_CONTROL,
+               0,
+               (void**)out_blob,
+               (void**)&error_blob);
+      }
+
+      if (FAILED(hr))
+      {
+         if (error_blob)
+         {
+            const char *err_str = (const char*)error_blob->lpVtbl->GetBufferPointer(error_blob);
+            RARCH_ERR("[D3D9 HLSL] D3DCompile failed: %s\n", err_str);
+            error_blob->lpVtbl->Release(error_blob);
+         }
+         return false;
+      }
+
+      if (error_blob)
+         error_blob->lpVtbl->Release(error_blob);
+      return true;
+   }
+}
+
+/* Ensure all members of the vertex shader output struct are initialized.
+ *
+ * D3DCompile requires every member of the return struct to be written.
+ * Cg allows partial initialization.  This pass finds `return OUT;` in
+ * main_vertex and inserts `OUT.member = 0;` for any member not assigned
+ * elsewhere in the function body.
+ *
+ * Returns a malloc'd modified copy, or NULL if no changes were made. */
+static char *d3d9_hlsl_init_vs_output_members(const char *source)
+{
+   /* Step 1: find 'main_vertex' function and its return type */
+   const char *mv = strstr(source, "main_vertex");
+   const char *ret_type_start, *ret_type_end;
+   char ret_type[128];
+   size_t ret_type_len;
+   const char *func_body_start, *func_body_end;
+   const char *struct_start, *struct_body_start, *struct_body_end;
+
+   /* Struct member info */
+   struct { const char *name; size_t len; } members[32];
+   unsigned member_count = 0;
+   unsigned unassigned_count = 0;
+   char unassigned_buf[2048];
+   size_t upos = 0;
+
+   if (!mv) return NULL;
+
+   /* Find return type: scan backwards from 'main_vertex' past whitespace */
+   ret_type_end = mv;
+   while (ret_type_end > source
+         && (ret_type_end[-1] == ' ' || ret_type_end[-1] == '\t'
+            || ret_type_end[-1] == '\n' || ret_type_end[-1] == '\r'))
+      ret_type_end--;
+   ret_type_start = ret_type_end;
+   while (ret_type_start > source && d3d9_hlsl_is_ident_char(ret_type_start[-1]))
+      ret_type_start--;
+
+   ret_type_len = (size_t)(ret_type_end - ret_type_start);
+   if (ret_type_len == 0 || ret_type_len >= sizeof(ret_type))
+      return NULL;
+   memcpy(ret_type, ret_type_start, ret_type_len);
+   ret_type[ret_type_len] = '\0';
+
+   /* Step 2: find the struct definition for the return type */
+   {
+      char pattern[140];
+      snprintf(pattern, sizeof(pattern), "struct %s", ret_type);
+      struct_start = strstr(source, pattern);
+      if (!struct_start) return NULL;
+      /* Verify it's a whole word match */
+      {
+         const char *after = struct_start + strlen(pattern);
+         if (d3d9_hlsl_is_ident_char(*after))
+            return NULL;
+      }
+   }
+
+   struct_body_start = strchr(struct_start, '{');
+   if (!struct_body_start) return NULL;
+   struct_body_start++;
+
+   /* Find matching '}' */
+   {
+      int depth = 1;
+      const char *s = struct_body_start;
+      while (*s && depth > 0)
+      {
+         if (*s == '{') depth++;
+         else if (*s == '}') depth--;
+         s++;
+      }
+      struct_body_end = s - 1;
+   }
+
+   /* Step 3: parse struct members — extract names */
+   {
+      const char *mp = struct_body_start;
+      while (mp < struct_body_end)
+      {
+         /* Find each ';' — the member name is the identifier before
+          * the optional ': SEMANTIC' before the ';' */
+         const char *semi = strchr(mp, ';');
+         if (!semi || semi >= struct_body_end) break;
+
+         /* Scan backwards from ';' past semantic if present */
+         {
+            const char *end = semi;
+            const char *name_end, *name_start;
+
+            /* Skip past ': SEMANTIC' */
+            {
+               const char *colon = NULL;
+               const char *scan = mp;
+               while (scan < semi)
+               {
+                  if (*scan == ':') colon = scan;
+                  scan++;
+               }
+               if (colon) end = colon;
+            }
+
+            /* Skip trailing whitespace */
+            while (end > mp && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            name_end = end;
+
+            /* Scan backwards to find start of identifier */
+            name_start = name_end;
+            while (name_start > mp && d3d9_hlsl_is_ident_char(name_start[-1]))
+               name_start--;
+
+            if (name_end > name_start && member_count < 32)
+            {
+               members[member_count].name = name_start;
+               members[member_count].len = (size_t)(name_end - name_start);
+               member_count++;
+            }
+         }
+
+         mp = semi + 1;
+      }
+   }
+
+   if (member_count == 0) return NULL;
+
+   /* Step 4: find main_vertex function body */
+   {
+      const char *ob = mv;
+      int depth;
+      while (*ob && *ob != '{') ob++;
+      if (!*ob) return NULL;
+      func_body_start = ob + 1;
+      depth = 1;
+      {
+         const char *s = func_body_start;
+         while (*s && depth > 0)
+         {
+            if (*s == '{') depth++;
+            else if (*s == '}') depth--;
+            s++;
+         }
+         func_body_end = s;
+      }
+   }
+
+   /* Step 5: check for aggregate initialization (OUT = { ... } or
+    * ret_type OUT = { ... }).  If found, all members are initialized. */
+   {
+      const char *scan = func_body_start;
+      while (scan < func_body_end)
+      {
+         if (*scan == '=' && scan + 1 < func_body_end)
+         {
+            const char *after = scan + 1;
+            while (*after == ' ' || *after == '\t' || *after == '\n' || *after == '\r')
+               after++;
+            if (*after == '{')
+            {
+               /* Check that this is an assignment to the output variable,
+                * not some other variable.  Look backward for an identifier. */
+               const char *before = scan - 1;
+               while (before > func_body_start && (*before == ' ' || *before == '\t'))
+                  before--;
+               if (before >= func_body_start && d3d9_hlsl_is_ident_char(*before))
+               {
+                  /* Found identifier = { ... } — assume aggregate init */
+                  return NULL; /* No changes needed */
+               }
+            }
+         }
+         scan++;
+      }
+   }
+
+   /* Step 6: check which members are assigned (look for 'OUT.member' or 'OUT .member') */
+   {
+      unsigned i;
+      for (i = 0; i < member_count; i++)
+      {
+         bool found = false;
+         /* Build "OUT.membername" pattern and search within function body */
+         /* Try common output variable names: OUT, Out, output */
+         {
+            const char *scan = func_body_start;
+            while (scan < func_body_end)
+            {
+               /* Look for '.membername' preceded by an identifier */
+               if (*scan == '.' && strncmp(scan + 1,
+                        members[i].name, members[i].len) == 0
+                     && !d3d9_hlsl_is_ident_char(scan[1 + members[i].len]))
+               {
+                  /* Check it's an assignment — look for '=' after the member,
+                   * possibly with a swizzle (.xy, .xyzw, etc.) in between */
+                  const char *eq = scan + 1 + members[i].len;
+                  /* Skip optional swizzle: .x, .xy, .xyz, .xyzw, .rg, etc. */
+                  if (*eq == '.')
+                  {
+                     eq++;
+                     while (d3d9_hlsl_is_ident_char(*eq)) eq++;
+                  }
+                  while (*eq == ' ' || *eq == '\t') eq++;
+                  if (*eq == '=' && eq[1] != '=')
+                  { found = true; break; }
+               }
+               scan++;
+            }
+         }
+
+         if (!found)
+         {
+            /* This member is not assigned — add initialization */
+            size_t added = snprintf(unassigned_buf + upos,
+                  sizeof(unassigned_buf) - upos,
+                  "OUT.%.*s = 0;\n",
+                  (int)members[i].len, members[i].name);
+            upos += added;
+            unassigned_count++;
+         }
+      }
+   }
+
+   if (unassigned_count == 0) return NULL;
+
+   /* Step 6: insert initializations before 'return OUT;' */
+   {
+      const char *ret_stmt = strstr(func_body_start, "return ");
+      size_t src_len, pre_len, tail_len, new_len;
+      char *out;
+
+      if (!ret_stmt || ret_stmt >= func_body_end) return NULL;
+
+      src_len = strlen(source);
+      pre_len = (size_t)(ret_stmt - source);
+      tail_len = src_len - pre_len;
+      new_len = src_len + upos;
+
+      out = (char*)malloc(new_len + 1);
+      if (!out) return NULL;
+
+      memcpy(out, source, pre_len);
+      memcpy(out + pre_len, unassigned_buf, upos);
+      memcpy(out + pre_len + upos, ret_stmt, tail_len);
+      out[new_len] = '\0';
+      return out;
+   }
+}
+
+/* Convert consecutively-invoked single-parameter macros into [loop] for
+ * loops.  Many Cg shaders unroll filter kernels via macros like:
+ *
+ *   #define macroloop(i) <body using i>
+ *   macroloop(0)
+ *   macroloop(1)
+ *   ...
+ *   macroloop(28)
+ *
+ * The Cg compiler handles this, but D3DCompile for SM3.0 often exceeds
+ * the 32-temp-register limit on the fully expanded code.  Converting
+ * back to a real loop lets the HLSL compiler emit loop instructions.
+ *
+ * Detection:
+ *  1. Find '#define NAME(PARAM) BODY' where BODY uses PARAM
+ *  2. Find a run of NAME(0) NAME(1) ... NAME(N) with N >= 4
+ *  3. Replace the run with '[loop] for (int PARAM = 0; PARAM <= N; PARAM++) { BODY }'
+ *  4. Comment out the original #define
+ *
+ * Returns a malloc'd modified copy, or NULL if no changes were made. */
+static char *d3d9_hlsl_convert_macro_loops(const char *source)
+{
+   /* Find #define candidates: single-param function-like macros */
+   char macro_name[128];
+   char macro_param[64];
+   const char *macro_body_start = NULL;
+   size_t macro_body_len = 0;
+#ifdef DEBUG
+   size_t macro_name_len          = 0;
+   size_t macro_param_len         = 0;
+#endif
+   const char *macro_define_start = NULL;
+   const char *macro_define_end   = NULL;
+   const char *p = source;
+   while (*p)
+   {
+      /* Look for #define at start of line */
+      if ((p == source || p[-1] == '\n') && *p == '#')
+      {
+         const char *dir = p + 1;
+         while (*dir == ' ' || *dir == '\t') dir++;
+         if (strncmp(dir, "define", 6) == 0 && !d3d9_hlsl_is_ident_char(dir[6]))
+         {
+            const char *nm = dir + 6;
+            const char *nm_end, *pp, *pp_end, *body, *body_end;
+
+            while (*nm == ' ' || *nm == '\t')
+               nm++;
+            nm_end = nm;
+            while (d3d9_hlsl_is_ident_char(*nm_end)) nm_end++;
+
+            /* Check for (param) */
+            if (*nm_end == '(' && nm_end > nm)
+            {
+               pp = nm_end + 1;
+               while (*pp == ' ' || *pp == '\t')
+                  pp++;
+               pp_end = pp;
+               while (d3d9_hlsl_is_ident_char(*pp_end)) pp_end++;
+               if (pp_end > pp && *pp_end == ')')
+               {
+                  /* Found #define NAME(PARAM) — get the body */
+                  body = pp_end + 1;
+                  while (*body == ' ' || *body == '\t')
+                     body++;
+
+                  /* Find end of body (handle line continuations) */
+                  body_end = body;
+                  while (*body_end)
+                  {
+                     if (*body_end == '\n')
+                     {
+                        if (body_end > body && body_end[-1] == '\\')
+                        {
+                           body_end++;
+                           continue;
+                        }
+                        break;
+                     }
+                     body_end++;
+                  }
+
+                  /* Check that PARAM appears in BODY */
+                  {
+                     size_t pl = (size_t)(pp_end - pp);
+                     const char *scan = body;
+                     bool found = false;
+                     while (scan < body_end - pl)
+                     {
+                        if (strncmp(scan, pp, pl) == 0
+                              && (scan == body || !d3d9_hlsl_is_ident_char(scan[-1]))
+                              && !d3d9_hlsl_is_ident_char(scan[pl]))
+                        {
+                           found = true;
+                           break;
+                        }
+                        scan++;
+                     }
+
+                     if (found && (size_t)(nm_end - nm) < sizeof(macro_name)
+                           && pl < sizeof(macro_param))
+                     {
+                        /* Now search for consecutive invocations:
+                         * NAME(0) NAME(1) ... NAME(N) */
+                        int max_seq           = -1;
+                        const char *seq_start = NULL, *seq_end_ptr = NULL;
+                        const char *s         = source;
+
+                        while (*s)
+                        {
+                           if (strncmp(s, nm, (size_t)(nm_end - nm)) == 0
+                                 && (s == source || !d3d9_hlsl_is_ident_char(s[-1]))
+                                 && s[(size_t)(nm_end - nm)] == '(')
+                           {
+                              /* Check if this starts a consecutive run from 0 */
+                              const char *after_name = s + (size_t)(nm_end - nm);
+                              /* Parse the argument */
+                              if (after_name[0] == '(' && after_name[1] == '0'
+                                    && after_name[2] == ')')
+                              {
+                                 /* Found NAME(0) — scan forward for NAME(1), NAME(2)... */
+                                 int expected = 1;
+                                 const char *run_end = after_name + 3;
+                                 seq_start = s;
+
+                                 while (*run_end)
+                                 {
+                                    const char *next = run_end;
+                                    char num_buf[16];
+                                    int num_len;
+                                    while (*next == ' ' || *next == '\t'
+                                          || *next == '\n' || *next == '\r')
+                                       next++;
+                                    num_len = snprintf(num_buf, sizeof(num_buf),
+                                          "%d", expected);
+                                    if (strncmp(next, nm, (size_t)(nm_end - nm)) == 0
+                                          && next[(size_t)(nm_end - nm)] == '('
+                                          && strncmp(next + (size_t)(nm_end - nm) + 1,
+                                             num_buf, num_len) == 0
+                                          && next[(size_t)(nm_end - nm) + 1 + num_len] == ')')
+                                    {
+                                       run_end = next + (size_t)(nm_end - nm)
+                                          + 1 + num_len + 1;
+                                       expected++;
+                                    }
+                                    else
+                                       break;
+                                 }
+
+                                 if (expected > 4)
+                                 {
+                                    max_seq = expected - 1;
+                                    seq_end_ptr = run_end;
+                                    break; /* Use first run found */
+                                 }
+                              }
+                           }
+                           s++;
+                        }
+
+                        if (max_seq >= 4 && seq_start && seq_end_ptr)
+                        {
+                           /* Build the replacement loop */
+                           size_t cap, opos;
+                           size_t src_len_full = strlen(source);
+                           size_t body_l       = (size_t)(body_end - body);
+                           char *out;
+                           size_t nml          = (size_t)(nm_end - nm);
+
+                           memcpy(macro_name, nm, nml);
+                           macro_name[nml]     = '\0';
+#ifdef DEBUG
+                           macro_name_len      = nml;
+#endif
+                           memcpy(macro_param, pp, (size_t)(pp_end - pp));
+                           macro_param[(size_t)(pp_end - pp)] = '\0';
+#ifdef DEBUG
+                           macro_param_len     = (size_t)(pp_end - pp);
+#endif
+                           macro_body_start    = body;
+                           macro_body_len      = body_l;
+                           macro_define_start  = p;
+                           macro_define_end    = body_end;
+                           if (*macro_define_end == '\n')
+                              macro_define_end++;
+
+                           cap = src_len_full + body_l + 256;
+                           out = (char*)malloc(cap);
+                           if (!out)
+                              return NULL;
+                           opos = 0;
+
+                           /* Copy everything before the #define, commenting it out */
+                           {
+                              size_t pre = (size_t)(macro_define_start - source);
+                              memcpy(out, source, pre);
+                              opos = pre;
+                           }
+
+                           /* Comment out the #define line */
+                           {
+                              const char *dl = "/* ";
+                              size_t dll     = 3;
+                              size_t def_len = (size_t)(macro_define_end - macro_define_start);
+                              /* Strip any trailing newline from the define for the comment */
+                              size_t comment_len = def_len;
+                              while (comment_len > 0
+                                    && (macro_define_start[comment_len-1] == '\n'
+                                       || macro_define_start[comment_len-1] == '\r'))
+                                 comment_len--;
+                              while (opos + dll + comment_len + 10 >= cap)
+                              {
+                                 char *tmp;
+                                 cap *= 2;
+                                 if (!(tmp = (char*)realloc(out, cap)))
+                                 { free(out); return NULL; }
+                                 out = tmp;
+                              }
+                              memcpy(out + opos, dl, dll); opos += dll;
+                              memcpy(out + opos, macro_define_start, comment_len);
+                              opos += comment_len;
+                              memcpy(out + opos, " */\n", 4); opos += 4;
+                           }
+
+                           /* Copy between #define and the macro call run */
+                           {
+                              size_t mid = (size_t)(seq_start - macro_define_end);
+                              while (opos + mid + 1 >= cap)
+                              {
+                                 char *tmp;
+                                 cap *= 2;
+                                 if (!(tmp = (char*)realloc(out, cap)))
+                                 { free(out); return NULL; }
+                                 out = tmp;
+                              }
+                              memcpy(out + opos, macro_define_end, mid);
+                              opos += mid;
+                           }
+
+                           /* Emit the [loop] for */
+                           {
+                              char loop_header[256];
+                              size_t lh_len = snprintf(loop_header, sizeof(loop_header),
+                                    "[loop] for (int %s = 0; %s <= %d; %s++) {\n",
+                                    macro_param, macro_param, max_seq, macro_param);
+                              while (opos + lh_len + 1 >= cap)
+                              {
+                                 char *tmp;
+                                 cap *= 2;
+                                 if (!(tmp = (char*)realloc(out, cap)))
+                                 { free(out); return NULL; }
+                                 out = tmp;
+                              }
+                              memcpy(out + opos, loop_header, lh_len);
+                              opos += lh_len;
+                           }
+
+                           /* Emit the macro body — need to strip line continuations */
+                           {
+                              const char *bp_src = macro_body_start;
+                              while (bp_src < macro_body_start + macro_body_len)
+                              {
+                                 if (*bp_src == '\\' && bp_src + 1 < macro_body_start + macro_body_len
+                                       && bp_src[1] == '\n')
+                                 { bp_src += 2; continue; }
+                                 while (opos + 2 >= cap)
+                                 {
+                                    char *tmp;
+                                    cap *= 2;
+                                    if (!(tmp = (char*)realloc(out, cap)))
+                                    {
+                                       free(out);
+                                       return NULL;
+                                    }
+                                    out = tmp;
+                                 }
+                                 out[opos++] = *bp_src++;
+                              }
+                           }
+
+                           /* Close the loop */
+                           {
+                              const char *cl = "\n}\n";
+                              while (opos + 4 >= cap)
+                              {
+                                 char *tmp;
+                                 cap *= 2;
+                                 if (!(tmp = (char*)realloc(out, cap)))
+                                 {
+                                    free(out);
+                                    return NULL;
+                                 }
+                                 out = tmp;
+                              }
+                              memcpy(out + opos, cl, 3); opos += 3;
+                           }
+
+                           /* Copy everything after the macro call run */
+                           {
+                              size_t tail = src_len_full - (size_t)(seq_end_ptr - source);
+                              while (opos + tail + 1 >= cap)
+                              {
+                                 char *tmp;
+                                 cap *= 2;
+                                 if (!(tmp = (char*)realloc(out, cap)))
+                                 {
+                                    free(out);
+                                    return NULL;
+                                 }
+                                 out = tmp;
+                              }
+                              memcpy(out + opos, seq_end_ptr, tail);
+                              opos += tail;
+                           }
+
+                           out[opos] = '\0';
+                           return out;
+                        }
+                     }
+                  }
+               }
+            }
+         }
+      }
+      p++;
+   }
+
+   return NULL; /* No changes */
+}
+
+/* Load a shader from file AND populate pass_data with CTAB info.
+ * Reads the shader source, preprocesses #include directives,
+ * fixes Cg-isms, then compiles via d3d_compile. */
+static bool d3d9_hlsl_load_program_from_file_ex(
+      LPDIRECT3DDEVICE9 dev,
+      struct shader_pass *pass,
+      const char *prog,
+      hlsl_pass_data_t *pd)
+{
+   D3DBlob code_f = NULL;
+   D3DBlob code_v = NULL;
+   char *source   = NULL;
+   char *resolved = NULL;
+   char base_dir[PATH_MAX_LENGTH];
+   size_t src_len = 0;
+
+   if (!prog || !*prog)
+      return false;
+
+   /* Read source file */
+   source = d3d9_hlsl_read_file(prog, &src_len);
+   if (!source)
+   {
+      RARCH_ERR("[D3D9 HLSL] Could not read shader file: %s\n", prog);
+      return false;
+   }
+
+   /* Extract directory for #include resolution */
+   strlcpy(base_dir, prog, sizeof(base_dir));
+   path_basedir(base_dir);
+
+   /* Resolve #include directives */
+   resolved = d3d9_hlsl_preprocess_includes(source, base_dir, 0);
+   free(source);
+
+   if (!resolved)
+   {
+      RARCH_ERR("[D3D9 HLSL] Include preprocessing failed: %s\n", prog);
+      return false;
+   }
+
+   /* Convert Cg '#pragma parameter' + '#define' pairs into HLSL uniforms.
+    *
+    * Cg shaders declare tweakable parameters like:
+    *   #pragma parameter AAOFFSET "description" 1.0 0.25 2.0 0.05
+    *   #define AAOFFSET 1.0
+    *
+    * The Cg runtime creates a uniform from #pragma parameter, but
+    * D3DCompile ignores #pragma and just expands #define — making
+    * AAOFFSET a compile-time constant with no CTAB entry.
+    *
+    * Fix: for each #pragma parameter NAME, find a matching
+    * '#define NAME <number>' and replace it with
+    * 'uniform float NAME = <number>;'  so D3DCompile creates a real
+    * uniform that appears in the CTAB and can be set at runtime. */
+   {
+      char *p = resolved;
+      while ((p = strstr(p, "#pragma parameter")) != NULL)
+      {
+         const char *pp = p + 17; /* skip "#pragma parameter" */
+         const char *name_start, *name_end;
+         size_t name_len;
+
+         /* Check that #pragma is at the start of a line (not commented out).
+          * Scan backwards to the start of the line and check for '//' */
+         {
+            const char *ls = p;
+            bool in_comment = false;
+            while (ls > resolved && ls[-1] != '\n')
+               ls--;
+            /* Check if there's a '//' between line start and #pragma */
+            {
+               const char *sc = ls;
+               while (sc < p)
+               {
+                  if (sc[0] == '/' && sc[1] == '/')
+                  { in_comment = true; break; }
+                  if (*sc != ' ' && *sc != '\t')
+                     break;
+                  sc++;
+               }
+            }
+            if (in_comment)
+            {
+               p++;
+               continue;
+            }
+         }
+
+         /* Skip whitespace to get parameter name */
+         while (*pp == ' ' || *pp == '\t') pp++;
+         name_start = pp;
+         while (d3d9_hlsl_is_ident_char(*pp)) pp++;
+         name_end = pp;
+         name_len = (size_t)(name_end - name_start);
+
+         if (name_len > 0 && name_len < 128)
+         {
+            char name_buf[128];
+            char define_pattern[140];
+            char *def_loc;
+
+            memcpy(name_buf, name_start, name_len);
+            name_buf[name_len] = '\0';
+
+            /* Build pattern: "#define NAME " (with trailing space) */
+            snprintf(define_pattern, sizeof(define_pattern),
+                  "#define %s ", name_buf);
+
+            /* Search for matching #define */
+            def_loc = strstr(resolved, define_pattern);
+            if (!def_loc)
+            {
+               /* Try with tab separator */
+               snprintf(define_pattern, sizeof(define_pattern),
+                     "#define %s\t", name_buf);
+               def_loc = strstr(resolved, define_pattern);
+            }
+
+            if (def_loc)
+            {
+               /* Found "#define NAME <value>".
+                * Extract the value (rest of line). */
+               const char *val_start;
+               const char *val_end;
+               const char *def_line_end;
+               char replacement[256];
+               size_t def_line_len, repl_len, old_len, tail_len;
+
+               /* Find end of #define line */
+               def_line_end = def_loc;
+               while (*def_line_end && *def_line_end != '\n'
+                     && *def_line_end != '\r')
+                  def_line_end++;
+
+               def_line_len = (size_t)(def_line_end - def_loc);
+
+               /* Extract value: skip "#define NAME " to get value part */
+               val_start = def_loc + strlen(define_pattern);
+               /* Trim leading whitespace from value */
+               while (val_start < def_line_end
+                     && (*val_start == ' ' || *val_start == '\t'))
+                  val_start++;
+               val_end = def_line_end;
+               /* Strip // comment from value */
+               {
+                  const char *cmt = val_start;
+                  while (cmt < val_end - 1)
+                  {
+                     if (cmt[0] == '/' && cmt[1] == '/')
+                     { val_end = cmt; break; }
+                     cmt++;
+                  }
+               }
+               /* Trim trailing whitespace */
+               while (val_end > val_start
+                     && (val_end[-1] == ' ' || val_end[-1] == '\t'))
+                  val_end--;
+
+               if (val_end > val_start)
+               {
+                  char val_buf[64];
+                  size_t val_len = (size_t)(val_end - val_start);
+                  if (val_len >= sizeof(val_buf))
+                     val_len = sizeof(val_buf) - 1;
+                  memcpy(val_buf, val_start, val_len);
+                  val_buf[val_len] = '\0';
+
+                  /* Build replacement: "uniform float NAME = VALUE;" */
+                  repl_len = snprintf(replacement, sizeof(replacement),
+                        "uniform float %s = %s;", name_buf, val_buf);
+
+                  /* Replace the #define line in-place */
+                  old_len = strlen(resolved);
+                  tail_len = old_len - (size_t)(def_loc - resolved) - def_line_len;
+
+                  if (repl_len <= def_line_len)
+                  {
+                     /* Replacement fits — copy in place + shift tail */
+                     memcpy(def_loc, replacement, repl_len);
+                     memmove(def_loc + repl_len,
+                           def_loc + def_line_len, tail_len + 1);
+                  }
+                  else
+                  {
+                     /* Replacement is longer — realloc */
+                     size_t new_len = old_len - def_line_len + repl_len;
+                     size_t def_off = (size_t)(def_loc - resolved);
+                     char *new_buf  = (char*)malloc(new_len + 1);
+                     if (new_buf)
+                     {
+                        memcpy(new_buf, resolved, def_off);
+                        memcpy(new_buf + def_off, replacement, repl_len);
+                        memcpy(new_buf + def_off + repl_len,
+                              resolved + def_off + def_line_len,
+                              tail_len + 1);
+                        free(resolved);
+                        resolved = new_buf;
+                        /* Reset p to continue scanning in new buffer */
+                        p = resolved;
+                        continue;
+                     }
+                  }
+               }
+            }
+         }
+
+         /* Advance past this #pragma line */
+         while (*p && *p != '\n') p++;
+         if (*p) p++;
+      }
+   }
+
+   /* Add semantics to struct members that lack them.
+    * Many Cg shaders define structs without HLSL semantics
+    * (e.g. tex_coords with float2 members used as interpolants).
+    * This pass auto-assigns TEXCOORD semantics. */
+   /* Semantic pass */
+   /* Add semantics to struct members that lack them */
+   {
+      char *with_sem = d3d9_hlsl_add_struct_semantics(resolved);
+      if (with_sem)
+      {
+         free(resolved);
+         resolved = with_sem;
+      }
+   }
+
+   /* Apply Cg→HLSL source-level fixes:
+    *  1. 'texture' as identifier → '_texture' (HLSL reserved keyword)
+    *  2. 'uniform <type> <name>' in function params → move to global scope
+    *     (HLSL requires semantics on all VS/PS input params; Cg 'uniform'
+    *      params are set via the runtime, not from vertex streams) */
+   {
+      char *fixed = d3d9_hlsl_fixup_cg_source(resolved);
+      free(resolved);
+      resolved = fixed;
+      if (!resolved)
+      {
+         RARCH_ERR("[D3D9 HLSL] Source fixup failed: %s\n", prog);
+         return false;
+      }
+   }
+
+   /* Collapse redundant floatN(X, X, ..., X) constructors where all
+    * arguments are identical identifiers.  Cg allows float4(float4_var,
+    * float4_var, float4_var, float4_var) taking the first N components;
+    * HLSL does not.  Replace with just (X). */
+   {
+      const char *search = resolved;
+      while ((search = strstr(search, "float")) != NULL)
+      {
+         const char *fp = search;
+         /* Check floatN( pattern */
+         if ((fp[5] == '3' || fp[5] == '4')
+               && fp[6] == '('
+               && (fp == resolved || !d3d9_hlsl_is_ident_char(fp[-1])))
+         {
+            int nc = fp[5] - '0';
+            const char *args = fp + 7;
+            /* Collect comma-separated args respecting parens */
+            const char *a_s[4];
+            size_t a_l[4];
+            int ac = 0, depth = 1;
+            const char *s = args;
+            bool ok = true;
+
+            a_s[0] = s;
+            while (*s && depth > 0)
+            {
+               if (*s == '(') depth++;
+               else if (*s == ')') { if (--depth == 0) break; }
+               else if (*s == ',' && depth == 1)
+               {
+                  const char *ae = s, *ab = a_s[ac];
+                  while (ae > ab && (ae[-1] == ' ' || ae[-1] == '\t')) ae--;
+                  while (ab < ae && (*ab == ' ' || *ab == '\t')) ab++;
+                  a_s[ac] = ab;
+                  a_l[ac] = (size_t)(ae - ab);
+                  ac++;
+                  if (ac >= nc) { ok = false; break; }
+                  a_s[ac] = s + 1;
+               }
+               s++;
+            }
+            if (ok && depth == 0 && ac == nc - 1)
+            {
+               /* Record last arg */
+               const char *ae = s, *ab = a_s[ac];
+               while (ae > ab && (ae[-1] == ' ' || ae[-1] == '\t')) ae--;
+               while (ab < ae && (*ab == ' ' || *ab == '\t')) ab++;
+               a_s[ac] = ab;
+               a_l[ac] = (size_t)(ae - ab);
+               ac++;
+
+               /* Check all args identical and start with letter/underscore */
+               if (ac == nc && a_l[0] > 0
+                     && d3d9_hlsl_is_ident_char(a_s[0][0])
+                     && !(a_s[0][0] >= '0' && a_s[0][0] <= '9'))
+               {
+                  bool same = true;
+                  int ai;
+                  for (ai = 1; ai < ac; ai++)
+                     if (a_l[ai] != a_l[0]
+                           || strncmp(a_s[0], a_s[ai], a_l[0]) != 0)
+                     { same = false; break; }
+
+                  if (same)
+                  {
+                     /* Replace float4(X, X, X, X) with (X) */
+                     size_t old_len = (size_t)(s + 1 - fp); /* includes closing ) */
+                     size_t new_len = a_l[0] + 2; /* (X) */
+                     size_t src_full = strlen(resolved);
+                     size_t off = (size_t)(fp - resolved);
+                     size_t tail = src_full - off - old_len;
+                     char *nb = (char*)malloc(src_full - old_len + new_len + 1);
+                     if (nb)
+                     {
+                        memcpy(nb, resolved, off);
+                        nb[off] = '(';
+                        memcpy(nb + off + 1, a_s[0], a_l[0]);
+                        nb[off + 1 + a_l[0]] = ')';
+                        memcpy(nb + off + new_len, fp + old_len, tail + 1);
+                        free(resolved);
+                        resolved = nb;
+                        search = resolved + off + new_len;
+                        continue;
+                     }
+                  }
+               }
+            }
+         }
+         search++;
+      }
+   }
+
+   /* Decompose sampler members out of structs.
+    * HLSL SM3.0 doesn't allow samplers in compound types.
+    * This removes 'sampler2D _texture;' from struct bodies and
+    * creates standalone sampler declarations for each instance. */
+   {
+      char *decomposed = d3d9_hlsl_decompose_struct_samplers(resolved);
+      if (decomposed)
+      {
+         free(resolved);
+         resolved = decomposed;
+      }
+   }
+
+   /* Ensure sampler declarations exist for ORIG/PREV/PASSPREV textures.
+    * Multi-pass Cg shaders reference ORIG__texture, PREVn__texture, etc.
+    * via compat macros and struct sampler decomposition.  If the shader
+    * passes these as function parameters (e.g. 'in orig ORIG : TEXCOORD2')
+    * rather than global uniforms, the decomposition pass won't create
+    * standalone sampler declarations.  Scan for references and add
+    * missing declarations. */
+   {
+      static const char *sampler_names[] = {
+         "ORIG__texture", "PREV__texture",
+         "PREV1__texture", "PREV2__texture", "PREV3__texture",
+         "PREV4__texture", "PREV5__texture", "PREV6__texture",
+         "PASSPREV1__texture", "PASSPREV2__texture",
+         "PASSPREV3__texture", "PASSPREV4__texture",
+         NULL
+      };
+      char decl_buf[1024];
+      size_t dpos = 0;
+      int si;
+
+      for (si = 0; sampler_names[si]; si++)
+      {
+         const char *name = sampler_names[si];
+         size_t nlen = strlen(name);
+         /* Check if this sampler is actually used in the source.
+          * Since ORIG__texture only appears in #define lines (as a macro
+          * replacement target), we need to check for uses of the MACROS
+          * that reference it: ORIG_texture, ORIG_Sample, ORIG_SamplePoint,
+          * or direct uses of ORIG__texture in actual code (not #define). */
+         bool found_real_ref = false;
+
+         /* Check for direct usage outside #define lines */
+         {
+            const char *ref = resolved;
+            while ((ref = strstr(ref, name)) != NULL)
+            {
+               /* Verify whole-word */
+               if ((ref > resolved && d3d9_hlsl_is_ident_char(ref[-1]))
+                     || d3d9_hlsl_is_ident_char(ref[nlen]))
+               { ref++; continue; }
+               /* Check not inside a #define line */
+               {
+                  const char *ls = ref;
+                  bool in_define = false;
+                  while (ls > resolved && ls[-1] != '\n') ls--;
+                  while (*ls == ' ' || *ls == '\t') ls++;
+                  if (*ls == '#')
+                  {
+                     const char *dir = ls + 1;
+                     while (*dir == ' ' || *dir == '\t') dir++;
+                     if (strncmp(dir, "define", 6) == 0)
+                        in_define = true;
+                  }
+                  if (!in_define)
+                  { found_real_ref = true; break; }
+               }
+               ref++;
+            }
+         }
+
+         /* Also check for usage of macros that expand to this sampler.
+          * E.g., ORIG_texture expands to ORIG__texture, and ORIG_Sample
+          * uses ORIG__texture internally via tex2D(ORIG, ...).
+          * Check for the prefix (e.g., "ORIG" for "ORIG__texture") used
+          * in function parameters like 'in orig ORIG' or calls like
+          * ORIG_Sample, ORIG_SamplePoint, ORIG_texture. */
+         if (!found_real_ref)
+         {
+            /* Extract prefix: everything before "__texture" */
+            const char *suffix = strstr(name, "__texture");
+            if (suffix)
+            {
+               size_t prefix_len = (size_t)(suffix - name);
+               char usage_pattern[64];
+               /* Check for 'ORIG_Sample(' or 'ORIG_SamplePoint(' or
+                * 'ORIG_texture' used as an identifier in actual code */
+               snprintf(usage_pattern, sizeof(usage_pattern),
+                     "%.*s_Sample", (int)prefix_len, name);
+               if (strstr(resolved, usage_pattern))
+                  found_real_ref = true;
+
+               if (!found_real_ref)
+               {
+                  snprintf(usage_pattern, sizeof(usage_pattern),
+                        "%.*s_texture", (int)prefix_len, name);
+                  /* Check this isn't only in #define lines */
+                  {
+                     const char *ref = resolved;
+                     while ((ref = strstr(ref, usage_pattern)) != NULL)
+                     {
+                        const char *ls = ref;
+                        bool in_define = false;
+                        while (ls > resolved && ls[-1] != '\n') ls--;
+                        while (*ls == ' ' || *ls == '\t') ls++;
+                        if (*ls == '#')
+                        {
+                           const char *dir = ls + 1;
+                           while (*dir == ' ' || *dir == '\t') dir++;
+                           if (strncmp(dir, "define", 6) == 0)
+                              in_define = true;
+                        }
+                        if (!in_define)
+                        { found_real_ref = true; break; }
+                        ref++;
+                     }
+                  }
+               }
+
+               /* Check for 'in orig ORIG' or 'uniform orig ORIG' pattern
+                * in function signatures — struct parameter passing */
+               if (!found_real_ref)
+               {
+                  char struct_pattern[64];
+                  /* For ORIG__texture, check for 'orig ORIG' */
+                  if (prefix_len == 4 && strncmp(name, "ORIG", 4) == 0)
+                     snprintf(struct_pattern, sizeof(struct_pattern), "orig ORIG");
+                  else
+                     snprintf(struct_pattern, sizeof(struct_pattern),
+                           "%.*s %.*s", (int)prefix_len, name,
+                           (int)prefix_len, name);
+                  if (strstr(resolved, struct_pattern))
+                     found_real_ref = true;
+               }
+            }
+         }
+
+         if (!found_real_ref)
+            continue;
+         /* Check if it's already declared as sampler2D */
+         {
+            char decl_pattern[192];
+            snprintf(decl_pattern, sizeof(decl_pattern),
+                  "sampler2D %s", name);
+            if (strstr(resolved, decl_pattern))
+               continue; /* Already declared */
+         }
+         /* Add declaration */
+         dpos += snprintf(decl_buf + dpos, sizeof(decl_buf) - dpos,
+               "uniform sampler2D %s;\n", name);
+      }
+
+      if (dpos > 0)
+      {
+         /* Insert declarations at the beginning of the source */
+         size_t old_len = strlen(resolved);
+         char *nb = (char*)malloc(old_len + dpos + 1);
+         if (nb)
+         {
+            memcpy(nb, decl_buf, dpos);
+            memcpy(nb + dpos, resolved, old_len + 1);
+            free(resolved);
+            resolved = nb;
+         }
+      }
+   }
+
+   src_len = strlen(resolved);
+
+   /* Zero-initialize any unassigned vertex shader output struct members.
+    * Cg allows partial struct initialization; HLSL does not. */
+   {
+      char *inited = d3d9_hlsl_init_vs_output_members(resolved);
+      if (inited)
+      {
+         free(resolved);
+         resolved = inited;
+         src_len = strlen(resolved);
+      }
+   }
+
+   /* Convert consecutively-invoked macros into [loop] for loops.
+    * This is critical for shaders with large unrolled filter kernels
+    * (e.g. 29-tap FIR) that exceed SM3.0's temp register limit. */
+   {
+      char *looped = d3d9_hlsl_convert_macro_loops(resolved);
+      if (looped)
+      {
+         free(resolved);
+         resolved = looped;
+         src_len = strlen(resolved);
+      }
+   }
+
+   if (!d3d9_hlsl_compile_cg_compat(resolved, src_len, prog,
+            "main_fragment", "ps_3_0", &code_f))
+   {
+      RARCH_ERR("[D3D9 HLSL] Could not compile fragment shader (%s).\n", prog);
+      free(resolved);
+      return false;
+   }
+   if (!d3d9_hlsl_compile_cg_compat(resolved, src_len, prog,
+            "main_vertex", "vs_3_0", &code_v))
+   {
+      RARCH_ERR("[D3D9 HLSL] Could not compile vertex shader (%s).\n", prog);
+      code_f->lpVtbl->Release(code_f);
+      free(resolved);
+      return false;
+   }
+
+   free(resolved);
+
+   pass->ftable = NULL;
+   pass->vtable = NULL;
+
+   if (pd)
+   {
+      pd->ps_bytecode = d3d9_hlsl_dup_bytecode(code_f, &pd->ps_bytecode_dwords);
+      pd->vs_bytecode = d3d9_hlsl_dup_bytecode(code_v, &pd->vs_bytecode_dwords);
+      hlsl_uniform_map_from_bytecode(&pd->vs_map, pd->vs_bytecode, pd->vs_bytecode_dwords);
+      hlsl_uniform_map_from_bytecode(&pd->ps_map, pd->ps_bytecode, pd->ps_bytecode_dwords);
+   }
+
+   IDirect3DDevice9_CreatePixelShader(dev,
+         (const DWORD*)code_f->lpVtbl->GetBufferPointer(code_f),
+         (LPDIRECT3DPIXELSHADER9*)&pass->fprg);
+   IDirect3DDevice9_CreateVertexShader(dev,
+         (const DWORD*)code_v->lpVtbl->GetBufferPointer(code_v),
+         (LPDIRECT3DVERTEXSHADER9*)&pass->vprg);
+   code_f->lpVtbl->Release(code_f);
+   code_v->lpVtbl->Release(code_v);
+
+   return true;
 }
 
 /* END HLSL RENDERCHAIN */
 
+#ifdef D3D9_VIEWS
+/* Views pixel shader @i from @src, and its constant's register */
+static bool d3d9_hlsl_views_ps_make(d3d9_video_t *d3d, unsigned i,
+      const char *src)
+{
+   bool ok;
+   D3DBlob code = NULL;
+   if (!d3d_compile(src, strlen(src), "views", "main_fragment", "ps_2_0",
+            &code))
+      return false;
+   ok = SUCCEEDED(IDirect3DDevice9_CreatePixelShader(d3d->dev,
+            (const DWORD*)code->lpVtbl->GetBufferPointer(code),
+            (LPDIRECT3DPIXELSHADER9*)&d3d->views.ps[i]));
+   d3d->views.ps_reg[i] = d3d9_hlsl_ctab_find_register(
+         (const DWORD*)code->lpVtbl->GetBufferPointer(code),
+         code->lpVtbl->GetBufferSize(code) / sizeof(DWORD), "views_c",
+         NULL, NULL);
+   code->lpVtbl->Release(code);
+   return ok;
+}
+
+/* A chain of its own for a view @width x @height, a copy of the
+ * preset's: its frame's textures, render targets and history its own,
+ * its programs, declarations and lookup textures the preset's */
+static hlsl_renderchain_t *d3d9_hlsl_views_chain_new(d3d9_video_t *d3d,
+      unsigned view, unsigned width, unsigned height)
+{
+   unsigned i;
+   D3DSURFACE_DESC desc;
+   hlsl_renderchain_t *main = (hlsl_renderchain_t*)d3d->renderchain_data;
+   hlsl_renderchain_t *c    = (hlsl_renderchain_t*)calloc(1, sizeof(*c));
+   unsigned tw              = next_pow2(width);
+   unsigned th              = next_pow2(height);
+
+   if (!c)
+      return NULL;
+   c->chain.passes     = shader_pass_vector_list_new();
+   c->chain.luts       = lut_info_vector_list_new();
+   c->chain.bound_tex  = unsigned_vector_list_new();
+   c->chain.bound_vert = unsigned_vector_list_new();
+   if (     !c->chain.passes || !c->chain.luts
+         || !c->chain.bound_tex || !c->chain.bound_vert)
+   {
+      shader_pass_vector_list_free(c->chain.passes);
+      lut_info_vector_list_free(c->chain.luts);
+      unsigned_vector_list_free(c->chain.bound_tex);
+      unsigned_vector_list_free(c->chain.bound_vert);
+      free(c);
+      return NULL;
+   }
+   c->chain.dev         = main->chain.dev;
+   c->chain.pixel_size  = main->chain.pixel_size;
+   c->chain.out_vp      = &c->view_vp;
+   c->view_vp.MaxZ      = 1.0f;
+   c->view              = view;
+   hlsl_uniform_map_init(&c->stock_data.vs_map);
+   hlsl_uniform_map_init(&c->stock_data.ps_map);
+   c->stock_shader      = main->stock_shader;
+   if (c->stock_shader.vprg)
+      IDirect3DVertexShader9_AddRef(
+            (LPDIRECT3DVERTEXSHADER9)c->stock_shader.vprg);
+   if (c->stock_shader.fprg)
+      IDirect3DPixelShader9_AddRef(
+            (LPDIRECT3DPIXELSHADER9)c->stock_shader.fprg);
+
+   for (i = 0; i < main->chain.passes->count; i++)
+   {
+      struct shader_pass pass = main->chain.passes->data[i];
+      pass.last_dims  = 0;
+      pass.tex        = NULL;
+      pass.vertex_buf = NULL;
+      pass.attrib_map = unsigned_vector_list_new();
+      pass.info.tex_dims = i ? 0 : VIDEO_SCALE_PACK(tw, th);
+      if (pass.vertex_decl)
+         IDirect3DVertexDeclaration9_AddRef(pass.vertex_decl);
+      if (pass.vprg)
+         IDirect3DVertexShader9_AddRef((LPDIRECT3DVERTEXSHADER9)pass.vprg);
+      if (pass.fprg)
+         IDirect3DPixelShader9_AddRef((LPDIRECT3DPIXELSHADER9)pass.fprg);
+      if (i && FAILED(IDirect3DDevice9_CreateVertexBuffer(c->chain.dev,
+                  4 * sizeof(struct Vertex), D3DUSAGE_WRITEONLY, 0,
+                  D3DPOOL_DEFAULT, &pass.vertex_buf, NULL)))
+         pass.vertex_buf = NULL;
+      shader_pass_vector_list_append(c->chain.passes, pass);
+      if (i && !pass.vertex_buf)
+         goto error;
+   }
+
+   for (i = 0; i < main->pass_data_count; i++)
+   {
+      hlsl_pass_data_t *pd       = &c->pass_data[i];
+      const hlsl_pass_data_t *md = &main->pass_data[i];
+      *pd             = *md;
+      pd->vs_bytecode = NULL;
+      pd->ps_bytecode = NULL;
+      c->pass_data_count++;
+      if (md->vs_bytecode && (pd->vs_bytecode = (DWORD*)malloc(
+                  md->vs_bytecode_dwords * sizeof(DWORD))))
+         memcpy(pd->vs_bytecode, md->vs_bytecode,
+               md->vs_bytecode_dwords * sizeof(DWORD));
+      if (md->ps_bytecode && (pd->ps_bytecode = (DWORD*)malloc(
+                  md->ps_bytecode_dwords * sizeof(DWORD))))
+         memcpy(pd->ps_bytecode, md->ps_bytecode,
+               md->ps_bytecode_dwords * sizeof(DWORD));
+      if (     (md->vs_bytecode && !pd->vs_bytecode)
+            || (md->ps_bytecode && !pd->ps_bytecode))
+         goto error;
+   }
+
+   for (i = 0; i < main->chain.luts->count; i++)
+   {
+      struct lut_info lut = main->chain.luts->data[i];
+      IDirect3DTexture9_AddRef(lut.tex);
+      lut_info_vector_list_append(c->chain.luts, lut);
+   }
+
+   if (FAILED(IDirect3DTexture9_GetLevelDesc(main->chain.prev.tex[0], 0,
+               &desc)))
+      goto error;
+   for (i = 0; i < TEXTURES; i++)
+   {
+      if (     FAILED(IDirect3DDevice9_CreateVertexBuffer(c->chain.dev,
+                  4 * sizeof(struct Vertex), D3DUSAGE_WRITEONLY, 0,
+                  D3DPOOL_DEFAULT, &c->chain.prev.vertex_buf[i], NULL))
+            || FAILED(d3d9_tex_create(c->chain.dev, tw, th, 1,
+                  0, desc.Format,
+                  (LPDIRECT3DTEXTURE9*)&c->chain.prev.tex[i])))
+         goto error;
+   }
+   return c;
+
+error:
+   hlsl_d3d9_renderchain_free(c);
+   return NULL;
+}
+
+/* The views' preset chains from @first on let go */
+static void d3d9_hlsl_views_free_chains(d3d9_video_t *d3d, unsigned first)
+{
+   unsigned i;
+   for (i = first; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      if (d3d->views.chains.preset[i])
+         hlsl_d3d9_renderchain_free(d3d->views.chains.preset[i]);
+      d3d->views.chains.preset[i] = NULL;
+   }
+}
+
+/* A preset chain for each of the map's views [0, count) that has none */
+static void d3d9_hlsl_views_build_chains(d3d9_video_t *d3d,
+      const video_views_map_t *map)
+{
+   unsigned i;
+   for (i = 0; i < d3d->views.chains.count && i < map->num_views; i++)
+      if (!d3d->views.chains.preset[i])
+         d3d->views.chains.preset[i] = d3d9_hlsl_views_chain_new(d3d, i,
+               map->views[i].width, map->views[i].height);
+}
+
+/* The MVP that puts a pass's quad over @dst within viewport @vp, turned
+ * @rotation quarter turns as the frame is */
+static void d3d9_hlsl_views_mvp(float *m, const video_views_rect_t *dst,
+      const D3DVIEWPORT9 *vp, unsigned rotation)
+{
+   /* The turned quad: q.x = r0 x + r1 y + r2, q.y = r3 x + r4 y + r5 */
+   static const float turns[4][6] = {
+      {  1.0f,  0.0f, 0.0f,  0.0f,  1.0f, 0.0f },
+      {  0.0f, -1.0f, 1.0f,  1.0f,  0.0f, 0.0f },
+      { -1.0f,  0.0f, 1.0f,  0.0f, -1.0f, 1.0f },
+      {  0.0f,  1.0f, 0.0f, -1.0f,  0.0f, 1.0f }
+   };
+   const float *r = turns[rotation & 3];
+   float ax = 2.0f * (float)VIDEO_SCALE_W(dst->dims) / (float)vp->Width;
+   float bx = 2.0f * (float)(VIDEO_POS_X(dst->pos) - (int)vp->X)
+      / (float)vp->Width - 1.0f;
+   float ay = 2.0f * (float)VIDEO_SCALE_H(dst->dims) / (float)vp->Height;
+   float by = 1.0f - 2.0f * (float)(VIDEO_POS_Y(dst->pos) - (int)vp->Y
+         + (int)VIDEO_SCALE_H(dst->dims)) / (float)vp->Height;
+   m[0]  = ax * r[0];
+   m[1]  = ay * r[3];
+   m[2]  = 0.0f;
+   m[3]  = 0.0f;
+   m[4]  = ax * r[1];
+   m[5]  = ay * r[4];
+   m[6]  = 0.0f;
+   m[7]  = 0.0f;
+   m[8]  = 0.0f;
+   m[9]  = 0.0f;
+   m[10] = 1.0f;
+   m[11] = 0.0f;
+   m[12] = ax * r[2] + bx;
+   m[13] = ay * r[5] + by;
+   m[14] = 0.0f;
+   m[15] = 1.0f;
+}
+
+struct d3d9_views_draw;
+static void d3d9_hlsl_views_draw_pass(d3d9_video_t *d3d,
+      const struct d3d9_views_draw *d, void *data,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool again);
+
+#define D3D9V_FN(name)             d3d9_hlsl_##name
+#define D3D9V_TAG                  "[D3D9 HLSL]"
+#define D3D9V_PRESETS
+#define D3D9V_CHAINS_BUILD(d, map) d3d9_hlsl_views_build_chains(d, map)
+#define D3D9V_CHAINS_FREE(d, first) d3d9_hlsl_views_free_chains(d, first)
+#define D3D9V_PASS(p, d, c, r, cut, again) \
+   d3d9_hlsl_views_draw_pass(p, d, c, r, cut, again)
+#define D3D9V_PS_MAKE(d, i, src)   d3d9_hlsl_views_ps_make(d, i, src)
+#define D3D9V_PS_FREE(d, i)        IDirect3DPixelShader9_Release( \
+      (LPDIRECT3DPIXELSHADER9)(d)->views.ps[i])
+#define D3D9V_PS_BIND(d, i)        IDirect3DDevice9_SetPixelShader((d)->dev, \
+      (LPDIRECT3DPIXELSHADER9)(d)->views.ps[i])
+#include "../common/d3d9_views.h"
+
+/* @c's last pass over @dst, cut to @cut; with @again its frame was run
+ * for an earlier placement. Each view of a software frame is written
+ * straight from it into the chain's own texture. */
+static void d3d9_hlsl_views_draw_pass(d3d9_video_t *d3d,
+      const struct d3d9_views_draw *d, void *data,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool again)
+{
+   float mvp[16];
+   D3DVIEWPORT9 vp;
+   hlsl_renderchain_t *c            = (hlsl_renderchain_t*)data;
+   const struct retro_video_view *v = &d->video_info->views.views[c->view];
+
+   if (!again)
+   {
+      unsigned old  = c->chain.passes->data[0].info.tex_dims;
+      unsigned size = d->rects[c->view].dims;
+      if (!d3d9_hlsl_renderchain_fit_frame(&c->chain, v->width, v->height))
+         return;
+      if (     c->sized_dims != size
+            || c->chain.passes->data[0].info.tex_dims != old
+            || !c->sized_dims)
+      {
+         c->view_vp.Width  = VIDEO_SCALE_W(size);
+         c->view_vp.Height = VIDEO_SCALE_H(size);
+         d3d9_recompute_pass_sizes(c->chain.dev, &c->chain, &d3d->shader,
+               &c->view_vp);
+         c->sized_dims     = size;
+      }
+      d3d9_hlsl_renderchain_run(d3d, c, (const uint8_t*)d->frame
+            + (size_t)v->y * d->pitch + (size_t)v->x * c->chain.pixel_size,
+            v->width, v->height, d->pitch, &c->last_dims);
+      c->ran = true;
+   }
+   else if (!c->ran)
+      return;
+   vp.X      = VIDEO_POS_X(cut->pos);
+   vp.Y      = VIDEO_POS_Y(cut->pos);
+   vp.Width  = VIDEO_SCALE_W(cut->dims);
+   vp.Height = VIDEO_SCALE_H(cut->dims);
+   vp.MinZ   = 0.0f;
+   vp.MaxZ   = 1.0f;
+   d3d9_hlsl_views_mvp(mvp, dst, &vp, d->rotation);
+   d3d9_hlsl_renderchain_last(d3d, c, c->last_dims, &vp, mvp, dst->dims);
+}
+
+/* Past the frame for each view's chain that ran */
+static void d3d9_hlsl_views_end(void **chains)
+{
+   unsigned i;
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      hlsl_renderchain_t *c = (hlsl_renderchain_t*)chains[i];
+      if (c && c->ran)
+      {
+         d3d9_hlsl_renderchain_end(c);
+         c->ran = false;
+      }
+   }
+}
+#endif
+
 static uint32_t d3d9_hlsl_get_flags(void *data)
 {
    uint32_t flags = 0;
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   /* Direct3D 9Ex Presentation took up the device */
+   if (d3d && d3d->dev_ex)
+      BIT32_SET(flags, GFX_CTX_FLAGS_CUSTOMIZABLE_FRAME_LATENCY);
 
    BIT32_SET(flags, GFX_CTX_FLAGS_BLACK_FRAME_INSERTION);
    BIT32_SET(flags, GFX_CTX_FLAGS_MENU_FRAME_FILTERING);
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_HLSL);
+   BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_CG);
+#ifdef D3D9_VIEWS
+   if (d3d && retro_atomic_load_acquire_int(&d3d->views.allowed))
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS);
+   if (d3d && retro_atomic_load_acquire_int(&d3d->views.fallback))
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+#endif
 
    return flags;
 }
 
+#ifdef D3D9_HW_RENDER
+/* --- libretro_d3d9.h ----------------------------------------------------
+ * The core and the driver take turns on the device. Unthreaded they never
+ * overlap and a turn is bookkeeping. Under the wrapper the turn is one
+ * atomic word; a waiting frontend goes first, and a waiter parks on an
+ * eventcount. Only frame and restore take the frontend's turn: the
+ * wrapper's other commands run while the main thread waits. */
+
+#define D3D9_HW_TURN_CORE     1
+#define D3D9_HW_TURN_FRONTEND 2
+#define D3D9_HW_TURN_WAITING  4
+
+#ifdef HAVE_THREADS
+/* Until the turn word has none of @busy, or changed */
+static void d3d9_hlsl_hw_turn_park(d3d9_video_t *d3d, int busy)
+{
+   int key = retro_eventcount_prepare_wait(&d3d->hw.turn_ec);
+   if (retro_atomic_load_acquire_int(&d3d->hw.turn) & busy)
+      retro_eventcount_commit_wait(&d3d->hw.turn_ec, key);
+   else
+      retro_eventcount_cancel_wait(&d3d->hw.turn_ec);
+}
+#endif
+
+/* The frontend's turn; recursive on the frontend's thread */
+static void d3d9_hlsl_hw_enter(d3d9_video_t *d3d)
+{
+   if (!d3d->hw.enable)
+      return;
+   if (d3d->hw.fe_depth++)
+      return;
+#ifdef HAVE_THREADS
+   if (d3d->hw.shared)
+   {
+      for (;;)
+      {
+         int t = retro_atomic_load_acquire_int(&d3d->hw.turn);
+         if (!(t & (D3D9_HW_TURN_CORE | D3D9_HW_TURN_FRONTEND)))
+         {
+            if (retro_atomic_cas_int(&d3d->hw.turn, t,
+                     D3D9_HW_TURN_FRONTEND))
+               break;
+            continue;
+         }
+         /* Say so, then wait for the core to give it back */
+         if (     !(t & D3D9_HW_TURN_WAITING)
+               && !retro_atomic_cas_int(&d3d->hw.turn, t,
+                  t | D3D9_HW_TURN_WAITING))
+            continue;
+         d3d9_hlsl_hw_turn_park(d3d, D3D9_HW_TURN_CORE);
+      }
+   }
+#endif
+}
+
+static void d3d9_hlsl_hw_leave(d3d9_video_t *d3d)
+{
+   if (!d3d->hw.enable || --d3d->hw.fe_depth)
+      return;
+   /* On the way out: unthreaded, the core's callbacks may lock and
+    * unlock inside the frontend's turn */
+   d3d->hw.frontend_used = true;
+#ifdef HAVE_THREADS
+   if (d3d->hw.shared)
+   {
+      retro_atomic_store_release_int(&d3d->hw.turn, 0);
+      retro_eventcount_notify(&d3d->hw.turn_ec);
+   }
+#endif
+}
+
+static bool d3d9_hlsl_hw_lock_context(void *handle)
+{
+   bool used;
+   d3d9_video_t *d3d = (d3d9_video_t*)handle;
+#ifdef HAVE_THREADS
+   if (d3d->hw.shared)
+   {
+      /* Only the holder finds its own id: it clears it before release */
+      int self = (int)GetCurrentThreadId();
+      if (retro_atomic_load_relaxed_int(&d3d->hw.core_tid) == self)
+      {
+         d3d->hw.core_depth++;
+         return false;
+      }
+      while (!retro_atomic_cas_int(&d3d->hw.turn, 0, D3D9_HW_TURN_CORE))
+         d3d9_hlsl_hw_turn_park(d3d, ~0);
+      retro_atomic_store_relaxed_int(&d3d->hw.core_tid, self);
+   }
+#endif
+   d3d->hw.core_depth++;
+   used                  = d3d->hw.frontend_used;
+   d3d->hw.frontend_used = false;
+   return used;
+}
+
+static void d3d9_hlsl_hw_unlock_context(void *handle)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)handle;
+   if (!d3d->hw.core_depth || --d3d->hw.core_depth)
+      return;
+#ifdef HAVE_THREADS
+   if (d3d->hw.shared)
+   {
+      int t;
+      retro_atomic_store_relaxed_int(&d3d->hw.core_tid, 0);
+      /* The waiting bit stays: the frontend goes first */
+      do
+      {
+         t = retro_atomic_load_acquire_int(&d3d->hw.turn);
+      } while (!retro_atomic_cas_int(&d3d->hw.turn, t,
+               t & ~D3D9_HW_TURN_CORE));
+      if (t & D3D9_HW_TURN_WAITING)
+         retro_eventcount_notify(&d3d->hw.turn_ec);
+   }
+#endif
+}
+
+/* With the device held: the release may be the texture's last */
+static void d3d9_hlsl_hw_take_texture(d3d9_video_t *d3d,
+      LPDIRECT3DTEXTURE9 tex)
+{
+   D3DSURFACE_DESC desc;
+   if (tex == d3d->hw.tex)
+      return;
+   if (tex)
+      IDirect3DTexture9_AddRef(tex);
+   if (d3d->hw.tex)
+      IDirect3DTexture9_Release(d3d->hw.tex);
+   d3d->hw.tex      = tex;
+   d3d->hw.tex_dims = 0;
+   if (tex && SUCCEEDED(IDirect3DTexture9_GetLevelDesc(tex, 0, &desc)))
+      d3d->hw.tex_dims = VIDEO_SCALE_PACK(desc.Width, desc.Height);
+}
+
+static void d3d9_hlsl_hw_set_texture(void *handle, LPDIRECT3DTEXTURE9 tex)
+{
+   d3d9_hlsl_hw_take_texture((d3d9_video_t*)handle, tex);
+}
+
+/* No wrapper: the frame reads the texture inside video_refresh */
+static unsigned d3d9_hlsl_hw_get_sync_index(void *handle)
+{
+   (void)handle;
+   return 0;
+}
+
+static unsigned d3d9_hlsl_hw_get_sync_index_mask(void *handle)
+{
+   (void)handle;
+   return 1;
+}
+
+static void d3d9_hlsl_hw_wait_sync_index(void *handle)
+{
+   (void)handle;
+}
+
+/* A device without Ex loses the core's default pool on a reset */
+static bool d3d9_hlsl_hw_reset_costs(d3d9_video_t *d3d)
+{
+   return d3d->hw.enable && !d3d9_dev_is_ex(d3d->dev);
+}
+
+/* Once until d3d9_hlsl_hw_context_reset; never on the video thread */
+static void d3d9_hlsl_hw_context_destroy(d3d9_video_t *d3d)
+{
+   struct retro_hw_render_callback *hwr;
+   if (!d3d->hw.enable || d3d->hw.lost || d3d->hw.shared)
+      return;
+   d3d9_hlsl_hw_take_texture(d3d, NULL);
+   d3d->hw.lost = true;
+   hwr          = video_driver_get_hw_context();
+   if (hwr->context_destroy)
+      hwr->context_destroy();
+}
+
+static void d3d9_hlsl_hw_context_reset(d3d9_video_t *d3d)
+{
+   struct retro_hw_render_callback *hwr = video_driver_get_hw_context();
+   d3d->hw.iface.device  = d3d->dev;
+   d3d->hw.lost          = false;
+   d3d->hw.frontend_used = true;
+   if (hwr->context_reset)
+      hwr->context_reset();
+}
+
+/* The state the driver's drawing assumes, which the core may change */
+static void d3d9_hlsl_hw_state_record(d3d9_video_t *d3d)
+{
+   unsigned i;
+   LPDIRECT3DDEVICE9 dev = d3d->dev;
+   if (FAILED(IDirect3DDevice9_BeginStateBlock(dev)))
+      return;
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_ZENABLE, D3DZB_FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_ZWRITEENABLE, FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_FILLMODE, D3DFILL_SOLID);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHATESTENABLE, FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_BLENDOP, D3DBLENDOP_ADD);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_STENCILENABLE, FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_FOGENABLE, FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_CLIPPLANEENABLE, 0);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_SCISSORTESTENABLE, TRUE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_COLORWRITEENABLE, 0xF);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_SRGBWRITEENABLE, FALSE);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_MULTISAMPLEMASK, 0xFFFFFFFF);
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_WRAP0, 0);
+   IDirect3DDevice9_SetStreamSourceFreq(dev, 0, 1);
+   /* A frame of any size: no border to sample */
+   IDirect3DDevice9_SetSamplerState(dev, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+   IDirect3DDevice9_SetSamplerState(dev, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+   for (i = 0; i < 16; i++)
+   {
+      IDirect3DDevice9_SetSamplerState(dev, i, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+      IDirect3DDevice9_SetSamplerState(dev, i, D3DSAMP_MAXMIPLEVEL, 0);
+      IDirect3DDevice9_SetSamplerState(dev, i, D3DSAMP_MIPMAPLODBIAS, 0);
+      IDirect3DDevice9_SetSamplerState(dev, i, D3DSAMP_SRGBTEXTURE, 0);
+   }
+   if (FAILED(IDirect3DDevice9_EndStateBlock(dev, &d3d->hw.state)))
+      d3d->hw.state = NULL;
+}
+
+static void d3d9_hlsl_hw_state_apply(d3d9_video_t *d3d)
+{
+   unsigned i;
+   LPDIRECT3DSURFACE9 back = NULL;
+   if (d3d->hw.state)
+      IDirect3DStateBlock9_Apply(d3d->hw.state);
+   /* Also sets the viewport and the scissor rect to the whole of it */
+   if (SUCCEEDED(IDirect3DDevice9_GetBackBuffer(d3d->dev, 0, 0,
+               D3DBACKBUFFER_TYPE_MONO, &back)))
+   {
+      IDirect3DDevice9_SetRenderTarget(d3d->dev, 0, back);
+      IDirect3DSurface9_Release(back);
+   }
+   for (i = 1; i < 4; i++)
+      IDirect3DDevice9_SetRenderTarget(d3d->dev, i, NULL);
+   IDirect3DDevice9_SetDepthStencilSurface(d3d->dev, NULL);
+}
+
+/* The wrapper's ring hands over the slot's texture by pointer; the frame
+ * takes the driver's reference, holding the device */
+static bool d3d9_hlsl_hw_ring_install(void *data, const void *image,
+      const void *semaphores, unsigned num_semaphores,
+      unsigned src_queue_family, const void *cmd, unsigned num_cmd)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   (void)semaphores; (void)num_semaphores; (void)src_queue_family;
+   (void)cmd; (void)num_cmd;
+   if (!d3d || !d3d->hw.enable || !image)
+      return false;
+   d3d->hw.ring_tex = (LPDIRECT3DTEXTURE9)image;
+   return true;
+}
+
+/* One device, one command stream: a frame issued is a frame done */
+static bool d3d9_hlsl_hw_ring_fence_new(void *data, void **fence)
+{
+   HANDLE ev;
+   (void)data;
+   if (!fence || !(ev = CreateEvent(NULL, FALSE, FALSE, NULL)))
+      return false;
+   *fence = (void*)ev;
+   return true;
+}
+
+static void d3d9_hlsl_hw_ring_fence_free(void *data, void *fence)
+{
+   (void)data;
+   if (fence)
+      CloseHandle((HANDLE)fence);
+}
+
+static void d3d9_hlsl_hw_ring_fence_signal(void *data, void *fence)
+{
+   (void)data;
+   if (fence)
+      SetEvent((HANDLE)fence);
+}
+
+static bool d3d9_hlsl_hw_ring_fence_wait(void *data, void *fence,
+      unsigned timeout_us)
+{
+   (void)data;
+   if (!fence)
+      return true;
+   return WaitForSingleObject((HANDLE)fence,
+         timeout_us == HW_RING_WAIT_FOREVER
+         ? INFINITE : (timeout_us + 999) / 1000) == WAIT_OBJECT_0;
+}
+
+static void d3d9_hlsl_hw_init(d3d9_video_t *d3d, const video_info_t *info)
+{
+   d3d->hw.shared                    = false;
+#ifdef HAVE_THREADS
+   d3d->hw.shared                    = info->is_threaded
+      && retro_eventcount_init(&d3d->hw.turn_ec);
+   retro_atomic_int_init(&d3d->hw.turn, 0);
+   retro_atomic_int_init(&d3d->hw.core_tid, 0);
+#endif
+   d3d->hw.frontend_used             = true;
+   d3d9_hlsl_ensure_compiler();
+   d3d->hw.iface.interface_type      = RETRO_HW_RENDER_INTERFACE_D3D9;
+   d3d->hw.iface.interface_version   = RETRO_HW_RENDER_INTERFACE_D3D9_VERSION;
+   d3d->hw.iface.handle              = d3d;
+   d3d->hw.iface.device              = d3d->dev;
+   d3d->hw.iface.D3DCompile          = (retro_d3d9_compile_t)d3d9_pCompile;
+   d3d->hw.iface.lock_context        = d3d9_hlsl_hw_lock_context;
+   d3d->hw.iface.unlock_context      = d3d9_hlsl_hw_unlock_context;
+   d3d->hw.iface.set_texture         = d3d9_hlsl_hw_set_texture;
+   d3d->hw.iface.get_sync_index      = d3d9_hlsl_hw_get_sync_index;
+   d3d->hw.iface.get_sync_index_mask = d3d9_hlsl_hw_get_sync_index_mask;
+   d3d->hw.iface.wait_sync_index     = d3d9_hlsl_hw_wait_sync_index;
+   RARCH_LOG("[D3D9 HLSL] Hardware render interface version %u%s.\n",
+         d3d->hw.iface.interface_version,
+         d3d->hw.shared ? ", device shared with the video thread" : "");
+}
+#endif
+
 static void d3d9_hlsl_deinitialize(d3d9_video_t *d3d)
 {
-   font_driver_free_osd();
+#ifdef D3D9_VIEWS
+   /* The device objects over frame memory: made again on use */
+   d3d9_frame_mem_device_lost(&d3d->sw_fb);
+#endif
+
+#ifdef D3D9_VIEWS
+   /* Its targets are in the default pool, which a reset drops. */
+   d3d9_hlsl_views_release(d3d);
+#endif
 
    hlsl_d3d9_renderchain_free(d3d->renderchain_data);
 
+#ifdef D3D9_HW_RENDER
+   if (d3d->hw.state)
+   {
+      IDirect3DStateBlock9_Release(d3d->hw.state);
+      d3d->hw.state = NULL;
+   }
+#endif
+
    d3d9_vertex_buffer_free(d3d->menu_display.buffer,
          d3d->menu_display.decl);
+
+   if (d3d9_hlsl_menu_fullscreen_vbo)
+   {
+      IDirect3DVertexBuffer9_Release(d3d9_hlsl_menu_fullscreen_vbo);
+      d3d9_hlsl_menu_fullscreen_vbo = NULL;
+   }
+   if (d3d9_hlsl_pipeline_decl)
+   {
+      IDirect3DVertexDeclaration9_Release(d3d9_hlsl_pipeline_decl);
+      d3d9_hlsl_pipeline_decl = NULL;
+   }
+   if (d3d9_hlsl_menu_pipeline_vbo)
+   {
+      IDirect3DVertexBuffer9_Release(d3d9_hlsl_menu_pipeline_vbo);
+      d3d9_hlsl_menu_pipeline_vbo = NULL;
+   }
+
+   if (d3d9_hlsl_overlay_decl)
+   {
+      IDirect3DVertexDeclaration9_Release(d3d9_hlsl_overlay_decl);
+      d3d9_hlsl_overlay_decl = NULL;
+   }
 
    d3d->renderchain_data    = NULL;
    d3d->menu_display.buffer = NULL;
@@ -1132,37 +7374,148 @@ static bool d3d9_hlsl_init_base(
 
    memset(&d3dpp, 0, sizeof(d3dpp));
 
-   g_pD3D9            = (LPDIRECT3D9)d3d9_create();
+   d3d->d3d9 = (LPDIRECT3D9)d3d9_create();
 
-   /* this needs g_pD3D9 created first */
+   /* this needs d3d->d3d9 created first */
    d3d9_make_d3dpp(d3d, info, &d3dpp);
 
-   if (!g_pD3D9)
+   if (!d3d->d3d9)
       return false;
    if (!d3d9_create_device(&d3d->dev, &d3dpp,
-            g_pD3D9,
+            d3d->d3d9,
             focus_window,
             d3d->cur_mon_id)
       )
       return false;
+   d3d->present_interval = d3dpp.PresentationInterval;
    return true;
 }
 
-static bool renderchain_d3d_hlsl_init_first(
-      enum gfx_ctx_api api,
-      void **renderchain_handle)
+static void d3d9_hlsl_log_info(const struct LinkInfo *info)
 {
-   hlsl_renderchain_t *renderchain =
-      (hlsl_renderchain_t*)calloc(1, sizeof(*renderchain));
-   if (!renderchain)
+   RARCH_LOG("[D3D9] Render pass info:\n");
+   RARCH_LOG("\tTexture width: %u\n", VIDEO_SCALE_W(info->tex_dims));
+   RARCH_LOG("\tTexture height: %u\n", VIDEO_SCALE_H(info->tex_dims));
+
+   RARCH_LOG("\tScale type (X): ");
+
+   switch (info->pass->fbo.type_x)
+   {
+      case RARCH_SCALE_INPUT:
+         RARCH_LOG("Relative @ %fx\n", info->pass->fbo.scale_x);
+         break;
+
+      case RARCH_SCALE_VIEWPORT:
+         RARCH_LOG("Viewport @ %fx\n", info->pass->fbo.scale_x);
+         break;
+
+      case RARCH_SCALE_ABSOLUTE:
+         RARCH_LOG("Absolute @ %u px\n", info->pass->fbo.abs_x);
+         break;
+   }
+
+   RARCH_LOG("\tScale type (Y): ");
+
+   switch (info->pass->fbo.type_y)
+   {
+      case RARCH_SCALE_INPUT:
+         RARCH_LOG("Relative @ %fx\n", info->pass->fbo.scale_y);
+         break;
+
+      case RARCH_SCALE_VIEWPORT:
+         RARCH_LOG("Viewport @ %fx\n", info->pass->fbo.scale_y);
+         break;
+
+      case RARCH_SCALE_ABSOLUTE:
+         RARCH_LOG("Absolute @ %u px\n", info->pass->fbo.abs_y);
+         break;
+   }
+
+   RARCH_LOG("\tBilinear filter: %s\n",
+         info->pass->filter == RARCH_FILTER_LINEAR ? "true" : "false");
+}
+
+static bool d3d9_init_multipass(d3d9_video_t *d3d, const char *shader_path)
+{
+   unsigned i;
+   struct video_shader_pass *pass = NULL;
+
+   memset(&d3d->shader, 0, sizeof(d3d->shader));
+
+   if (!video_shader_load_preset_into_shader(shader_path, &d3d->shader))
       return false;
 
-   d3d9_init_renderchain(&renderchain->chain);
+   RARCH_LOG("[D3D9] Found %u shaders.\n", d3d->shader.passes);
 
-   *renderchain_handle = renderchain;
+   for (i = 0; i < d3d->shader.passes; i++)
+   {
+      if (d3d->shader.pass[i].fbo.flags & FBO_SCALE_FLAG_VALID)
+         continue;
+
+      d3d->shader.pass[i].fbo.scale_y = 1.0f;
+      d3d->shader.pass[i].fbo.scale_x = 1.0f;
+      d3d->shader.pass[i].fbo.type_x  = RARCH_SCALE_INPUT;
+      d3d->shader.pass[i].fbo.type_y  = RARCH_SCALE_INPUT;
+   }
+
+   /* The last pass gets a target of its own, drawn to the backbuffer by
+    * a stock pass after it, only when the image would differ drawn
+    * straight there: a scale other than the viewport at 1.0, or a
+    * floating-point target. */
+   if (     d3d->shader.passes < GFX_MAX_SHADERS
+         && (d3d->shader.pass[d3d->shader.passes - 1].fbo.flags
+            & FBO_SCALE_FLAG_VALID)
+         && !GFX_FBO_SCALE_IS_VIEWPORT(
+            &d3d->shader.pass[d3d->shader.passes - 1].fbo))
+   {
+      d3d->shader.passes++;
+      pass              = (struct video_shader_pass*)
+         &d3d->shader.pass[d3d->shader.passes - 1];
+
+      pass->fbo.scale_x = 1.0f;
+      pass->fbo.scale_y = 1.0f;
+      pass->fbo.type_x  = RARCH_SCALE_VIEWPORT;
+      pass->fbo.type_y  = RARCH_SCALE_VIEWPORT;
+      pass->filter      = RARCH_FILTER_UNSPEC;
+   }
+   else
+   {
+      pass              = (struct video_shader_pass*)
+         &d3d->shader.pass[d3d->shader.passes - 1];
+
+      pass->fbo.scale_x = 1.0f;
+      pass->fbo.scale_y = 1.0f;
+      pass->fbo.type_x  = RARCH_SCALE_VIEWPORT;
+      pass->fbo.type_y  = RARCH_SCALE_VIEWPORT;
+   }
 
    return true;
 }
+
+static bool d3d9_hlsl_process_shader(d3d9_video_t *d3d)
+{
+   struct video_shader_pass *pass   = NULL;
+   const char *shader_path = d3d->shader_path;
+   if (shader_path && *shader_path)
+      return d3d9_init_multipass(d3d, shader_path);
+
+   memset(&d3d->shader, 0, sizeof(d3d->shader));
+   d3d->shader.passes               = 1;
+
+   pass = (struct video_shader_pass*)&d3d->shader.pass[0];
+
+   pass->fbo.flags                 |= FBO_SCALE_FLAG_VALID;
+   pass->fbo.scale_y                = 1.0;
+   pass->fbo.type_y                 = RARCH_SCALE_VIEWPORT;
+   pass->fbo.scale_x                = pass->fbo.scale_y;
+   pass->fbo.type_x                 = pass->fbo.type_y;
+
+   if (d3d->shader_path && *d3d->shader_path)
+      strlcpy(pass->source.path, d3d->shader_path,
+            sizeof(pass->source.path));
+   return true;
+}
+
 
 static bool d3d9_hlsl_init_chain(d3d9_video_t *d3d,
       unsigned input_scale, bool rgb32)
@@ -1176,18 +7529,26 @@ static bool d3d9_hlsl_init_chain(d3d9_video_t *d3d,
    bool video_smooth    = settings->bools.video_smooth;
 
    /* Setup information for first pass. */
-   link_info.pass       = NULL;
-   link_info.tex_w      = input_scale * RARCH_SCALE_BASE;
-   link_info.tex_h      = input_scale * RARCH_SCALE_BASE;
+   link_info.tex_dims   = VIDEO_SCALE_PACK(input_scale * RARCH_SCALE_BASE,
+         input_scale * RARCH_SCALE_BASE);
    link_info.pass       = &d3d->shader.pass[0];
 
-   if (!renderchain_d3d_hlsl_init_first(GFX_CTX_DIRECT3D9_API,
-            &d3d->renderchain_data))
-      return false;
-   if (!d3d->renderchain_data)
-      return false;
+   {
+      hlsl_renderchain_t *renderchain =
+         (hlsl_renderchain_t*)calloc(1, sizeof(*renderchain));
+      if (!renderchain)
+         return false;
 
-   RARCH_LOG("[D3D9]: Using HLSL shader backend.\n");
+      renderchain->chain.passes     = shader_pass_vector_list_new();
+      renderchain->chain.luts       = lut_info_vector_list_new();
+      renderchain->chain.bound_tex  = unsigned_vector_list_new();
+      renderchain->chain.bound_vert = unsigned_vector_list_new();
+
+      renderchain->chain.sw_fb      = &d3d->sw_fb;
+      d3d->renderchain_data         = renderchain;
+   }
+
+   RARCH_LOG("[D3D9 HLSL] Using HLSL shader backend.\n");
 
    if (
          !hlsl_d3d9_renderchain_init(
@@ -1200,24 +7561,44 @@ static bool d3d9_hlsl_init_chain(d3d9_video_t *d3d,
       )
       return false;
 
-   d3d9_log_info(&link_info);
+   d3d9_hlsl_log_info(&link_info);
 
 #ifndef _XBOX
-   current_width  = link_info.tex_w;
-   current_height = link_info.tex_h;
+   current_width  = VIDEO_SCALE_W(link_info.tex_dims);
+   current_height = VIDEO_SCALE_H(link_info.tex_dims);
    out_width      = 0;
    out_height     = 0;
 
    for (i = 1; i < d3d->shader.passes; i++)
    {
-      d3d9_convert_geometry(
-            &link_info,
-            &out_width, &out_height,
-            current_width, current_height, &d3d->out_vp);
+      switch (link_info.pass->fbo.type_x)
+      {
+         case RARCH_SCALE_VIEWPORT:
+            out_width = link_info.pass->fbo.scale_x * d3d->out_vp.Width;
+            break;
+         case RARCH_SCALE_ABSOLUTE:
+            out_width = link_info.pass->fbo.abs_x;
+            break;
+         case RARCH_SCALE_INPUT:
+            out_width = link_info.pass->fbo.scale_x * current_width;
+            break;
+      }
+      switch (link_info.pass->fbo.type_y)
+      {
+         case RARCH_SCALE_VIEWPORT:
+            out_height = link_info.pass->fbo.scale_y * d3d->out_vp.Height;
+            break;
+         case RARCH_SCALE_ABSOLUTE:
+            out_height = link_info.pass->fbo.abs_y;
+            break;
+         case RARCH_SCALE_INPUT:
+            out_height = link_info.pass->fbo.scale_y * current_height;
+            break;
+      }
 
       link_info.pass  = &d3d->shader.pass[i];
-      link_info.tex_w = next_pow2(out_width);
-      link_info.tex_h = next_pow2(out_height);
+      link_info.tex_dims = VIDEO_SCALE_PACK(next_pow2(out_width),
+            next_pow2(out_height));
 
       current_width   = out_width;
       current_height  = out_height;
@@ -1225,20 +7606,20 @@ static bool d3d9_hlsl_init_chain(d3d9_video_t *d3d,
       if (!hlsl_d3d9_renderchain_add_pass(
                (hlsl_renderchain_t*)d3d->renderchain_data, &link_info))
       {
-         RARCH_ERR("[D3D9]: Failed to add pass.\n");
+         RARCH_ERR("[D3D9 HLSL] Failed to add pass.\n");
          return false;
       }
-      d3d9_log_info(&link_info);
+      d3d9_hlsl_log_info(&link_info);
    }
 #endif
 
    {
       hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
-      d3d9_renderchain_t *chain   = (d3d9_renderchain_t*)&_chain->chain;
+      d3d9_hlsl_renderchain_t *chain   = (d3d9_hlsl_renderchain_t*)&_chain->chain;
 
       for (i = 0; i < d3d->shader.luts; i++)
       {
-         if (!d3d9_renderchain_add_lut(
+         if (!d3d9_hlsl_renderchain_add_lut(
                   chain,
                   d3d->shader.lut[i].id,
                   d3d->shader.lut[i].path,
@@ -1246,7 +7627,7 @@ static bool d3d9_hlsl_init_chain(d3d9_video_t *d3d,
                   ? video_smooth
                   : (d3d->shader.lut[i].filter == RARCH_FILTER_LINEAR)))
          {
-            RARCH_ERR("[D3D9]: Failed to init LUTs.\n");
+            RARCH_ERR("[D3D9 HLSL] Failed to init LUTs.\n");
             return false;
          }
       }
@@ -1255,38 +7636,143 @@ static bool d3d9_hlsl_init_chain(d3d9_video_t *d3d,
    return true;
 }
 
+static void d3d9_set_font_rect(
+      d3d9_video_t *d3d,
+      const struct font_params *params)
+{
+   settings_t *settings           = config_get_ptr();
+   float pos_x                    = settings->floats.video_msg_pos_x;
+   float pos_y                    = settings->floats.video_msg_pos_y;
+   float font_size                = settings->floats.video_font_size;
+
+   if (params)
+   {
+      pos_x                       = params->x;
+      pos_y                       = params->y;
+      font_size                  *= params->scale;
+   }
+
+   d3d->font_rect.left            = VIDEO_SCALE_W(d3d->video_info.dims) * pos_x;
+   d3d->font_rect.right           = VIDEO_SCALE_W(d3d->video_info.dims);
+   d3d->font_rect.top             = (1.0f - pos_y) * VIDEO_SCALE_H(d3d->video_info.dims) - font_size;
+   d3d->font_rect.bottom          = VIDEO_SCALE_H(d3d->video_info.dims);
+
+   d3d->font_rect_shifted         = d3d->font_rect;
+   d3d->font_rect_shifted.left   -= 2;
+   d3d->font_rect_shifted.right  -= 2;
+   d3d->font_rect_shifted.top    += 2;
+   d3d->font_rect_shifted.bottom += 2;
+}
+
+static void d3d9_hlsl_set_viewport(void *data,
+      unsigned dims,
+      bool force_full,
+      bool allow_rotate)
+{
+   d3d9_video_t *d3d   = (d3d9_video_t*)data;
+   float translate_x   = d3d->translate_x;
+   float translate_y   = d3d->translate_y;
+   int x               = 0;
+   int y               = 0;
+   struct video_viewport vp;
+
+   /* The viewport is fitted to the driver's own full size; the
+    * caller's size word is not used. */
+   vp.full_dims   = d3d->vp.full_dims;
+   video_driver_update_viewport(&vp, force_full, d3d->keep_aspect, true);
+
+   x      = VIDEO_POS_X(vp.pos);
+   y      = VIDEO_POS_Y(vp.pos);
+
+   /* D3D doesn't support negative X/Y viewports ... */
+   if (x < 0)
+   {
+      if (!force_full)
+         d3d->translate_x = x * 2;
+      x = 0;
+   }
+   else if (!force_full)
+      d3d->translate_x = 0;
+
+   if (y < 0)
+   {
+      if (!force_full)
+         d3d->translate_y = y * 2;
+      y = 0;
+   }
+   else if (!force_full)
+      d3d->translate_y = 0;
+
+   if (!force_full)
+   {
+      if (translate_x != d3d->translate_x || translate_y != d3d->translate_y)
+         d3d->needs_restore = true;
+   }
+
+   d3d->out_vp.X      = x;
+   d3d->out_vp.Y      = y;
+   d3d->out_vp.Width  = VIDEO_SCALE_W(vp.dims);
+   d3d->out_vp.Height = VIDEO_SCALE_H(vp.dims);
+   d3d->out_vp.MinZ   = 0.0f;
+   d3d->out_vp.MaxZ   = 1.0f;
+
+   d3d9_set_font_rect(d3d, NULL);
+}
+
+static void d3d9_hlsl_set_osd_msg(void *data,
+      const char *msg, size_t msg_len,
+      const struct font_params *params, void *font)
+{
+   d3d9_video_t          *d3d = (d3d9_video_t*)data;
+   LPDIRECT3DDEVICE9     dev  = d3d->dev;
+
+   d3d9_set_font_rect(d3d, params);
+   IDirect3DDevice9_BeginScene(dev);
+   font_driver_render_msg(d3d, msg, msg_len, params, font);
+   IDirect3DDevice9_EndScene(dev);
+}
+
 static bool d3d9_hlsl_initialize(
       d3d9_video_t *d3d, const video_info_t *info)
 {
-   unsigned width, height;
    bool ret             = true;
 
-   if (!g_pD3D9)
+   /* Whatever device comes, it is taken up below */
+   d3d->dev_ex          = NULL;
+   d3d->chain_ex        = NULL;
+   d3d->present_wait    = 0;
+   d3d->wait_for_vblank = 0;
+   d3d->present_shown   = false;
+
+   if (!d3d->d3d9)
       ret               = d3d9_hlsl_init_base(d3d, info);
    else if (d3d->needs_restore)
    {
       D3DPRESENT_PARAMETERS d3dpp;
 
       d3d9_make_d3dpp(d3d, info, &d3dpp);
-
-      /* The D3DX font driver uses POOL_DEFAULT resources
-       * and will prevent a clean reset here
-       * another approach would be to keep track of all created D3D
-       * font objects and free/realloc them around the d3d_reset call  */
-#ifdef HAVE_MENU
-      menu_driver_ctl(RARCH_MENU_CTL_DEINIT, NULL);
-#endif
-
       if (!d3d9_reset(d3d->dev, &d3dpp))
       {
+#ifdef D3D9_HW_RENDER
+         /* A new device: under the wrapper, the main thread's to make */
+         if (d3d->hw.enable && d3d->hw.shared)
+         {
+            d3d->hw.reinit_asked = true;
+            video_driver_modify_disp_flags(VIDEO_FLAG_GPU_DEVICE_LOST, 0);
+            return false;
+         }
+         d3d9_hlsl_hw_context_destroy(d3d);
+#endif
          d3d9_hlsl_deinitialize(d3d);
-         IDirect3D9_Release(g_pD3D9);
-         g_pD3D9 = NULL;
+         IDirect3D9_Release(d3d->d3d9);
+         d3d->d3d9 = NULL;
 
          ret     = d3d9_hlsl_init_base(d3d, info);
          if (ret)
-            RARCH_LOG("[D3D9]: Recovered from dead state.\n");
+            RARCH_LOG("[D3D9 HLSL] Recovered from dead state.\n");
       }
+      else
+         d3d->present_interval = d3dpp.PresentationInterval;
 
 #ifdef HAVE_MENU
       menu_driver_init(info->is_threaded);
@@ -1296,20 +7782,25 @@ static bool d3d9_hlsl_initialize(
    if (!ret)
       return ret;
 
+   d3d9_present_init(d3d, info->vsync);
+
    if (!d3d9_hlsl_init_chain(d3d, info->input_scale, info->rgb32))
    {
-      RARCH_ERR("[D3D9]: Failed to initialize render chain.\n");
+      RARCH_ERR("[D3D9 HLSL] Failed to initialize render chain.\n");
       return false;
    }
 
-   video_driver_get_size(&width, &height);
-   d3d9_set_viewport(d3d,
-      width, height, false, true);
+   /* d3d->vp.full_* was written by the caller (d3d9_hlsl_init_internal
+    * has already called set_size at this point). */
+   d3d9_hlsl_set_viewport(d3d,
+      d3d->vp.full_dims,
+#ifdef D3D9_VIEWS
+      d3d->views.active,
+#else
+      false,
+#endif
+      true);
 
-   font_driver_init_osd(d3d, info,
-         false,
-         info->is_threaded,
-         FONT_DRIVER_RENDER_D3D9_API);
 
    {
       static const D3DVERTEXELEMENT9 VertexElements[4] = {
@@ -1324,60 +7815,108 @@ static bool d3d9_hlsl_initialize(
             D3DDECLUSAGE_COLOR,   0},
          D3DDECL_END()
       };
-      if (!d3d9_vertex_declaration_new(d3d->dev,
-               (void*)VertexElements, (void**)&d3d->menu_display.decl))
+      if (!SUCCEEDED(IDirect3DDevice9_CreateVertexDeclaration(d3d->dev,
+               (const D3DVERTEXELEMENT9*)VertexElements, (IDirect3DVertexDeclaration9**)&d3d->menu_display.decl)))
          return false;
    }
 
-   d3d->menu_display.offset = 0;
-   d3d->menu_display.size   = 1024;
-   d3d->menu_display.buffer = d3d9_vertex_buffer_new(
-         d3d->dev, d3d->menu_display.size * sizeof(Vertex),
-         D3DUSAGE_WRITEONLY,
-         0,
-         D3DPOOL_DEFAULT,
-         NULL);
-
-   if (!d3d->menu_display.buffer)
+   if (!d3d9_menu_vbuf_create(d3d))
       return false;
 
-   d3d_matrix_identity(&d3d->mvp_transposed);
-   d3d_matrix_ortho_off_center_lh(&d3d->mvp_transposed, 0, 1, 0, 1, 0, 1);
-   d3d->mvp = d3d->mvp_transposed;
+   /* Sampled by a quad drawn with no texture: solid colour */
+   if (!d3d9_hlsl_white_texture)
+   {
+      d3d9_tex_create(d3d->dev, 1, 1, 1,
+            0, D3DFMT_A8R8G8B8,
+            (LPDIRECT3DTEXTURE9*)&d3d9_hlsl_white_texture);
+      if (d3d9_hlsl_white_texture)
+      {
+         D3DLOCKED_RECT lr;
+         if (SUCCEEDED(d3d9_tex_lock(
+                     d3d9_hlsl_white_texture, 0, &lr, NULL, 0)))
+         {
+            *((DWORD*)lr.pBits) = 0xFFFFFFFF; /* ARGB white */
+            d3d9_tex_unlock(d3d9_hlsl_white_texture, 0, true);
+         }
+      }
+   }
+
+   /* Pre-computed D3D left-handed orthographic projection (0,1,0,1,0,1) */
+   {
+      static const math_matrix_4x4 k_ortho = {{
+         2, 0, 0, 0,   0, 2, 0, 0,   0, 0, 1, 0,   -1, -1, 0, 1
+      }};
+      d3d->mvp_transposed = k_ortho;
+      d3d->mvp            = k_ortho;
+   }
 
    if (d3d->translate_x)
    {
-      struct d3d_matrix *pout = (struct d3d_matrix*)&d3d->mvp;
       float vp_x = -(d3d->translate_x/(float)d3d->out_vp.Width);
-      pout->m[3][0] = -1.0f + vp_x - 2.0f * 1 / (0 - 1);
+      MAT_ELEM_4X4(d3d->mvp, 0, 3) = -1.0f + vp_x - 2.0f * 1 / (0 - 1);
    }
 
    if (d3d->translate_y)
    {
-      struct d3d_matrix *pout = (struct d3d_matrix*)&d3d->mvp;
       float vp_y = -(d3d->translate_y/(float)d3d->out_vp.Height);
-      pout->m[3][1] = 1.0f + vp_y + 2.0f * 1 / (0 - 1);
+      MAT_ELEM_4X4(d3d->mvp, 1, 3) = 1.0f + vp_y + 2.0f * 1 / (0 - 1);
    }
 
    IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_CULLMODE, D3DCULL_NONE);
    IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_SCISSORTESTENABLE, TRUE);
+
+#ifdef D3D9_HW_RENDER
+   if (d3d->hw.enable)
+      d3d9_hlsl_hw_state_record(d3d);
+#endif
 
    return true;
 }
 
 static bool d3d9_hlsl_restore(d3d9_video_t *d3d)
 {
+   bool ret = true;
+#ifdef D3D9_HW_RENDER
+   if (d3d->hw.enable && d3d->hw.shared)
+   {
+      if (d3d->hw.reinit_asked)
+         return false;
+      /* Only a new interval comes here (a lost device asks the main
+       * thread for a rebuild): the core could only be told on its own
+       * thread, and a rebuild starts at the configured interval again,
+       * so the device keeps the one it has. */
+      if (d3d->needs_restore && d3d9_hlsl_hw_reset_costs(d3d))
+      {
+         if (!d3d->hw.interval_kept)
+            RARCH_WARN("[D3D9 HLSL] Threaded video without Direct3D9Ex: "
+                  "V-Sync stays as the device was made.\n");
+         d3d->hw.interval_kept = true;
+         d3d->needs_restore    = false;
+         return true;
+      }
+   }
+   if (d3d->needs_restore && d3d9_hlsl_hw_reset_costs(d3d))
+      d3d9_hlsl_hw_context_destroy(d3d);
+   d3d9_hlsl_hw_enter(d3d);
+#endif
+
    d3d9_hlsl_deinitialize(d3d);
 
    if (!d3d9_hlsl_initialize(d3d, &d3d->video_info))
    {
-      RARCH_ERR("[D3D9]: Restore error.\n");
-      return false;
+      RARCH_ERR("[D3D9 HLSL] Restore error.\n");
+      ret = false;
    }
+   else
+      d3d->needs_restore = false;
 
-   d3d->needs_restore = false;
+#ifdef D3D9_HW_RENDER
+   d3d9_hlsl_hw_leave(d3d);
+   if (ret && d3d->hw.lost)
+      d3d9_hlsl_hw_context_reset(d3d);
+#endif
 
-   return true;
+   return ret;
 }
 
 static bool d3d9_hlsl_set_shader(void *data,
@@ -1388,7 +7927,7 @@ static bool d3d9_hlsl_set_shader(void *data,
    if (!d3d)
       return false;
 
-   if (!string_is_empty(d3d->shader_path))
+   if ((d3d->shader_path && *d3d->shader_path))
       free(d3d->shader_path);
    d3d->shader_path = NULL;
 
@@ -1396,19 +7935,19 @@ static bool d3d9_hlsl_set_shader(void *data,
    {
       case RARCH_SHADER_CG:
       case RARCH_SHADER_HLSL:
-         if (!string_is_empty(path))
+         if (path && *path)
             d3d->shader_path = strdup(path);
 
          break;
       case RARCH_SHADER_NONE:
          break;
       default:
-         RARCH_WARN("[D3D9]: Only Cg shaders are supported. Falling back to stock.\n");
+         RARCH_WARN("[D3D9 HLSL] Only CG shaders are supported. Falling back to stock.\n");
    }
 
-   if (!d3d9_process_shader(d3d) || !d3d9_hlsl_restore(d3d))
+   if (!d3d9_hlsl_process_shader(d3d) || !d3d9_hlsl_restore(d3d))
    {
-      RARCH_ERR("[D3D9]: Failed to set shader.\n");
+      RARCH_ERR("[D3D9 HLSL] Failed to set shader.\n");
       return false;
    }
 
@@ -1416,20 +7955,13 @@ static bool d3d9_hlsl_set_shader(void *data,
 }
 
 static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
-      const video_info_t *info, input_driver_t **input,
-      void **input_data)
+      const video_info_t *info)
 {
 #ifdef HAVE_MONITOR
    bool windowed_full;
    RECT mon_rect;
    MONITORINFOEX current_mon;
    HMONITOR hm_to_use;
-#endif
-#ifdef HAVE_WINDOW
-   DWORD style;
-   unsigned win_width        = 0;
-   unsigned win_height       = 0;
-   RECT rect                 = {0};
 #endif
    unsigned full_x           = 0;
    unsigned full_y           = 0;
@@ -1452,15 +7984,14 @@ static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
 
 #ifdef HAVE_WINDOW
    memset(&d3d->windowClass, 0, sizeof(d3d->windowClass));
-   d3d->windowClass.lpfnWndProc = wnd_proc_d3d_common;
-#ifdef HAVE_DINPUT
-   if (string_is_equal(settings->arrays.input_driver, "dinput"))
-      d3d->windowClass.lpfnWndProc = wnd_proc_d3d_dinput;
-#endif
-#ifdef HAVE_WINRAWINPUT
-   if (string_is_equal(settings->arrays.input_driver, "raw"))
-      d3d->windowClass.lpfnWndProc = wnd_proc_d3d_winraw;
-#endif
+   /* one window procedure for every video and input driver; the
+    * family says what creating the window sets up */
+   d3d->windowClass.lpfnWndProc = win32_window_proc;
+   win32_window_proc_setup(WIN32_WINDOW_D3D);
+   /* the window may be left up for the next d3d9_hlsl driver, and taken
+    * from the last: d3d9_hlsl_free() and the device's creation below do
+    * what that needs */
+   win32_window_tag("d3d9_hlsl");
    win32_window_init(&d3d->windowClass, true, NULL);
 #endif
 
@@ -1468,64 +7999,73 @@ static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
    win32_monitor_info(&current_mon, &hm_to_use, &d3d->cur_mon_id);
 
    mon_rect              = current_mon.rcMonitor;
-   g_win32_resize_width  = info->width;
-   g_win32_resize_height = info->height;
+   g_win32_resize_width  = VIDEO_SCALE_W(info->dims);
+   g_win32_resize_height = VIDEO_SCALE_H(info->dims);
 
    windowed_full         = settings->bools.video_windowed_fullscreen;
 
-   full_x                = (windowed_full || info->width  == 0)
+   full_x                = (windowed_full || VIDEO_SCALE_W(info->dims)  == 0)
       ? (unsigned)(mon_rect.right  - mon_rect.left)
-      : info->width;
-   full_y                = (windowed_full || info->height == 0)
+      : VIDEO_SCALE_W(info->dims);
+   full_y                = (windowed_full || VIDEO_SCALE_H(info->dims) == 0)
       ? (unsigned)(mon_rect.bottom - mon_rect.top)
-      : info->height;
+      : VIDEO_SCALE_H(info->dims);
 #else
-   d3d9_get_video_size(d3d, &full_x, &full_y);
+   {
+      unsigned full_dims;
+      d3d9_get_video_size(d3d, &full_dims);
+      full_x             = VIDEO_SCALE_W(full_dims);
+      full_y             = VIDEO_SCALE_H(full_dims);
+   }
 #endif
    {
-      unsigned new_width  = info->fullscreen ? full_x : info->width;
-      unsigned new_height = info->fullscreen ? full_y : info->height;
-      video_driver_set_size(new_width, new_height);
-   }
+      unsigned new_width  = info->fullscreen ? full_x : VIDEO_SCALE_W(info->dims);
+      unsigned new_height = info->fullscreen ? full_y : VIDEO_SCALE_H(info->dims);
+      video_driver_set_output_dims(VIDEO_SCALE_PACK(new_width, new_height));
+      d3d->vp.full_dims   = VIDEO_SCALE_PACK(new_width, new_height);
 
 #ifdef HAVE_WINDOW
-   video_driver_get_size(&win_width, &win_height);
-
-   win32_set_style(&current_mon, &hm_to_use, &win_width, &win_height,
-         info->fullscreen, windowed_full, &rect, &mon_rect, &style);
-
-   win32_window_create(d3d, style, &mon_rect, win_width,
-         win_height, info->fullscreen);
-
-   win32_set_window(&win_width, &win_height, info->fullscreen,
-      windowed_full, &rect);
+      /* Use new_width / new_height directly rather than reading
+       * them back via video_driver_get_output_dims: nothing in the
+       * codebase sets the output size between the
+       * set_size above and this call except us. */
+      if (!win32_set_video_mode(d3d, VIDEO_SCALE_PACK(new_width, new_height),
+            info->fullscreen))
+      {
+         RARCH_ERR("[D3D9 HLSL] win32_set_video_mode failed.\n");
+         return false;
+      }
 #endif
+   }
 
    d3d->video_info = *info;
 
    if (!d3d9_hlsl_initialize(d3d, &d3d->video_info))
-      return false;
-
-   d3d9_hlsl_fake_context.get_flags   = d3d9_hlsl_get_flags;
-#ifndef _XBOX_
-   d3d9_hlsl_fake_context.get_metrics = win32_get_metrics;
-#endif
-   video_context_driver_set(&d3d9_hlsl_fake_context);
    {
-      const char *shader_preset   = video_shader_get_current_shader_preset();
-      enum rarch_shader_type type = video_shader_parse_type(shader_preset);
-
-      d3d9_hlsl_set_shader(d3d, type, shader_preset);
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+      /* No device on a window the last driver left up: the window is
+       * not worth having. A new one, and once more. */
+      if (     d3d->dev
+            || !win32_window_was_taken())
+         return false;
+      if (d3d->d3d9)
+         IDirect3D9_Release(d3d->d3d9);
+      d3d->d3d9 = NULL;
+      if (     !win32_window_remake(d3d, d3d->vp.full_dims, info->fullscreen)
+            || !d3d9_hlsl_initialize(d3d, &d3d->video_info))
+#endif
+         return false;
    }
 
-   d3d_input_driver(settings->arrays.input_joypad_driver,
-      settings->arrays.input_joypad_driver, input, input_data);
+   /* no input driver of this driver's own: the frontend starts the
+    * one that goes with a Windows window */
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 
    {
       char version_str[128];
       D3DADAPTER_IDENTIFIER9 ident = {0};
 
-      IDirect3D9_GetAdapterIdentifier(g_pD3D9, 0, 0, &ident);
+      IDirect3D9_GetAdapterIdentifier(d3d->d3d9, 0, 0, &ident);
 
       version_str[0] = '\0';
 
@@ -1535,16 +8075,15 @@ static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
             HIWORD(ident.DriverVersion.LowPart),
             LOWORD(ident.DriverVersion.LowPart));
 
-      RARCH_LOG("[D3D9]: Using GPU: \"%s\".\n", ident.Description);
-      RARCH_LOG("[D3D9]: GPU API Version: %s\n", version_str);
+      RARCH_LOG("[D3D9 HLSL] Using GPU: \"%s\".\n", ident.Description);
+      RARCH_LOG("[D3D9 HLSL] GPU API Version: %s.\n", version_str);
       video_driver_set_gpu_api_version_string(version_str);
    }
 
    return true;
 }
 
-static void *d3d9_hlsl_init(const video_info_t *info,
-      input_driver_t **input, void **input_data)
+static void *d3d9_hlsl_init(const video_info_t *info)
 {
    d3d9_video_t *d3d = (d3d9_video_t*)calloc(1, sizeof(*d3d));
 
@@ -1567,19 +8106,398 @@ static void *d3d9_hlsl_init(const video_info_t *info,
 #endif
    d3d->should_resize        = false;
    d3d->menu                 = NULL;
+#ifdef D3D9_HW_RENDER
+   d3d->hw.enable            = video_driver_get_hw_context()->context_type
+      == RETRO_HW_CONTEXT_D3D9;
+#endif
 
-   if (!d3d9_hlsl_init_internal(d3d, info, input, input_data))
+   if (!d3d9_hlsl_init_internal(d3d, info))
       goto error;
 
+#ifdef D3D9_HW_RENDER
+   if (d3d->hw.enable)
+      d3d9_hlsl_hw_init(d3d, info);
+#endif
+
    d3d->keep_aspect       = info->force_aspect;
+#ifdef D3D9_VIEWS
+   d3d9_hlsl_views_publish(d3d);
+#endif
 
    return d3d;
 
 error:
-   RARCH_ERR("[D3D9]: Failed to init D3D.\n");
+   RARCH_ERR("[D3D9 HLSL] Failed to init D3D.\n");
    free(d3d);
    return NULL;
 }
+
+static void d3d9_hlsl_viewport_info(void *data, struct video_viewport *vp)
+{
+   d3d9_video_t *d3d   = (d3d9_video_t*)data;
+
+   vp->pos             = VIDEO_POS_PACK(d3d->out_vp.X, d3d->out_vp.Y);
+   vp->dims            = VIDEO_SCALE_PACK(d3d->out_vp.Width,
+         d3d->out_vp.Height);
+
+   vp->full_dims       = d3d->vp.full_dims;
+}
+
+#ifdef HAVE_OVERLAY
+static void d3d9_hlsl_free_overlays(d3d9_video_t *d3d)
+{
+   unsigned i;
+
+   for (i = 0; i < d3d->overlays_size; i++)
+   {
+      if (     (LPDIRECT3DTEXTURE9)d3d->overlays[i].tex
+            && !d3d->overlays_borrowed)
+         IDirect3DTexture9_Release((LPDIRECT3DTEXTURE9)d3d->overlays[i].tex);
+      d3d9_vertex_buffer_free(d3d->overlays[i].vert_buf, NULL);
+   }
+   free(d3d->overlays);
+   d3d->overlays          = NULL;
+   d3d->overlays_size     = 0;
+   d3d->overlays_borrowed = false;
+}
+
+static void d3d9_hlsl_overlay_tex_geom(
+      void *data,
+      unsigned index,
+      float x, float y,
+      float w, float h)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   /* Called whenever the frontend likes, not only after a load that
+    * worked: no page, or an index off the end of it, is nothing. */
+   if (!d3d || !d3d->overlays || index >= d3d->overlays_size)
+      return;
+
+   d3d->overlays[index].tex_coords[0] = x;
+   d3d->overlays[index].tex_coords[1] = y;
+   d3d->overlays[index].tex_coords[2] = w;
+   d3d->overlays[index].tex_coords[3] = h;
+}
+
+static void d3d9_hlsl_overlay_vertex_geom(
+      void *data,
+      unsigned index,
+      float x, float y,
+      float w, float h)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   if (!d3d || !d3d->overlays || index >= d3d->overlays_size)
+      return;
+
+   y                                   = 1.0f - y;
+   h                                   = -h;
+   d3d->overlays[index].vert_coords[0] = x;
+   d3d->overlays[index].vert_coords[1] = y;
+   d3d->overlays[index].vert_coords[2] = w;
+   d3d->overlays[index].vert_coords[3] = h;
+}
+
+static bool d3d9_hlsl_overlay_load(void *data,
+      const void *image_data, unsigned num_images)
+{
+   unsigned i, y;
+   d3d9_video_t *d3d                  = (d3d9_video_t*)data;
+   const struct texture_image *images = (const struct texture_image*)
+      image_data;
+
+   if (!d3d)
+      return false;
+
+   d3d9_hlsl_free_overlays(d3d);
+   if (!num_images)
+      return true;
+   d3d->overlays      = (overlay_t*)calloc(num_images, sizeof(*d3d->overlays));
+   /* A size with no array behind it is a NULL the free, the draw and
+    * the setters would all walk. */
+   if (!d3d->overlays)
+      return false;
+   d3d->overlays_size = num_images;
+
+   for (i = 0; i < num_images; i++)
+   {
+      D3DLOCKED_RECT d3dlr;
+      unsigned width     = images[i].width;
+      unsigned height    = images[i].height;
+      overlay_t *overlay = (overlay_t*)&d3d->overlays[i];
+
+      overlay->tex       = NULL;
+      d3d9_tex_create(d3d->dev,
+                  width, height, 1,
+                  0,
+                  D3D9_ARGB8888_FORMAT,
+                  (LPDIRECT3DTEXTURE9*)&overlay->tex);
+
+      if (!overlay->tex)
+      {
+         RARCH_ERR("[D3D9] Failed to create overlay texture.\n");
+         return false;
+      }
+
+      /* A lock that failed leaves d3dlr as it was found: not an
+       * address to copy a texture to. */
+      if (SUCCEEDED(d3d9_tex_lock((LPDIRECT3DTEXTURE9)overlay->tex, 0, &d3dlr, NULL, D3DLOCK_NOSYSLOCK)))
+      {
+         uint32_t       *dst = (uint32_t*)(d3dlr.pBits);
+         const uint32_t *src = images[i].pixels;
+         unsigned      pitch = d3dlr.Pitch >> 2;
+         for (y = 0; y < height; y++, dst += pitch, src += width)
+            memcpy(dst, src, width << 2);
+         d3d9_tex_unlock((LPDIRECT3DTEXTURE9)overlay->tex, 0, true);
+      }
+
+      overlay->tex_dims      = VIDEO_SCALE_PACK(width, height);
+
+      /* Default. Stretch to whole screen. */
+      d3d9_hlsl_overlay_tex_geom(d3d, i, 0, 0, 1, 1);
+      d3d9_hlsl_overlay_vertex_geom(d3d, i, 0, 0, 1, 1);
+   }
+
+   return true;
+}
+
+/* A page of the pack's textures: d3d9_hlsl_load_texture's, in the same
+ * format and pool as load()'s own, uploaded once for every page */
+static bool d3d9_hlsl_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   if (!d3d)
+      return false;
+
+   d3d9_hlsl_free_overlays(d3d);
+   if (!num_textures)
+      return true;
+   if (!(d3d->overlays = (overlay_t*)calloc(num_textures,
+         sizeof(*d3d->overlays))))
+      return false;
+   d3d->overlays_size     = num_textures;
+   d3d->overlays_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      D3DSURFACE_DESC desc;
+      LPDIRECT3DTEXTURE9 tex = (LPDIRECT3DTEXTURE9)textures[i];
+
+      if (!tex || FAILED(IDirect3DTexture9_GetLevelDesc(tex, 0, &desc)))
+         continue;
+      d3d->overlays[i].tex      = tex;
+      d3d->overlays[i].tex_dims = VIDEO_SCALE_PACK(desc.Width, desc.Height);
+
+      /* Default. Stretch to whole screen. */
+      d3d9_hlsl_overlay_tex_geom(d3d, i, 0, 0, 1, 1);
+      d3d9_hlsl_overlay_vertex_geom(d3d, i, 0, 0, 1, 1);
+   }
+
+   return true;
+}
+
+static void d3d9_hlsl_overlay_enable(void *data, bool state)
+{
+   d3d9_video_t            *d3d = (d3d9_video_t*)data;
+
+   if (!d3d)
+      return;
+
+   d3d->overlays_enabled = state;
+
+#ifndef XBOX
+   win32_show_cursor(d3d, state);
+#endif
+}
+
+static void d3d9_hlsl_overlay_full_screen(void *data, bool enable)
+{
+   unsigned i;
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   if (!d3d || !d3d->overlays)
+      return;
+
+   for (i = 0; i < d3d->overlays_size; i++)
+      d3d->overlays[i].fullscreen = enable;
+}
+
+static void d3d9_hlsl_overlay_set_alpha(void *data, unsigned index, float mod)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   if (d3d && d3d->overlays && index < d3d->overlays_size)
+      d3d->overlays[index].alpha_mod = mod;
+}
+
+static const video_overlay_interface_t d3d9_hlsl_overlay_interface = {
+   d3d9_hlsl_overlay_enable,
+   d3d9_hlsl_overlay_load,
+   d3d9_hlsl_overlay_load_textures,
+   d3d9_hlsl_overlay_tex_geom,
+   d3d9_hlsl_overlay_vertex_geom,
+   d3d9_hlsl_overlay_full_screen,
+   d3d9_hlsl_overlay_set_alpha,
+};
+
+static void d3d9_hlsl_get_overlay_interface(void *data,
+      const video_overlay_interface_t **iface)
+{
+   *iface = &d3d9_hlsl_overlay_interface;
+}
+#endif
+
+#if defined(HAVE_MENU) || defined(HAVE_OVERLAY)
+static void d3d9_hlsl_overlay_render(d3d9_video_t *d3d,
+      unsigned width,
+      unsigned height,
+      overlay_t *overlay, bool force_linear)
+{
+   D3DTEXTUREFILTERTYPE filter_type;
+   LPDIRECT3DDEVICE9 dev;
+   struct video_viewport vp;
+   void *verts;
+   unsigned i;
+   Vertex vert[4];
+   static const D3DVERTEXELEMENT9 vElems[4] = {
+      {0, offsetof(Vertex, x),  D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT,
+         D3DDECLUSAGE_POSITION, 0},
+      {0, offsetof(Vertex, u), D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT,
+         D3DDECLUSAGE_TEXCOORD, 0},
+      {0, offsetof(Vertex, color), D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT,
+         D3DDECLUSAGE_COLOR, 0},
+      D3DDECL_END()
+   };
+
+   if (!overlay || !overlay->tex)
+      return;
+
+   dev                 = d3d->dev;
+
+   if (!overlay->vert_buf)
+   {
+      overlay->vert_buf = NULL;
+#ifdef _XBOX
+      if (!SUCCEEDED(IDirect3DDevice9_CreateVertexBuffer(
+                  dev, sizeof(vert), D3DUSAGE_WRITEONLY,
+                  0,
+                  D3DPOOL_MANAGED,
+                  (LPDIRECT3DVERTEXBUFFER9*)&overlay->vert_buf, NULL)))
+         overlay->vert_buf = NULL;
+#else
+      if (!SUCCEEDED(d3d9_vbuf_create(dev, sizeof(vert),
+                  D3DUSAGE_WRITEONLY,
+                  (LPDIRECT3DVERTEXBUFFER9*)&overlay->vert_buf)))
+         overlay->vert_buf = NULL;
+#endif
+
+     if (!overlay->vert_buf)
+        return;
+     overlay->vert_sent_ok = false;
+   }
+
+   for (i = 0; i < 4; i++)
+   {
+      vert[i].z       = 0.5f;
+      vert[i].color   = (((uint32_t)VIDEO_ALPHA_BYTE(overlay->alpha_mod)) << 24) | 0xFFFFFF;
+   }
+
+   d3d9_hlsl_viewport_info(d3d, &vp);
+
+   vert[0].x      = overlay->vert_coords[0];
+   vert[1].x      = overlay->vert_coords[0] + overlay->vert_coords[2];
+   vert[2].x      = overlay->vert_coords[0];
+   vert[3].x      = overlay->vert_coords[0] + overlay->vert_coords[2];
+   vert[0].y      = overlay->vert_coords[1];
+   vert[1].y      = overlay->vert_coords[1];
+   vert[2].y      = overlay->vert_coords[1] + overlay->vert_coords[3];
+   vert[3].y      = overlay->vert_coords[1] + overlay->vert_coords[3];
+
+   vert[0].u      = overlay->tex_coords[0];
+   vert[1].u      = overlay->tex_coords[0] + overlay->tex_coords[2];
+   vert[2].u      = overlay->tex_coords[0];
+   vert[3].u      = overlay->tex_coords[0] + overlay->tex_coords[2];
+   vert[0].v      = overlay->tex_coords[1];
+   vert[1].v      = overlay->tex_coords[1];
+   vert[2].v      = overlay->tex_coords[1] + overlay->tex_coords[3];
+   vert[3].v      = overlay->tex_coords[1] + overlay->tex_coords[3];
+
+   /* A lock only when the quad changed: the page's quads are the same
+    * from one frame to the next until the layout or an alpha moves. */
+   if (     !overlay->vert_sent_ok
+         || memcmp(overlay->vert_sent, vert, sizeof(vert)))
+   {
+      if (SUCCEEDED(IDirect3DVertexBuffer9_Lock(
+                  (LPDIRECT3DVERTEXBUFFER9)overlay->vert_buf,
+                  0, 0, &verts, d3d9_vbuf_rewrite_flags(
+                     (LPDIRECT3DVERTEXBUFFER9)overlay->vert_buf)))
+            && verts)
+      {
+         memcpy(verts, vert, sizeof(vert));
+         IDirect3DVertexBuffer9_Unlock(
+               (LPDIRECT3DVERTEXBUFFER9)overlay->vert_buf);
+         memcpy(overlay->vert_sent, vert, sizeof(vert));
+         overlay->vert_sent_ok = true;
+      }
+   }
+
+   IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+   IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+   IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_ALPHABLENDENABLE, true);
+
+   /* Use cached vertex declaration for overlay. */
+   if (!d3d9_hlsl_overlay_decl)
+      IDirect3DDevice9_CreateVertexDeclaration(dev,
+            (const D3DVERTEXELEMENT9*)&vElems, (IDirect3DVertexDeclaration9**)&d3d9_hlsl_overlay_decl);
+   IDirect3DDevice9_SetVertexDeclaration(dev, d3d9_hlsl_overlay_decl);
+
+   IDirect3DDevice9_SetStreamSource(dev, 0,
+         (LPDIRECT3DVERTEXBUFFER9)overlay->vert_buf, 0, sizeof(*vert));
+
+   if (overlay->fullscreen)
+   {
+      D3DVIEWPORT9 vp_full;
+
+      vp_full.X      = 0;
+      vp_full.Y      = 0;
+      vp_full.Width  = width;
+      vp_full.Height = height;
+      vp_full.MinZ   = 0.0f;
+      vp_full.MaxZ   = 1.0f;
+      IDirect3DDevice9_SetViewport(dev, (D3DVIEWPORT9*)&vp_full);
+   }
+
+   filter_type = D3DTEXF_LINEAR;
+
+   if (!force_linear)
+   {
+      settings_t *settings    = config_get_ptr();
+      bool menu_linear_filter = settings->bools.menu_linear_filter;
+      if (!menu_linear_filter)
+         filter_type       = D3DTEXF_POINT;
+   }
+
+   /* Render overlay. */
+   IDirect3DDevice9_SetTexture(dev, 0,(IDirect3DBaseTexture9*)overlay->tex);
+   IDirect3DDevice9_SetSamplerState(dev,0,D3DSAMP_ADDRESSU,
+         D3DTADDRESS_BORDER);
+   IDirect3DDevice9_SetSamplerState(dev,0,D3DSAMP_ADDRESSV,
+         D3DTADDRESS_BORDER);
+   IDirect3DDevice9_SetSamplerState(dev,0,D3DSAMP_MINFILTER, filter_type);
+   IDirect3DDevice9_SetSamplerState(dev,0,D3DSAMP_MAGFILTER, filter_type);
+   IDirect3DDevice9_BeginScene(dev);
+   IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP, 0, 2);
+   IDirect3DDevice9_EndScene(dev);
+
+   /* Restore previous state. */
+   IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, false);
+   IDirect3DDevice9_SetViewport(dev, (D3DVIEWPORT9*)&d3d->out_vp);
+}
+
+#endif
 
 static void d3d9_hlsl_free(void *data)
 {
@@ -1589,48 +8507,82 @@ static void d3d9_hlsl_free(void *data)
       return;
 
 #ifdef HAVE_OVERLAY
-   d3d9_free_overlays(d3d);
-   if (d3d->overlays)
-      free(d3d->overlays);
-   d3d->overlays      = NULL;
-   d3d->overlays_size = 0;
+   d3d9_hlsl_free_overlays(d3d);
 #endif
 
-   d3d9_free_overlay(d3d, d3d->menu);
    if (d3d->menu)
+   {
+      if ((LPDIRECT3DTEXTURE9)d3d->menu->tex)
+         IDirect3DTexture9_Release((LPDIRECT3DTEXTURE9)d3d->menu->tex);
+      d3d9_vertex_buffer_free(d3d->menu->vert_buf, NULL);
       free(d3d->menu);
+   }
    d3d->menu          = NULL;
 
+#ifdef D3D9_HW_RENDER
+   d3d9_hlsl_hw_take_texture(d3d, NULL);
+   d3d->hw.ring_tex = NULL;
+#ifdef HAVE_THREADS
+   if (d3d->hw.shared)
+      retro_eventcount_free(&d3d->hw.turn_ec);
+#endif
+#endif
    d3d9_hlsl_deinitialize(d3d);
+   d3d9_sw_fb_collect(&d3d->sw_fb);
 
-   if (!string_is_empty(d3d->shader_path))
+   if (d3d9_hlsl_white_texture)
+   {
+      IDirect3DTexture9_Release(d3d9_hlsl_white_texture);
+      d3d9_hlsl_white_texture = NULL;
+   }
+
+   if (d3d->shader_path && *d3d->shader_path)
       free(d3d->shader_path);
 
    IDirect3DDevice9_Release(d3d->dev);
-   IDirect3D9_Release(g_pD3D9);
+   IDirect3D9_Release(d3d->d3d9);
+#ifdef D3D9_VIEWS
+   /* Frame memory left over, the device that read it gone */
+   {
+      unsigned i;
+      for (i = 0; i < D3D9_FRAME_MEM_MAX; i++)
+         d3d9_frame_mem_blk_release(&d3d->sw_fb.mem[i], true);
+   }
+#endif
    d3d->shader_path = NULL;
    d3d->dev         = NULL;
-   g_pD3D9          = NULL;
+   d3d->d3d9          = NULL;
 
    d3d9_deinitialize_symbols();
 
-#ifndef _XBOX
-   win32_monitor_from_window();
-   win32_destroy_window();
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+   /* left up for the next d3d9_hlsl driver, where it can be: the device
+    * and everything made on it are gone by now. The restart a hardware
+    * core's content brings then has no new window to come up behind
+    * another program's, without the focus. */
+   if (!win32_window_keep())
 #endif
+   {
+#ifndef _XBOX
+      win32_monitor_from_window();
+      win32_destroy_window();
+#endif
+   }
    free(d3d);
 }
 
-static bool d3d9_hlsl_frame(void *data, const void *frame,
-      unsigned frame_width, unsigned frame_height,
+static bool d3d9_hlsl_frame_body(void *data, const void *frame,
+      unsigned dims,
       uint64_t frame_count, unsigned pitch,
       const char *msg, video_frame_info_t *video_info)
 {
+   unsigned frame_width = VIDEO_SCALE_W(dims);
+   unsigned frame_height = VIDEO_SCALE_H(dims);
    D3DVIEWPORT9 screen_vp;
    unsigned i                          = 0;
    d3d9_video_t *d3d                   = (d3d9_video_t*)data;
-   unsigned width                      = video_info->width;
-   unsigned height                     = video_info->height;
+   unsigned width                      = VIDEO_SCALE_W(video_info->dims);
+   unsigned height                     = VIDEO_SCALE_H(video_info->dims);
    bool statistics_show                = video_info->statistics_show;
    unsigned black_frame_insertion      = video_info->black_frame_insertion;
    struct font_params *osd_params      = (struct font_params*)
@@ -1645,9 +8597,44 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
 #ifdef HAVE_GFX_WIDGETS
    bool widgets_active                 = video_info->widgets_active;
 #endif
+   bool views_per_eye                  = false;
+#ifdef D3D9_HW_RENDER
+   bool hw_frame                       = false;
+#endif
+#ifdef D3D9_VIEWS
+   void *view_chains[RETRO_VIDEO_VIEWS_MAX];
+   video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
+   bool views                          = false;
+   bool views_blend                    = false;
+   bool views_direct                   = false;
+   bool views_ui                       = false;
+#endif
 
+#ifdef D3D9_HW_RENDER
+   /* The last frame again (menu, pause) comes without one: a hardware
+    * core's is the texture it handed over, if a reset left it any */
+   if (!frame && video_info->frame_repeat && d3d->hw.enable)
+      frame = RETRO_HW_FRAME_BUFFER_VALID;
+#endif
    if (!frame)
       return true;
+
+#ifdef D3D9_HW_RENDER
+   hw_frame = (frame == RETRO_HW_FRAME_BUFFER_VALID);
+   if (!hw_frame)
+#endif
+   /* A frame the core wrote into the lent texture stays where it is */
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      if (_chain)
+         d3d9_sw_fb_settle(&d3d->sw_fb, frame, frame_width, frame_height,
+               pitch, _chain->chain.pixel_size,
+               _chain->chain.prev.last_dims[_chain->chain.prev.ptr]);
+   }
+#ifdef D3D9_VIEWS
+   /* Frame memory given back while the GPU read it */
+   d3d9_frame_mem_collect(&d3d->sw_fb);
+#endif
 
    /* We cannot recover in fullscreen. */
    if (d3d->needs_restore)
@@ -1660,25 +8647,114 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
 
       if (!d3d9_hlsl_restore(d3d))
       {
-         RARCH_ERR("[D3D9]: Failed to restore.\n");
+         RARCH_ERR("[D3D9 HLSL] Failed to restore. Requesting reinit.\n");
+         video_driver_modify_disp_flags(VIDEO_FLAG_GPU_DEVICE_LOST, 0);
          return false;
       }
    }
 
+#ifdef D3D9_HW_RENDER
+   /* The first pass sized for what it reads: the core's texture, or its
+    * own again */
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      d3d9_hlsl_renderchain_t *chain = &_chain->chain;
+      struct shader_pass *first = &chain->passes->data[0];
+      unsigned dims             = 0;
+      D3DSURFACE_DESC desc;
+      if (hw_frame)
+         dims = d3d->hw.tex_dims;
+      else if (chain->hw_sized && SUCCEEDED(
+               IDirect3DTexture9_GetLevelDesc(chain->prev.tex[0], 0, &desc)))
+         dims = VIDEO_SCALE_PACK(desc.Width, desc.Height);
+      if (dims && first->info.tex_dims != dims)
+      {
+         for (i = 0; i < TEXTURES; i++)
+            chain->prev.last_dims[i] = 0;
+         first->info.tex_dims = dims;
+         d3d->should_resize   = true;
+      }
+      chain->hw_sized = hw_frame;
+      chain->hw_tex   = hw_frame ? d3d->hw.tex : NULL;
+      if (hw_frame)
+      {
+         frame_width  = MIN(frame_width,  VIDEO_SCALE_W(dims));
+         frame_height = MIN(frame_height, VIDEO_SCALE_H(dims));
+         if (     !d3d->hw.tex && !d3d->hw.warned
+               && !video_info->frame_repeat)
+         {
+            d3d->hw.warned = true;
+            RARCH_WARN("[D3D9 HLSL] HW render: no texture set.\n");
+         }
+      }
+   }
+   if (!hw_frame)
+#endif
+   /* A frame past the size the core declared */
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      unsigned old_dims = _chain->chain.passes->data[0].info.tex_dims;
+      if (d3d9_hlsl_renderchain_fit_frame(&_chain->chain,
+               frame_width, frame_height))
+      {
+         /* Passes scaled from it are sized again. */
+         if (_chain->chain.passes->data[0].info.tex_dims != old_dims)
+            d3d->should_resize = true;
+      }
+      else
+      {
+         unsigned tex_dims = _chain->chain.passes->data[0].info.tex_dims;
+         frame_width       = MIN(frame_width,  VIDEO_SCALE_W(tex_dims));
+         frame_height      = MIN(frame_height, VIDEO_SCALE_H(tex_dims));
+      }
+   }
+
+#ifdef D3D9_VIEWS
+   d3d->views.frame_dims = VIDEO_SCALE_PACK(frame_width, frame_height);
+#ifdef D3D9_HW_RENDER
+   /* A core's texture is drawn whole */
+   if (!hw_frame)
+#endif
+   views = d3d9_hlsl_views_setup(d3d, video_info, msg,
+         d3d->menu && d3d->menu->enabled, &views_blend, &views_direct,
+         view_chains, view_rects);
+   /* The viewport is the whole window while views draw. */
+   if (views != d3d->views.active)
+   {
+      d3d->views.active  = views;
+      d3d->should_resize = true;
+   }
+   retro_atomic_store_release_int(&d3d->views.fallback,
+         (video_info->views.num_views && !views) ? 1 : 0);
+   d3d9_hlsl_views_publish(d3d);
+#endif
+
    if (d3d->should_resize)
    {
       hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
-      d3d9_renderchain_t *chain  = (d3d9_renderchain_t*)&_chain->chain;
+      d3d9_hlsl_renderchain_t *chain  = (d3d9_hlsl_renderchain_t*)&_chain->chain;
 
-      d3d9_set_viewport(d3d, width, height, false, true);
+      d3d9_hlsl_set_viewport(d3d, VIDEO_SCALE_PACK(width, height),
+#ifdef D3D9_VIEWS
+            d3d->views.active,
+#else
+            false,
+#endif
+            true);
 
       if (chain)
          chain->out_vp           = (D3DVIEWPORT9*)&d3d->out_vp;
 
-      d3d9_recompute_pass_sizes(chain->dev, chain, d3d);
+      d3d9_recompute_pass_sizes(chain->dev, chain, &d3d->shader,
+            &d3d->out_vp);
 
       d3d->should_resize         = false;
    }
+
+#ifdef D3D9_HW_RENDER
+   if (d3d->hw.enable)
+      d3d9_hlsl_hw_state_apply(d3d);
+#endif
 
    /* render_chain() only clears out viewport,
     * clear out everything. */
@@ -1694,6 +8770,68 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
 
    IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev, 0,
          (const float*)&d3d->mvp, 4);
+#ifdef D3D9_VIEWS
+   /* The stock chain's frame into its texture as ever, each view drawn
+    * from there; a preset's views each through its own chain */
+   if (views)
+   {
+      struct d3d9_views_draw d;
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      struct shader_pass *first  = &_chain->chain.passes->data[0];
+      d.video_info = video_info;
+      d.frame      = frame;
+      d.rects      = view_rects;
+      d.pitch      = pitch;
+      d.tex        = _chain->chain.prev.tex[_chain->chain.prev.ptr];
+      d.tex_dims   = first->info.tex_dims;
+      d.filter     = (DWORD)d3d_translate_filter(first->info.pass->filter);
+      d.rotation   = d3d->dev_rotation;
+      if (views_direct)
+      {
+         unsigned src_pitch = pitch;
+         const uint8_t *src = d3d9_sw_fb_src_begin(&d3d->sw_fb, frame,
+               d.tex, &src_pitch);
+         if (src)
+         {
+            /* As ever, nothing past the frame cleared: its size given
+             * as the texture's last */
+            d3d9_frame_put(&d3d->sw_fb, d3d->dev, d.tex, d.tex_dims,
+                  VIDEO_SCALE_PACK(frame_width, frame_height), src,
+                  src_pitch, frame_width, frame_height,
+                  _chain->chain.pixel_size);
+            d3d9_sw_fb_src_end(&d3d->sw_fb, frame, d.tex);
+         }
+      }
+      d3d9_hlsl_views_render(d3d, &d, view_chains, views_blend,
+            views_direct);
+      if (!views_direct)
+         d3d9_hlsl_views_end(view_chains);
+      IDirect3DDevice9_SetVertexShader(d3d->dev,
+            (LPDIRECT3DVERTEXSHADER9)_chain->stock_shader.vprg);
+      IDirect3DDevice9_SetPixelShader(d3d->dev,
+            (LPDIRECT3DPIXELSHADER9)_chain->stock_shader.fprg);
+      if (_chain->stock_data.vs_map.mvp >= 0)
+         IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev,
+               _chain->stock_data.vs_map.mvp, (const float*)&d3d->mvp, 4);
+   }
+   else
+#endif
+#ifdef D3D9_HW_RENDER
+   if (hw_frame)
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      if (_chain->chain.hw_tex)
+      {
+         hlsl_d3d9_renderchain_render(
+               d3d, frame, frame_width, frame_height,
+               pitch, d3d->dev_rotation);
+         /* The core draws into it next */
+         IDirect3DDevice9_SetTexture(d3d->dev, 0, NULL);
+         _chain->chain.hw_tex = NULL;
+      }
+   }
+   else
+#endif
    hlsl_d3d9_renderchain_render(
          d3d, frame, frame_width, frame_height,
          pitch, d3d->dev_rotation);
@@ -1717,13 +8855,44 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
       }
    }
 
+#ifdef D3D9_VIEWS
+   /* As the main thread laid the UI out, also in a frame drawn whole:
+    * it lays out later frames whole once it reads the fallback. */
+   views_per_eye = video_views_ui_per_eye(&video_info->views,
+         &video_info->views_layout, d3d9_hlsl_views_allowed(d3d));
+   if (!views_per_eye)
+      d3d9_hlsl_vv_target_drop(d3d, &d3d->views.ui_target, &d3d->views.ui);
+   /* Drawn and composited only when there is UI; overlays are hidden.
+    * No directive inside the macro's arguments: MSVC's preprocessor
+    * takes it as tokens. */
+#ifdef HAVE_GFX_WIDGETS
+   views_ui = VIDEO_VIEWS_UI_WANTED(views_per_eye,
+         d3d->menu->enabled, msg, statistics_show,
+         widgets_active && gfx_widgets_visible(video_info))
+#else
+   views_ui = VIDEO_VIEWS_UI_WANTED(views_per_eye,
+         d3d->menu->enabled, msg, statistics_show, false)
+#endif
+      && d3d->views.layer
+      && d3d9_hlsl_vv_target_ensure(d3d, &d3d->views.ui_target,
+            &d3d->views.ui, video_info->views_layout.ui_dims);
+   if (views_ui)
+   {
+      d3d9_hlsl_views_ui_begin(d3d, video_info);
+      width            = VIDEO_SCALE_W(video_info->dims);
+      height           = VIDEO_SCALE_H(video_info->dims);
+      screen_vp.Width  = width;
+      screen_vp.Height = height;
+   }
+#endif
+
 #ifdef HAVE_OVERLAY
-   if (d3d->overlays_enabled && overlay_behind_menu)
+   if (d3d->overlays_enabled && overlay_behind_menu && !views_per_eye)
    {
       IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev, 0,
             (const float*)&d3d->mvp_transposed, 4);
       for (i = 0; i < d3d->overlays_size; i++)
-         d3d9_overlay_render(d3d, width, height, &d3d->overlays[i], true);
+         d3d9_hlsl_overlay_render(d3d, width, height, &d3d->overlays[i], true);
    }
 #endif
 
@@ -1732,7 +8901,11 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
    {
       IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev, 0,
             (const float*)&d3d->mvp, 4);
-      d3d9_overlay_render(d3d, width, height, d3d->menu, false);
+#ifdef D3D9_VIEWS
+      if (d3d->views.active || views_ui)
+         d3d9_hlsl_views_menu_viewport(d3d, video_info->dims);
+#endif
+      d3d9_hlsl_overlay_render(d3d, width, height, d3d->menu, false);
 
       d3d->menu_display.offset = 0;
       IDirect3DDevice9_SetVertexDeclaration(d3d->dev, (LPDIRECT3DVERTEXDECLARATION9)d3d->menu_display.decl);
@@ -1740,7 +8913,9 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
             (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
             0, sizeof(Vertex));
       IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
+      IDirect3DDevice9_BeginScene(d3d->dev);
       menu_driver_frame(menu_is_alive, video_info);
+      IDirect3DDevice9_EndScene(d3d->dev);
    }
    else if (statistics_show)
    {
@@ -1748,7 +8923,7 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
       {
          IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
          IDirect3DDevice9_BeginScene(d3d->dev);
-         font_driver_render_msg(d3d, stat_text,
+         font_driver_render_msg(d3d, stat_text, video_info->stat_text_len,
                (const struct font_params*)osd_params, NULL);
          IDirect3DDevice9_EndScene(d3d->dev);
       }
@@ -1756,44 +8931,567 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
 #endif
 
 #ifdef HAVE_OVERLAY
-   if (d3d->overlays_enabled && !overlay_behind_menu)
+   if (d3d->overlays_enabled && !overlay_behind_menu && !views_per_eye)
    {
       IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev, 0,
             (const float*)&d3d->mvp_transposed, 4);
       for (i = 0; i < d3d->overlays_size; i++)
-         d3d9_overlay_render(d3d, width, height, &d3d->overlays[i], true);
+         d3d9_hlsl_overlay_render(d3d, width, height, &d3d->overlays[i], true);
    }
 #endif
 
 #ifdef HAVE_GFX_WIDGETS
    if (widgets_active)
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      RECT scissor_rect;
+
+      d3d->menu_display.offset = 0;
+      IDirect3DDevice9_SetVertexDeclaration(d3d->dev,
+            (LPDIRECT3DVERTEXDECLARATION9)d3d->menu_display.decl);
+      IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
+            (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+            0, sizeof(Vertex));
+      IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
+
+      /* Reset scissor rect to full screen */
+      scissor_rect.left   = 0;
+      scissor_rect.top    = 0;
+      scissor_rect.right  = width;
+      scissor_rect.bottom = height;
+      IDirect3DDevice9_SetScissorRect(d3d->dev, &scissor_rect);
+
+      IDirect3DDevice9_SetRenderState(d3d->dev,
+            D3DRS_ALPHABLENDENABLE, true);
+      IDirect3DDevice9_SetRenderState(d3d->dev,
+            D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+      IDirect3DDevice9_SetRenderState(d3d->dev,
+            D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+      IDirect3DDevice9_SetRenderState(d3d->dev,
+            D3DRS_ZENABLE, false);
+      IDirect3DDevice9_SetRenderState(d3d->dev,
+            D3DRS_CULLMODE, D3DCULL_NONE);
+      if (_chain)
+      {
+         IDirect3DDevice9_SetVertexShader(d3d->dev, (LPDIRECT3DVERTEXSHADER9)(&_chain->stock_shader)->vprg);
+         IDirect3DDevice9_SetPixelShader(d3d->dev, (LPDIRECT3DPIXELSHADER9)(&_chain->stock_shader)->fprg);
+      }
+      IDirect3DDevice9_SetVertexShaderConstantF(d3d->dev, 0,
+            (const float*)&d3d->mvp, 4);
+      IDirect3DDevice9_BeginScene(d3d->dev);
       gfx_widgets_frame(video_info);
+      IDirect3DDevice9_EndScene(d3d->dev);
+   }
 #endif
 
    if (msg && *msg)
    {
       IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
       IDirect3DDevice9_BeginScene(d3d->dev);
-      font_driver_render_msg(d3d, msg, NULL, NULL);
+      font_driver_render_msg(d3d, msg, strlen(msg), NULL, NULL);
       IDirect3DDevice9_EndScene(d3d->dev);
    }
 
+#ifdef D3D9_VIEWS
+   if (views_ui)
+   {
+      hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
+      d3d9_hlsl_views_ui_end(d3d, video_info);
+      IDirect3DDevice9_SetVertexShader(d3d->dev,
+            (LPDIRECT3DVERTEXSHADER9)_chain->stock_shader.vprg);
+      IDirect3DDevice9_SetPixelShader(d3d->dev,
+            (LPDIRECT3DPIXELSHADER9)_chain->stock_shader.fprg);
+   }
+#endif
+
    video_driver_update_title(NULL);
+
+#ifndef _XBOX
+   {
+      HRESULT hr = d3d9_present(d3d);
+      if (hr == D3DERR_DEVICELOST)
+      {
+         RARCH_WARN("[D3D9 HLSL] Device lost detected on Present().\n");
+#ifdef D3D9_HW_RENDER
+         /* Under the wrapper, the main thread's rebuild resets it */
+         if (d3d->hw.shared && d3d9_hlsl_hw_reset_costs(d3d))
+            d3d->hw.reinit_asked = true;
+         else
+#endif
+         d3d->needs_restore = true;
+         video_driver_modify_disp_flags(VIDEO_FLAG_GPU_DEVICE_LOST, 0);
+         return false;
+      }
+   }
+#else
    IDirect3DDevice9_Present(d3d->dev, NULL, NULL, NULL, NULL);
+#endif
 
    return true;
 }
 
+static bool d3d9_hlsl_frame(void *data, const void *frame,
+      unsigned dims,
+      uint64_t frame_count, unsigned pitch,
+      const char *msg, video_frame_info_t *video_info)
+{
+#ifdef D3D9_HW_RENDER
+   bool ret;
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   if (d3d->hw.enable)
+   {
+      d3d9_hlsl_hw_enter(d3d);
+      if (d3d->hw.ring_tex)
+      {
+         d3d9_hlsl_hw_take_texture(d3d, d3d->hw.ring_tex);
+         d3d->hw.ring_tex = NULL;
+      }
+      ret = (d3d->hw.shared && d3d->hw.reinit_asked && d3d->needs_restore)
+         ? true
+         : d3d9_hlsl_frame_body(data, frame, dims, frame_count, pitch,
+               msg, video_info);
+      d3d9_hlsl_hw_leave(d3d);
+      return ret;
+   }
+#endif
+   return d3d9_hlsl_frame_body(data, frame, dims, frame_count, pitch,
+         msg, video_info);
+}
+
+static void d3d9_hlsl_set_aspect_ratio(void *data, unsigned aspect_ratio_idx)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   if (!d3d)
+      return;
+
+   d3d->keep_aspect   = true;
+   d3d->should_resize = true;
+}
+
+static void d3d9_hlsl_apply_state_changes(void *data)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   if (d3d)
+      d3d->should_resize = true;
+}
+
+static void d3d9_hlsl_set_menu_texture_enable(void *data,
+      bool state, bool full_screen)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   if (!d3d || !d3d->menu)
+      return;
+
+   d3d->menu->enabled            = state;
+   d3d->menu->fullscreen         = full_screen;
+}
+
+static void d3d9_hlsl_set_menu_texture_frame(void *data,
+      const void *frame, bool rgb32, unsigned dims,
+      float alpha)
+{
+   D3DLOCKED_RECT d3dlr;
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   if (!d3d || !d3d->menu)
+      return;
+
+   if (       (!d3d->menu->tex)
+            || (d3d->menu->tex_dims != dims)
+            || (d3d->menu_tex_rgb32 != rgb32))
+   {
+      if (d3d->menu->tex)
+         IDirect3DTexture9_Release((LPDIRECT3DTEXTURE9)d3d->menu->tex);
+
+      d3d->menu->tex = NULL;
+      /* RGUI sends 16bpp ARGB4444 (the d3d9 case in RGUI's pixel
+       * format dispatcher selects argb32_to_argb4444), so we can
+       * upload it byte-for-byte into a D3DFMT_A4R4G4B4 texture and
+       * skip the per-pixel CPU expansion to ARGB8888 the previous
+       * implementation did every frame.  The rgb32 path is preserved
+       * for callers that hand us 32bpp data; in current practice no
+       * such caller exists, but the API contract supports it. */
+      d3d9_tex_create(d3d->dev,
+            VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), 1,
+            0, rgb32 ? D3D9_ARGB8888_FORMAT : D3D9_ARGB4444_FORMAT,
+            (LPDIRECT3DTEXTURE9*)&d3d->menu->tex);
+
+      if (!d3d->menu->tex)
+      {
+         RARCH_ERR("[D3D9] Failed to create menu texture.\n");
+         return;
+      }
+
+      d3d->menu->tex_dims       = dims;
+      d3d->menu_tex_rgb32       = rgb32;
+   }
+
+   d3d->menu->alpha_mod = alpha;
+
+   if (FAILED(d3d9_tex_lock((LPDIRECT3DTEXTURE9)d3d->menu->tex,
+               0, &d3dlr, NULL, D3DLOCK_NOSYSLOCK)))
+      return;
+   {
+      unsigned h;
+
+      if (rgb32)
+      {
+         uint8_t        *dst = (uint8_t*)d3dlr.pBits;
+         const uint32_t *src = (const uint32_t*)frame;
+
+         for (h = 0; h < VIDEO_SCALE_H(dims); h++, dst += d3dlr.Pitch, src += VIDEO_SCALE_W(dims))
+         {
+            memcpy(dst, src, VIDEO_SCALE_W(dims) * sizeof(uint32_t));
+            memset(dst + VIDEO_SCALE_W(dims) * sizeof(uint32_t), 0,
+                  d3dlr.Pitch - VIDEO_SCALE_W(dims) * sizeof(uint32_t));
+         }
+      }
+      else
+      {
+         /* Direct ARGB4444 upload.  The bit layout produced by
+          * argb32_to_argb4444 (host-endian uint16_t with A in bits
+          * 15..12, R 11..8, G 7..4, B 3..0) matches D3DFMT_A4R4G4B4
+          * exactly: D3D reads the locked memory as host-endian
+          * 16-bit units with the same bit assignments, so the same
+          * source bytes work on LE (PC) and BE (Xbox 360) hosts
+          * without a byte swap. */
+         uint8_t        *dst = (uint8_t*)d3dlr.pBits;
+         const uint8_t  *src = (const uint8_t*)frame;
+         unsigned src_pitch  = VIDEO_SCALE_W(dims) * sizeof(uint16_t);
+         unsigned row_bytes  = VIDEO_SCALE_W(dims) * sizeof(uint16_t);
+
+         for (h = 0; h < VIDEO_SCALE_H(dims); h++, dst += d3dlr.Pitch, src += src_pitch)
+         {
+            memcpy(dst, src, row_bytes);
+            if (d3dlr.Pitch > (int)row_bytes)
+               memset(dst + row_bytes, 0, d3dlr.Pitch - row_bytes);
+         }
+      }
+   }
+
+   d3d9_tex_unlock((LPDIRECT3DTEXTURE9)d3d->menu->tex, 0, true);
+}
+
+static void d3d9_hlsl_set_video_mode(void *data,
+      unsigned dims,
+      bool fullscreen)
+{
+#ifndef _XBOX
+   /* TODO/FIXME - why is this called here? */
+   win32_show_cursor(data, !fullscreen);
+#endif
+}
+
+struct d3d9_texture_info
+{
+   void *userdata;
+   void *data;
+   enum texture_filter_type type;
+};
+
+static void d3d9_hlsl_video_texture_load_d3d(
+      struct d3d9_texture_info *info,
+      uintptr_t *id)
+{
+   D3DLOCKED_RECT d3dlr;
+   LPDIRECT3DTEXTURE9 tex   = NULL;
+   unsigned usage           = 0;
+   bool want_mipmap         = false;
+   d3d9_video_t *d3d        = (d3d9_video_t*)info->userdata;
+   struct texture_image *ti = (struct texture_image*)info->data;
+
+   if (!ti)
+      return;
+
+   if (  (info->type == TEXTURE_FILTER_MIPMAP_LINEAR)
+      || (info->type == TEXTURE_FILTER_MIPMAP_NEAREST))
+      want_mipmap        = true;
+
+#ifndef _XBOX
+   if (want_mipmap)
+      usage |= D3DUSAGE_AUTOGENMIPMAP;
+#endif
+   tex = NULL;
+   if (!SUCCEEDED(d3d9_tex_create(d3d->dev,
+               ti->width, ti->height, 1,
+               usage, D3D9_ARGB8888_FORMAT,
+               (LPDIRECT3DTEXTURE9*)&tex)))
+      return;
+
+   if (FAILED(d3d9_tex_lock(tex, 0, &d3dlr, NULL, D3DLOCK_NOSYSLOCK)))
+   {
+      IDirect3DTexture9_Release(tex);
+      return;
+   }
+   {
+      unsigned i;
+      uint32_t       *dst = (uint32_t*)(d3dlr.pBits);
+      const uint32_t *src = ti->pixels;
+      unsigned      pitch = d3dlr.Pitch >> 2;
+      for (i = 0; i < ti->height; i++, dst += pitch, src += ti->width)
+         memcpy(dst, src, ti->width << 2);
+   }
+   d3d9_tex_unlock(tex, 0, true);
+
+   *id = (uintptr_t)tex;
+}
+
+#ifdef HAVE_THREADS
+static uintptr_t d3d9_hlsl_video_texture_load_wrap_d3d(void *data)
+{
+   uintptr_t id = 0;
+   struct d3d9_texture_info *info = (struct d3d9_texture_info*)data;
+   if (!info)
+      return 0;
+   d3d9_hlsl_video_texture_load_d3d(info, &id);
+   return id;
+}
+#endif
+
+uintptr_t d3d9_hlsl_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type)
+{
+   uintptr_t id = 0;
+   struct d3d9_texture_info info;
+
+   info.userdata = video_data;
+   info.data     = data;
+   info.type     = filter_type;
+
+#ifdef HAVE_THREADS
+   if (threaded)
+      return video_thread_texture_handle(&info,
+            d3d9_hlsl_video_texture_load_wrap_d3d);
+#endif
+
+   d3d9_hlsl_video_texture_load_d3d(&info, &id);
+   return id;
+}
+
+#ifdef HAVE_THREADS
+static uintptr_t d3d9_hlsl_video_texture_unload_wrap_d3d(void *data)
+{
+   uintptr_t id = (uintptr_t)data;
+   if (id)
+   {
+      LPDIRECT3DTEXTURE9 texid = (LPDIRECT3DTEXTURE9)id;
+      IDirect3DTexture9_Release(texid);
+   }
+   return 0;
+}
+#endif
+
+/* Same-size contents into a texture d3d9_hlsl_load_texture made. The
+ * texture is in the managed pool, so locking it writes the runtime's
+ * system copy without waiting on the GPU and the runtime uploads it at
+ * the next use: a streaming surface keeps one texture instead of
+ * creating and releasing one a frame. */
+static bool d3d9_hlsl_update_texture_internal(uintptr_t id,
+      const struct texture_image *ti)
+{
+   D3DLOCKED_RECT     d3dlr;
+   D3DSURFACE_DESC    desc;
+   LPDIRECT3DTEXTURE9 tex = (LPDIRECT3DTEXTURE9)id;
+   unsigned i, pitch;
+   uint32_t       *dst;
+   const uint32_t *src;
+
+   if (     !tex || !ti || !ti->pixels || ti->pix10
+         || FAILED(IDirect3DTexture9_GetLevelDesc(tex, 0, &desc))
+         || desc.Width != ti->width || desc.Height != ti->height
+         || FAILED(d3d9_tex_lock(tex, 0, &d3dlr, NULL,
+               D3DLOCK_NOSYSLOCK)))
+      return false;
+   dst   = (uint32_t*)d3dlr.pBits;
+   src   = ti->pixels;
+   pitch = d3dlr.Pitch >> 2;
+   for (i = 0; i < ti->height; i++, dst += pitch, src += ti->width)
+      memcpy(dst, src, ti->width << 2);
+   d3d9_tex_unlock(tex, 0, true);
+   return true;
+}
+
+#ifdef HAVE_THREADS
+struct d3d9_hlsl_update_cmd
+{
+   const struct texture_image *ti;
+   uintptr_t                   id;
+};
+
+static uintptr_t d3d9_hlsl_update_texture_wrap(void *data)
+{
+   struct d3d9_hlsl_update_cmd *cmd = (struct d3d9_hlsl_update_cmd*)data;
+   return d3d9_hlsl_update_texture_internal(cmd->id, cmd->ti) ? cmd->id : 0;
+}
+#endif
+
+static enum video_texture_update d3d9_hlsl_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   (void)video_data;
+#ifdef HAVE_THREADS
+   if (threaded)
+   {
+      struct d3d9_hlsl_update_cmd cmd;
+      cmd.ti = ti;
+      cmd.id = id;
+      return (video_thread_texture_handle(&cmd,
+            d3d9_hlsl_update_texture_wrap) != 0)
+            ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
+   }
+#endif
+   return (d3d9_hlsl_update_texture_internal(id, ti))
+      ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
+}
+
+static void d3d9_hlsl_unload_texture(void *data,
+      bool threaded, uintptr_t id)
+{
+   LPDIRECT3DTEXTURE9 texid;
+   if (!id)
+      return;
+
+#ifdef HAVE_THREADS
+   /* Dispatch Release to the video thread to serialise with
+    * in-flight draw calls that may still reference the
+    * texture.  Matches the threading pattern already used by
+    * d3d9_hlsl_load_texture above. */
+   if (threaded)
+   {
+      video_thread_texture_handle((void*)id,
+            d3d9_hlsl_video_texture_unload_wrap_d3d);
+      return;
+   }
+#endif
+
+   texid = (LPDIRECT3DTEXTURE9)id;
+   IDirect3DTexture9_Release(texid);
+}
+
+/* The next frame's texture, lent to the core to write its frame into */
+static bool d3d9_hlsl_get_current_software_framebuffer(void *data,
+      struct retro_framebuffer *fb)
+{
+   d3d9_video_t       *d3d   = (d3d9_video_t*)data;
+   hlsl_renderchain_t *chain = d3d
+      ? (hlsl_renderchain_t*)d3d->renderchain_data : NULL;
+
+   if (!chain || !fb || d3d->needs_restore)
+      return false;
+#ifdef D3D9_VIEWS
+   /* Views read the frame where the core left it */
+   if (d3d->views.active || d3d->views.chains.count)
+      return false;
+#endif
+   return d3d9_sw_fb_lend(&d3d->sw_fb,
+         chain->chain.prev.tex[chain->chain.prev.ptr],
+         chain->chain.passes->data[0].info.tex_dims,
+         chain->chain.pixel_size, fb);
+}
+
+static struct video_shader *d3d9_hlsl_get_current_shader(void *data)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   if (!d3d)
+      return NULL;
+   return &d3d->shader;
+}
+
+/* The Direct3D 9 present interval is a presentation parameter whose
+ * largest vsync-locked value is D3DPRESENT_INTERVAL_FOUR, so this
+ * driver holds a frame for at most four display intervals. */
+static unsigned d3d9_hlsl_get_swap_interval_cap(void *data)
+{
+   (void)data;
+   return 4;
+}
+
+/* The vblank the most recent present went out on, for display pacing
+ * (d3d9_last_present_time) */
+static retro_time_t d3d9_hlsl_get_last_present_time(void *data)
+{
+   return d3d9_last_present_time((d3d9_video_t*)data);
+}
+
+/* How long the last frame's present waited for the display, and
+ * whether its frame was out as it returned (d3d9_present) */
+static retro_time_t d3d9_hlsl_get_last_present_wait(void *data, bool *shown)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   *shown            = false;
+   if (!d3d)
+      return 0;
+   *shown            = d3d->present_shown;
+   return d3d->present_wait;
+}
+
+#ifdef D3D9_VIEWS
+/* Frame memory for the threaded wrapper: on a Direct3D9Ex device the
+ * GPU reads the frame slots where they lie (d3d9_sw_fb.h) */
+static void *d3d9_hlsl_frame_mem_alloc(void *data, size_t size,
+      uintptr_t *id, bool *cached, unsigned *pitch_align)
+{
+   static bool said;
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   void *mem         = d3d ? d3d9_frame_mem_alloc(&d3d->sw_fb, d3d->dev,
+         size, id, cached, pitch_align) : NULL;
+   if (mem && !said)
+   {
+      said = true;
+      RARCH_LOG("[D3D9] Frame memory: the GPU reads the frames where they "
+            "lie.\n");
+   }
+   return mem;
+}
+
+static bool d3d9_hlsl_frame_mem_ready(void *data, uintptr_t id)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   return !d3d || d3d9_frame_mem_ready(&d3d->sw_fb, id);
+}
+
+static void d3d9_hlsl_frame_mem_free(void *data, uintptr_t id)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   if (d3d)
+      d3d9_frame_mem_free(&d3d->sw_fb, id);
+}
+#endif
+
+#ifdef D3D9_HW_RENDER
+static bool d3d9_hlsl_get_hw_render_interface(void *data,
+      const struct retro_hw_render_interface **iface)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   *iface            = (const struct retro_hw_render_interface*)
+      &d3d->hw.iface;
+   return d3d->hw.enable;
+}
+
+static void d3d9_hlsl_invalidate_hw_render_cache(void *data)
+{
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+   if (!d3d || !d3d->hw.enable)
+      return;
+   d3d9_hlsl_hw_enter(d3d);
+   d3d9_hlsl_hw_take_texture(d3d, NULL);
+   d3d->hw.ring_tex = NULL;
+   d3d9_hlsl_hw_leave(d3d);
+}
+#endif
+
 static const video_poke_interface_t d3d9_hlsl_poke_interface = {
    d3d9_hlsl_get_flags,
-   d3d9_load_texture,
-   d3d9_unload_texture,
-   d3d9_set_video_mode,
+   d3d9_hlsl_load_texture,
+   d3d9_hlsl_unload_texture,
+   d3d9_hlsl_set_video_mode,
 #if defined(_XBOX) || defined(__WINRT__)
    NULL, /* get_refresh_rate */
 #else
    /* UWP does not expose this information easily */
-   win32_get_refresh_rate,
+   NULL, /* refresh_rate - handled by display server */
 #endif
    NULL, /* set_filtering */
    NULL, /* get_video_output_size */
@@ -1801,20 +9499,62 @@ static const video_poke_interface_t d3d9_hlsl_poke_interface = {
    NULL, /* get_video_output_next */
    NULL, /* get_current_framebuffer */
    NULL, /* get_proc_address */
-   d3d9_set_aspect_ratio,
-   d3d9_apply_state_changes,
-   d3d9_set_menu_texture_frame,
-   d3d9_set_menu_texture_enable,
-   d3d9_set_osd_msg,
+   d3d9_hlsl_set_aspect_ratio,
+   d3d9_hlsl_apply_state_changes,
+   d3d9_hlsl_set_menu_texture_frame,
+   d3d9_hlsl_set_menu_texture_enable,
+   d3d9_hlsl_set_osd_msg,
    win32_show_cursor,
    NULL, /* grab_mouse_toggle */
-   NULL, /* get_current_shader */
-   NULL, /* get_current_software_framebuffer */
+   d3d9_hlsl_get_current_shader,
+   d3d9_hlsl_get_current_software_framebuffer,
+#ifdef D3D9_HW_RENDER
+   d3d9_hlsl_get_hw_render_interface,
+#else
    NULL, /* get_hw_render_interface */
-   NULL, /* set_hdr_max_nits */
+#endif
+   NULL, /* set_hdr_menu_nits */
    NULL, /* set_hdr_paper_white_nits */
-   NULL, /* set_hdr_contrast */
-   NULL  /* set_hdr_expand_gamut */
+   NULL, /* set_hdr_expand_gamut */
+   NULL, /* set_hdr_scanlines */
+   NULL, /* set_hdr_subpixel_layout */
+   d3d9_supports_texture_format,
+   d3d9_load_texture_compressed,
+   NULL, /* present_last */
+   d3d9_hlsl_get_last_present_time,
+#ifdef D3D9_HW_RENDER
+   d3d9_hlsl_hw_ring_install,
+   d3d9_hlsl_hw_ring_fence_new,
+   d3d9_hlsl_hw_ring_fence_free,
+   d3d9_hlsl_hw_ring_fence_signal,
+   d3d9_hlsl_hw_ring_fence_wait,
+#else
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+#endif
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+   d3d9_hlsl_update_texture,
+   d3d9_hlsl_get_swap_interval_cap
+#ifdef D3D9_VIEWS
+   ,
+   NULL, /* texture_lend */
+   NULL, /* texture_lend_ready */
+   d3d9_hlsl_get_last_present_wait,
+   d3d9_hlsl_set_view_count,
+   NULL, /* hw_context_destroying */
+   NULL, /* get_headset_refresh */
+   NULL, /* set_frame_format */
+   d3d9_hlsl_frame_mem_alloc,
+   d3d9_hlsl_frame_mem_ready,
+   d3d9_hlsl_frame_mem_free
+#endif
 };
 
 static void d3d9_hlsl_get_poke_interface(void *data,
@@ -1826,36 +9566,37 @@ static void d3d9_hlsl_get_poke_interface(void *data,
 #ifdef HAVE_GFX_WIDGETS
 static bool d3d9_hlsl_gfx_widgets_enabled(void *data)
 {
-   return false; /* currently disabled due to memory issues */
+   (void)data;
+   return true;
 }
 #endif
 
 static void d3d9_hlsl_set_resize(d3d9_video_t *d3d,
-      unsigned new_width, unsigned new_height)
+      unsigned dims)
 {
    /* No changes? */
-   if (     (new_width  == d3d->video_info.width)
-         && (new_height == d3d->video_info.height))
+   if (d3d->video_info.dims == dims)
       return;
 
-   d3d->video_info.width  = new_width;
-   d3d->video_info.height = new_height;
-   video_driver_set_size(new_width, new_height);
+   d3d->video_info.dims   = dims;
+   video_driver_set_output_dims(dims);
+   d3d->vp.full_dims      = dims;
 }
 
 static bool d3d9_hlsl_alive(void *data)
 {
-   unsigned temp_width   = 0;
-   unsigned temp_height  = 0;
+   unsigned temp_dims   = 0;
    bool ret              = false;
    bool        quit      = false;
    bool        resize    = false;
    d3d9_video_t *d3d     = (d3d9_video_t*)data;
 
-   /* Needed because some context drivers don't track their sizes */
-   video_driver_get_size(&temp_width, &temp_height);
+   /* Read from local bookkeeping rather than video_st (which would
+    * cross threads needlessly).  d3d->vp.full_* is
+    * written at every set_size call site in this driver. */
+   temp_dims  = d3d->vp.full_dims;
 
-   win32_check_window(NULL, &quit, &resize, &temp_width, &temp_height);
+   win32_check_window(NULL, &quit, &resize, &temp_dims);
 
    if (quit)
       d3d->quitting      = quit;
@@ -1863,15 +9604,18 @@ static bool d3d9_hlsl_alive(void *data)
    if (resize)
    {
       d3d->should_resize = true;
-      d3d9_hlsl_set_resize(d3d, temp_width, temp_height);
+      d3d9_hlsl_set_resize(d3d, temp_dims);
       d3d9_hlsl_restore(d3d);
    }
 
    ret = !quit;
 
-   if (  temp_width  != 0 &&
-         temp_height != 0)
-      video_driver_set_size(temp_width, temp_height);
+   if (  VIDEO_SCALE_W(temp_dims)  != 0 &&
+         VIDEO_SCALE_H(temp_dims) != 0)
+   {
+      video_driver_set_output_dims(temp_dims);
+      d3d->vp.full_dims   = temp_dims;
+   }
 
    return ret;
 }
@@ -1901,6 +9645,15 @@ static void d3d9_hlsl_set_nonblock_state(void *data, bool state,
          interval ?
          D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE);
 #else
+   /* A reset only for an interval the device does not have: it costs a
+    * hardware core everything it holds in the default pool */
+   if (!d3d->needs_restore)
+   {
+      D3DPRESENT_PARAMETERS d3dpp;
+      d3d9_make_d3dpp(d3d, &d3d->video_info, &d3dpp);
+      if (d3dpp.PresentationInterval == d3d->present_interval)
+         return;
+   }
    d3d->needs_restore    = true;
    d3d9_hlsl_restore(d3d);
 #endif
@@ -1910,32 +9663,174 @@ static void d3d9_hlsl_set_nonblock_state(void *data, bool state,
 static bool d3d9_hlsl_suspend_screensaver(void *data, bool enable) { return true; }
 #endif
 
+static void d3d9_hlsl_set_rotation(void *data, unsigned rot)
+{
+   d3d9_video_t        *d3d = (d3d9_video_t*)data;
+   if (d3d)
+      d3d->dev_rotation = rot;
+}
+
+static INLINE bool d3d9_hlsl_device_get_render_target_data(
+      LPDIRECT3DDEVICE9 dev,
+      LPDIRECT3DSURFACE9 src, LPDIRECT3DSURFACE9 dst)
+{
+#ifndef _XBOX
+   return (   dev
+           && SUCCEEDED(IDirect3DDevice9_GetRenderTargetData(
+               dev, src, dst)));
+#else
+   return false;
+#endif
+}
+
+static bool d3d9_hlsl_read_viewport(void *data, uint8_t *buffer, bool is_idle)
+{
+   D3DLOCKED_RECT rect;
+   LPDIRECT3DSURFACE9 target = NULL;
+   LPDIRECT3DSURFACE9 dest   = NULL;
+   bool ret                  = true;
+   d3d9_video_t *d3d         = (d3d9_video_t*)data;
+   LPDIRECT3DDEVICE9 d3dr    = d3d->dev;
+   unsigned width            = VIDEO_SCALE_W(d3d->vp.full_dims);
+   unsigned height           = VIDEO_SCALE_H(d3d->vp.full_dims);
+
+   /* The back buffer, not render target 0: a hardware core may have
+    * left its own bound */
+   if (
+            !(d3dr &&
+               SUCCEEDED(IDirect3DDevice9_GetBackBuffer(d3dr, 0, 0,
+                     D3DBACKBUFFER_TYPE_MONO, (LPDIRECT3DSURFACE9*)&target)))
+         || !SUCCEEDED(IDirect3DDevice9_CreateOffscreenPlainSurface(d3dr,
+               width, height,
+               (D3DFORMAT)D3D9_XRGB8888_FORMAT, D3DPOOL_SYSTEMMEM,
+               (LPDIRECT3DSURFACE9*)&dest, NULL))
+         || !d3d9_hlsl_device_get_render_target_data(d3dr, target, dest)
+         )
+   {
+      ret = false;
+      goto end;
+   }
+
+   if (FAILED(IDirect3DSurface9_LockRect(dest, &rect, NULL, D3DLOCK_READONLY)))
+   {
+      ret = false;
+      goto end;
+   }
+
+   {
+      unsigned x, y;
+      /* The viewport's rows bottom up, kept inside the surface */
+      unsigned vp_x           = MIN(d3d->out_vp.X, width);
+      unsigned vp_y           = MIN(d3d->out_vp.Y, height);
+      unsigned vp_width       = MIN(d3d->out_vp.Width,  width  - vp_x);
+      unsigned vp_height      = MIN(d3d->out_vp.Height, height - vp_y);
+      unsigned pitchpix       = rect.Pitch / 4;
+      const uint32_t *pixels  = (const uint32_t*)rect.pBits;
+
+      pixels                 += vp_x;
+      pixels                 += (size_t)(vp_y + vp_height - 1) * pitchpix;
+
+      for (y = 0; y < vp_height; y++, pixels -= pitchpix)
+      {
+         for (x = 0; x < vp_width; x++)
+         {
+            uint32_t px = pixels[x];
+            *buffer++ = (px >>  0) & 0xff;
+            *buffer++ = (px >>  8) & 0xff;
+            *buffer++ = (px >> 16) & 0xff;
+         }
+      }
+
+      IDirect3DSurface9_UnlockRect(dest);
+   }
+
+end:
+   if (target)
+      IDirect3DSurface9_Release(target);
+   if (dest)
+      IDirect3DSurface9_Release(dest);
+   return ret;
+}
+
+static bool d3d9_hlsl_has_windowed(void *data)
+{
+#ifdef _XBOX
+   return false;
+#else
+   return true;
+#endif
+}
+
+static font_renderer_t d3d9_hlsl_font = {
+   d3d9_font_init,
+   d3d9_font_free,
+   d3d9_font_render_msg,
+   "d3d9_hlsl",
+   d3d9_font_get_glyph,
+   NULL, /* bind_block */
+   NULL, /* flush */
+   d3d9_font_get_message_width,
+   d3d9_font_get_line_metrics
+};
+
 video_driver_t video_d3d9_hlsl = {
    d3d9_hlsl_init,
    d3d9_hlsl_frame,
    d3d9_hlsl_set_nonblock_state,
    d3d9_hlsl_alive,
+#ifdef _XBOX
    NULL, /* focus */
+#else
+   /* As the other Windows drivers: without it the threaded wrapper
+    * reported the window as never focused - controllers read as idle,
+    * and the content paused with "Pause when not active". */
+   win32_has_focus,
+#endif
 #ifdef _XBOX
    d3d9_hlsl_suspend_screensaver,
 #else
    win32_suspend_screensaver,
 #endif
-   d3d9_has_windowed,
+   d3d9_hlsl_has_windowed,
    d3d9_hlsl_set_shader,
    d3d9_hlsl_free,
    "d3d9_hlsl",
-   d3d9_set_viewport,
-   d3d9_set_rotation,
-   d3d9_viewport_info,
-   d3d9_read_viewport,
-   NULL, /* read_frame_raw */
+   d3d9_hlsl_set_viewport,
+   d3d9_hlsl_set_rotation,
+   d3d9_hlsl_viewport_info,
+   d3d9_hlsl_read_viewport,
 #ifdef HAVE_OVERLAY
-   d3d9_get_overlay_interface,
+   d3d9_hlsl_get_overlay_interface,
 #endif
    d3d9_hlsl_get_poke_interface,
    NULL, /* wrap_type_to_enum */
+   NULL, /* shader_load_begin */
+   NULL, /* shader_load_step */
 #ifdef HAVE_GFX_WIDGETS
-   d3d9_hlsl_gfx_widgets_enabled
+   d3d9_hlsl_gfx_widgets_enabled,
 #endif
+#ifdef D3D9_HW_RENDER
+   d3d9_hlsl_invalidate_hw_render_cache,
+#else
+   NULL, /* invalidate_hw_render_cache */
+#endif
+   NULL, /* read_viewport_hdr */
+   &d3d9_hlsl_font
+};
+
+gfx_display_ctx_driver_t gfx_display_ctx_d3d9_hlsl = {
+   gfx_display_d3d9_hlsl_draw,
+   gfx_display_d3d9_hlsl_draw_pipeline,
+   gfx_display_d3d9_hlsl_blend_begin,
+   gfx_display_d3d9_hlsl_blend_end,
+   NULL,                                     /* get_default_mvp        */
+   NULL,                                     /* get_default_vertices   */
+   NULL,                                     /* get_default_tex_coords */
+   &d3d9_hlsl_font,
+   GFX_VIDEO_DRIVER_DIRECT3D9_HLSL,
+   "d3d9_hlsl",
+   true,
+   true,
+   gfx_display_d3d9_hlsl_scissor_begin,
+   gfx_display_d3d9_hlsl_scissor_end
 };

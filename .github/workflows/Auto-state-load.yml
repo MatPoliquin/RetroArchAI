@@ -1,0 +1,61 @@
+name: Deferred auto-state regression
+on:
+  push:
+    paths:
+      - 'runloop.c'
+      - 'runloop.h'
+      - 'runahead.c'
+      - 'command.c'
+      - 'samples/runloop/auto_state_load/**'
+      - '.github/workflows/Auto-state-load.yml'
+  pull_request:
+    paths:
+      - 'runloop.c'
+      - 'runloop.h'
+      - 'runahead.c'
+      - 'command.c'
+      - 'samples/runloop/auto_state_load/**'
+      - '.github/workflows/Auto-state-load.yml'
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: gcc-mingw-w64-x86-64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+      - name: Linux and sanitizer tests
+        working-directory: samples/runloop/auto_state_load
+        run: |
+          make check
+          make clean
+          make check EXTRA_CFLAGS='-DHAVE_NETWORKING -DHAVE_CHEEVOS' SANITIZER=address,undefined
+      - name: Windows cross-build
+        working-directory: samples/runloop/auto_state_load
+        run: |
+          make clean
+          make CC=x86_64-w64-mingw32-gcc TARGET=auto_state_load_test.exe EXTRA_CFLAGS='-DHAVE_NETWORKING -DHAVE_CHEEVOS'

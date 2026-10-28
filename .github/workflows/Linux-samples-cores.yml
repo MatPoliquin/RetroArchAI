@@ -1,0 +1,286 @@
+name: CI Linux samples/cores
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'cores/libretro-ffmpeg/**'
+      - 'libretro-common/queues/**'
+      - 'libretro-common/include/retro_spsc.h'
+      - 'libretro-common/include/retro_atomic.h'
+      - 'camera/drivers/**'
+      - 'samples/camera/**'
+      - 'samples/cores/**'
+      - '.github/workflows/Linux-samples-cores.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'cores/libretro-ffmpeg/**'
+      - 'libretro-common/queues/**'
+      - 'libretro-common/include/retro_spsc.h'
+      - 'libretro-common/include/retro_atomic.h'
+      - 'camera/drivers/**'
+      - 'samples/camera/**'
+      - 'samples/cores/**'
+      - '.github/workflows/Linux-samples-cores.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  samples-cores:
+    name: Build and run samples/cores
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential pkg-config ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libv4l-dev libasound2-dev ccache libavdevice-dev libavfilter-dev libpipewire-0.3-dev mesa-vulkan-drivers
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Select software Vulkan for CPU fixtures
+        run: |
+          set -eu
+          for icd in /usr/share/vulkan/icd.d/lvp_icd*.json; do
+            if [ -f "$icd" ]; then
+              printf 'VK_ICD_FILENAMES=%s\n' "$icd" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo "Lavapipe ICD is missing" >&2
+          exit 1
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Build and run camera ffmpeg_live_test (plain, ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/camera/ffmpeg_live
+        run: |
+          set -eu
+          # The camera driver against lavfi: built with its input
+          # format set to libavfilter, a filter graph is the device and
+          # the whole pipeline runs with no camera attached - avformat
+          # opens the source, the poll thread reads, the decoder
+          # decodes, swscale converts and poll() takes the newest
+          # finished frame.
+          #
+          # The cases are the ones the threading has to get right and
+          # that no eyeball on a webcam would show: start and stop
+          # repeatedly, stop while the thread is mid-frame, free
+          # without stopping, poll before starting, a source that
+          # does not exist, a poll that must show the last frame
+          # decoded, and a slow poll the thread must not wait on. Leak
+          # checking is on: a packet or plane kept per frame or per
+          # start is a leak report.
+          make clean && make -j$(nproc) all
+          ./ffmpeg_live_test
+          echo "[pass] ffmpeg_live_test"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 600 ./ffmpeg_live_test
+          echo "[pass] ffmpeg_live_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1:suppressions=../../cores/ffmpeg_audio_pipe/tsan.supp \
+             timeout 600 ./ffmpeg_live_test
+          echo "[pass] ffmpeg_live_test (TSan)"
+
+      - name: Build and run camera pipewire_poll_test (plain, ASan + UBSan)
+        shell: bash
+        working-directory: samples/camera/pipewire_poll
+        run: |
+          set -eu
+          # The pipewire camera driver's poll against a scripted
+          # stream, the pw_stream calls link-wrapped: an empty queue
+          # returns at once, and every buffer the poll takes - valid,
+          # corrupted or without CPU data - is queued back. The check
+          # target bounds the run: a poll that waits for a frame is
+          # the failure.
+          make clean check
+          echo "[pass] pipewire_poll_test"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./pipewire_poll_test
+          echo "[pass] pipewire_poll_test (ASan)"
+
+      - name: FFmpeg hardware-context replacement (plain, ASan + UBSan)
+        working-directory: samples/cores/ffmpeg_hw_context
+        run: |
+          set -eu
+          make clean
+          make check
+          make clean
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            make check SANITIZER=address,undefined
+
+      - name: Build and run ffmpeg_sweep_test (plain, ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/cores/ffmpeg_sweep
+        run: |
+          set -eu
+          # Breadth where ffmpeg_audio_pipe_test has depth: eight clips
+          # across containers, video and audio codecs, rates, channel
+          # counts and the one-sided cases, each loaded, run, seeked
+          # both ways, reset and unloaded in one process - so the
+          # second load is what finds what the first unload left
+          # behind - then files that are truncated, stubbed, noise,
+          # empty or absent, then teardown while the decode thread is
+          # still working.
+          #
+          # With leak detection: every load and unload in it, the
+          # decoder probing included, must give back its codec
+          # contexts and hardware devices. The libav* TSan
+          # suppressions are the audio-pipe lane's, for the same
+          # reason.
+          make clean && make -j$(nproc) all
+          ./ffmpeg_sweep_test
+          echo "[pass] ffmpeg_sweep_test"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 900 ./ffmpeg_sweep_test
+          echo "[pass] ffmpeg_sweep_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1:suppressions=../ffmpeg_audio_pipe/tsan.supp \
+             timeout 900 ./ffmpeg_sweep_test
+          echo "[pass] ffmpeg_sweep_test (TSan)"
+          # The standalone core's own makefiles: a link with
+          # --no-undefined is the check their source lists are whole,
+          # and a dry run with GL (no GL headers here) the check that
+          # the GL build's list resolves. The sample's objects share
+          # paths with the core's libretro-common ones: cleaned first.
+          make clean
+          make -n -C ../../../cores/libretro-ffmpeg OPENGL=1 >/dev/null
+          make -C ../../../cores/libretro-ffmpeg -j2 OPENGL=0 HAVE_SSA=0
+          make -C ../../../cores/libretro-ffmpeg clean OPENGL=0 HAVE_SSA=0
+          echo "[pass] standalone ffmpeg core links"
+
+      - name: Build and run ffmpeg_finished_wait_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/cores/ffmpeg_finished_wait
+        run: |
+          set -eu
+          # The main thread's wait for a finished video slot ends when
+          # the decode thread does, at the end of a clip, instead of
+          # holding retro_run() on a slot nothing will finish.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./ffmpeg_finished_wait_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1:suppressions=../ffmpeg_audio_pipe/tsan.supp \
+             timeout 60 ./ffmpeg_finished_wait_test
+          echo "[pass] ffmpeg_finished_wait_test"
+
+      - name: Build and run ffmpeg_audio_pipe_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/cores/ffmpeg_audio_pipe
+        run: |
+          set -eu
+          # cores/libretro-ffmpeg/ffmpeg_core.c as a libretro host would
+          # drive it: a generated clip (tone under a test pattern), 5 s
+          # of frames checked for the audio frame count and a tone in
+          # every batch, then R1/L1 seeks both ways - the decode-thread
+          # / main-thread handshake around the audio ring - and a
+          # teardown mid-stream, all on a watchdog.  Needs the ffmpeg
+          # CLI to generate the clip.  Leak detection off: libavutil's
+          # own HW-device probing allocates and keeps a few objects.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x ffmpeg_audio_pipe_test
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 300 \
+             ./ffmpeg_audio_pipe_test
+          echo "[pass] ffmpeg_audio_pipe_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          # The libav* libraries are uninstrumented, so TSan cannot see
+          # the atomics that order an AVBufferRef's reference count and
+          # reports the allocation and the release as a race. Only
+          # those libraries are suppressed; a race in the core's own
+          # code is still reported.
+          TSAN_OPTIONS=halt_on_error=1:suppressions=tsan.supp \
+             timeout 300 ./ffmpeg_audio_pipe_test
+          echo "[pass] ffmpeg_audio_pipe_test (TSan)"
+
+      - name: Build and run videoproc_audio_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/cores/videoproc_audio
+        run: |
+          set -eu
+          # cores/libretro-video-processor's ALSA capture handle between
+          # the frontend's audio thread, which keeps calling the core's
+          # audio callback, and the main thread opening and closing the
+          # device under it: no read on a closed handle - a close that
+          # lands mid-read included - and no lock taken by the callback.
+          # The device is ALSA's null PCM; the capture read is a
+          # stand-in.
+          make clean && make -j$(nproc) all
+          timeout 120 ./videoproc_audio_test
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./videoproc_audio_test
+          echo "[pass] videoproc_audio_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./videoproc_audio_test
+          echo "[pass] videoproc_audio_test (TSan)"
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

@@ -1,0 +1,47 @@
+# ui/companion/companion_thumbs.c against fake still and animation
+# decoders: cache, workers, cancel, animation switching, preview audio
+# and the still-to-animation session handoff.
+
+include ../../sample_objdir.mk
+
+TARGET   := companion_thumbs_test
+CORE_DIR := ../../..
+LRC      := $(CORE_DIR)/libretro-common
+
+SOURCES := companion_thumbs_test.c \
+           $(CORE_DIR)/ui/companion/companion_thumbs.c \
+           $(LRC)/formats/video_player.c \
+           $(LRC)/rthreads/rthreads.c \
+           $(LRC)/rthreads/retro_eventcount.c \
+           $(LRC)/rthreads/tpool.c \
+           $(LRC)/features/features_cpu.c \
+           $(LRC)/time/rtime.c \
+           $(LRC)/compat/compat_strl.c \
+           $(LRC)/compat/compat_strldup.c \
+           $(LRC)/string/stdstring.c \
+           $(LRC)/encodings/encoding_utf.c
+CFLAGS  += -Wall -std=gnu99 -g1 -O1 -D_GNU_SOURCE -DHAVE_THREADS \
+           -I$(CORE_DIR) -I$(LRC)/include
+LDFLAGS += -lpthread
+OBJS    := $(call sample_objs,$(SOURCES:.c=.o))
+
+ifneq ($(SANITIZER),)
+   CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
+   LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
+endif
+
+all: $(TARGET)
+%.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) -c -o $@ $< $(CFLAGS)
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+check: $(TARGET)
+	./$(TARGET)
+clean:
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(TARGET) $(OBJS)
+.PHONY: all check clean

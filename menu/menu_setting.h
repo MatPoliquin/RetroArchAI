@@ -80,6 +80,18 @@ int menu_setting_set(unsigned type, unsigned action, bool wraparound);
  **/
 rarch_setting_t *menu_setting_find(const char *label);
 
+/* The hotkey list's rows for entries and macros, made to show what
+ * there is now (see menu_setting.c). */
+void menu_setting_entries_refresh(void);
+
+/* The list of what a combination can do, opened for combination
+ * @number: @pad the buttons held on its empty row, or 0 to change what
+ * an entry there is does. */
+void menu_setting_entry_target_pick(unsigned number, unsigned pad);
+/* A list of the combination rows' waiting to be opened, opened: called
+ * each pass of the menu. */
+void menu_setting_entry_pending(void);
+
 rarch_setting_t *menu_setting_find_enum(enum msg_hash_enums enum_idx);
 
 int menu_action_handle_setting(rarch_setting_t *setting,
@@ -102,6 +114,10 @@ void setting_generic_handle_change(rarch_setting_t *setting);
 rarch_setting_t *menu_setting_new(void);
 
 void menu_setting_free(rarch_setting_t *setting);
+
+/* What Keyboard Index shows for @idx: "All" for 0, else the number and
+ * name of the keyboard listed there. */
+size_t menu_setting_keyboard_index_name(unsigned idx, char *s, size_t len);
 
 RETRO_END_DECLS
 

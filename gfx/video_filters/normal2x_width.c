@@ -20,6 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 #ifdef RARCH_INTERNAL
 #define softfilter_get_implementation normal2x_width_get_implementation
 #define softfilter_thread_data normal2x_width_softfilter_thread_data
@@ -70,14 +76,14 @@ static void *normal2x_width_generic_create(const struct softfilter_config *confi
    struct filter_data *filt = (struct filter_data*)calloc(1, sizeof(*filt));
    if (!filt)
       return NULL;
-   if (!(filt->workers = (struct softfilter_thread_data*)calloc(1, sizeof(struct softfilter_thread_data))))
+   if (!(filt->workers = (struct softfilter_thread_data*)calloc(threads ? threads : 1, sizeof(struct softfilter_thread_data))))
    {
       free(filt);
       return NULL;
    }
-   /* Apparently the code is not thread-safe,
-    * so force single threaded operation... */
-   filt->threads = 1;
+   /* Each output row comes from its own source row alone, so the
+    * rows are split between the workers. */
+   filt->threads = threads ? threads : 1;
    filt->in_fmt  = in_fmt;
    return filt;
 }
@@ -110,17 +116,30 @@ static void normal2x_width_work_cb_xrgb8888(void *data, void *thread_data)
 
    for (y = 0; y < thr->height; ++y)
    {
-      uint32_t *out_ptr = output;
-      for (x = 0; x < thr->width; ++x)
+      x = 0;
+#if defined(__SSE2__)
+      for (; x + 4 <= thr->width; x += 4)
       {
-         uint32_t *out_line_ptr = out_ptr;
-         uint32_t color         = *(input + x);
-
-         /* Duplicate pixels in the x direction */
-         *out_line_ptr       = color;
-         *(out_line_ptr + 1) = color;
-
-         out_ptr += 2;
+         __m128i v = _mm_loadu_si128((const __m128i*)(input + x));
+         _mm_storeu_si128((__m128i*)(output + 2 * x),
+               _mm_unpacklo_epi32(v, v));
+         _mm_storeu_si128((__m128i*)(output + 2 * x + 4),
+               _mm_unpackhi_epi32(v, v));
+      }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+      for (; x + 4 <= thr->width; x += 4)
+      {
+         uint32x4_t   v = vld1q_u32(input + x);
+         uint32x4x2_t d = vzipq_u32(v, v);   /* portable on ARMv7+A64  */
+         vst1q_u32(output + 2 * x,     d.val[0]);
+         vst1q_u32(output + 2 * x + 4, d.val[1]);
+      }
+#endif
+      for (; x < thr->width; ++x)
+      {
+         uint32_t color        = input[x];
+         output[2 * x]         = color;
+         output[2 * x + 1]     = color;
       }
 
       input  += in_stride;
@@ -139,17 +158,30 @@ static void normal2x_width_work_cb_rgb565(void *data, void *thread_data)
 
    for (y = 0; y < thr->height; ++y)
    {
-      uint16_t *out_ptr = output;
-      for (x = 0; x < thr->width; ++x)
+      x = 0;
+#if defined(__SSE2__)
+      for (; x + 8 <= thr->width; x += 8)
       {
-         uint16_t *out_line_ptr = out_ptr;
-         uint16_t color         = *(input + x);
-
-         /* Duplicate pixels in the x direction */
-         *out_line_ptr       = color;
-         *(out_line_ptr + 1) = color;
-
-         out_ptr += 2;
+         __m128i v = _mm_loadu_si128((const __m128i*)(input + x));
+         _mm_storeu_si128((__m128i*)(output + 2 * x),
+               _mm_unpacklo_epi16(v, v));
+         _mm_storeu_si128((__m128i*)(output + 2 * x + 8),
+               _mm_unpackhi_epi16(v, v));
+      }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+      for (; x + 8 <= thr->width; x += 8)
+      {
+         uint16x8_t   v = vld1q_u16(input + x);
+         uint16x8x2_t d = vzipq_u16(v, v);
+         vst1q_u16(output + 2 * x,     d.val[0]);
+         vst1q_u16(output + 2 * x + 8, d.val[1]);
+      }
+#endif
+      for (; x < thr->width; ++x)
+      {
+         uint16_t color        = input[x];
+         output[2 * x]         = color;
+         output[2 * x + 1]     = color;
       }
 
       input  += in_stride;
@@ -162,26 +194,28 @@ static void normal2x_width_generic_packets(void *data,
       void *output, size_t output_stride,
       const void *input, unsigned width, unsigned height, size_t input_stride)
 {
-   /* We are guaranteed single threaded operation
-    * (filt->threads = 1) so we don't need to loop
-    * over threads and can cull some code. This only
-    * makes the tiniest performance difference, but
-    * every little helps when running on an o3DS... */
-   struct filter_data *filt           = (struct filter_data*)data;
-   struct softfilter_thread_data *thr = (struct softfilter_thread_data*)&filt->workers[0];
+   unsigned i;
+   struct filter_data *filt = (struct filter_data*)data;
 
-   thr->out_data                      = (uint8_t*)output;
-   thr->in_data                       = (const uint8_t*)input;
-   thr->out_pitch                     = output_stride;
-   thr->in_pitch                      = input_stride;
-   thr->width                         = width;
-   thr->height                        = height;
+   for (i = 0; i < filt->threads; i++)
+   {
+      struct softfilter_thread_data *thr = &filt->workers[i];
+      unsigned y_start = (height * i) / filt->threads;
+      unsigned y_end   = (height * (i + 1)) / filt->threads;
 
-   if (filt->in_fmt == SOFTFILTER_FMT_XRGB8888)
-      packets[0].work                 = normal2x_width_work_cb_xrgb8888;
-   else if (filt->in_fmt == SOFTFILTER_FMT_RGB565)
-      packets[0].work                 = normal2x_width_work_cb_rgb565;
-   packets[0].thread_data             = thr;
+      thr->out_data  = (uint8_t*)output + (size_t)y_start * 1 * output_stride;
+      thr->in_data   = (const uint8_t*)input + (size_t)y_start * input_stride;
+      thr->out_pitch = output_stride;
+      thr->in_pitch  = input_stride;
+      thr->width     = width;
+      thr->height    = y_end - y_start;
+
+      if (filt->in_fmt == SOFTFILTER_FMT_XRGB8888)
+         packets[i].work = normal2x_width_work_cb_xrgb8888;
+      else if (filt->in_fmt == SOFTFILTER_FMT_RGB565)
+         packets[i].work = normal2x_width_work_cb_rgb565;
+      packets[i].thread_data = thr;
+   }
 }
 
 static const struct softfilter_implementation normal2x_width_generic = {

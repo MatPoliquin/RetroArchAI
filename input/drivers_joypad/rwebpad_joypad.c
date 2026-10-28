@@ -64,7 +64,7 @@ static EM_BOOL rwebpad_gamepad_cb(int event_type,
          rwebpad_joypad_data->live_pads[gamepad_event->index] = true;
          input_autoconfigure_connect(
                gamepad_event->id,    /* name */
-               NULL,                 /* display name */
+               NULL, NULL,           /* display names */
                rwebpad_joypad.ident, /* driver */
                gamepad_event->index, /* idx */
                vid,                  /* vid */
@@ -170,7 +170,8 @@ static int16_t rwebpad_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t rwebpad_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    unsigned i;
@@ -182,11 +183,8 @@ static int16_t rwebpad_joypad_state(
    gamepad_state = rwebpad_joypad_data->pads[port];
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN 
             && (joykey < gamepad_state.numButtons)
@@ -214,7 +212,7 @@ static void rwebpad_joypad_update_rumble(unsigned port)
    {
       EM_ASM({
          try {
-            JSEvents?.lastGamepadState?.[$0]?.vibrationActuator?.playEffect?.("dual-rumble", {startDelay: 0, duration: 200, strongMagnitude: $1 / 65536, weakMagnitude: $2 / 65536});
+            JSEvents?.lastGamepadState?.[$0]?.vibrationActuator?.playEffect?.("dual-rumble", {"startDelay": 0, "duration": 200, "strongMagnitude": $1 / 65535, "weakMagnitude": $2 / 65535});
          } catch (e) {}
       }, port, rwebpad_joypad_data->rumble[port].strong, rwebpad_joypad_data->rumble[port].weak);
    }

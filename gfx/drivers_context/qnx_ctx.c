@@ -176,7 +176,10 @@ static void *gfx_ctx_qnx_init(void *video_driver)
    }
 
 #ifndef HAVE_BB10
-   angle = atoi(getenv("ORIENTATION"));
+   {
+      const char *orientation = getenv("ORIENTATION");
+      angle = orientation ? atoi(orientation) : 0;
+   }
 
    if (screen_get_display_property_pv(qnx->screen_disp,
             SCREEN_PROPERTY_MODE, (void**)&screen_mode))
@@ -253,43 +256,40 @@ screen_error:
 }
 
 static void gfx_ctx_qnx_get_video_size(void *data,
-      unsigned *width, unsigned *height)
+      unsigned *dims)
 {
 #ifdef HAVE_EGL
    qnx_ctx_data_t *qnx = (qnx_ctx_data_t*)data;
-   egl_get_video_size(&qnx->egl, width, height);
+   egl_get_video_size(&qnx->egl, dims);
 #endif
 }
 
 static void gfx_ctx_qnx_check_window(void *data, bool *quit,
-      bool *resize, unsigned *width, unsigned *height)
+      bool *resize, unsigned *dims)
 {
-   unsigned new_width, new_height;
+   unsigned new_dims;
    qnx_ctx_data_t *qnx = (qnx_ctx_data_t*)data;
    *quit               = false;
 #ifdef HAVE_EGL
-   egl_get_video_size(&qnx->egl, &new_width, &new_height);
+   egl_get_video_size(&qnx->egl, &new_dims);
 #endif
 
-   if (new_width != *width || new_height != *height)
+   if (new_dims != *dims)
    {
-      *width           = new_width;
-      *height          = new_height;
+      *dims           = new_dims;
       *resize          = true;
    }
 }
 
 static bool gfx_ctx_qnx_set_video_mode(void *data,
-      unsigned width, unsigned height, bool fullscreen) { return true; }
+      unsigned dims, bool fullscreen) { return true; }
 
 static void gfx_ctx_qnx_input_driver(void *data,
-      const char *joypad_name,
-      input_driver_t **input, void **input_data)
+      const char *joypad_name)
 {
-   void *qnxinput       = input_driver_init_wrap(&input_qnx, joypad_name);
-
-   *input               = qnxinput ? &input_qnx : NULL;
-   *input_data          = qnxinput;
+   /* no input driver of this context's own: the frontend starts the
+    * platform's */
+   input_driver_video_window(INPUT_WINDOW_PLATFORM, NULL);
 }
 
 static enum gfx_ctx_api gfx_ctx_qnx_get_api(void *data) { return GFX_CTX_OPENGL_ES_API; }
@@ -391,6 +391,26 @@ static uint32_t gfx_ctx_qnx_get_flags(void *data)
 
 static void gfx_ctx_qnx_set_flags(void *data, uint32_t flags) { }
 
+static bool gfx_ctx_qnx_create_surface(void *data)
+{
+#ifdef HAVE_EGL
+   qnx_ctx_data_t *qnx = (qnx_ctx_data_t*)data;
+   return egl_create_surface(&qnx->egl, screen_win);
+#else
+   return false;
+#endif
+}
+
+static bool gfx_ctx_qnx_destroy_surface(void *data)
+{
+#ifdef HAVE_EGL
+   qnx_ctx_data_t *qnx = (qnx_ctx_data_t*)data;
+   return egl_destroy_surface(&qnx->egl);
+#else
+   return false;
+#endif
+}
+
 const gfx_ctx_driver_t gfx_ctx_qnx = {
    gfx_ctx_qnx_init,
    gfx_ctx_qnx_destroy,
@@ -426,5 +446,7 @@ const gfx_ctx_driver_t gfx_ctx_qnx = {
    gfx_ctx_qnx_set_flags,
    gfx_ctx_qnx_bind_hw_render,
    NULL,
-   NULL
+   NULL,
+   gfx_ctx_qnx_create_surface,
+   gfx_ctx_qnx_destroy_surface
 };

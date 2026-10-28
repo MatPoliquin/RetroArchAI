@@ -121,15 +121,13 @@ private_lane :ra_update_versions do |options|
     UI.message("Bumping to version: #{next_version_number}")
   end
 
-  # can't use update_build_number/agvtool to update this as it
-  # doesn't deal with multiple projects in the same folder
-  update_info_plist(
-    plist_path: options[:plist_path],
-    block: proc do |plist|
-      plist["CFBundleVersion"] = (next_build_number + 1).to_s
-      plist["CFBundleShortVersionString"] = next_version_number
-    end
-  )
+  # passed to xcodebuild as build settings so the app and its
+  # extensions all stamp the same CFBundleVersion and
+  # CFBundleShortVersionString
+  {
+    build_number: (next_build_number + 1).to_s,
+    version_number: next_version_number
+  }
 end
 
 private_lane :ra_update_signing do |options|
@@ -158,44 +156,117 @@ private_lane :ra_update_signing do |options|
 end
 
 private_lane :ra_build_app do |options|
+  # xcodebuild -exportArchive copies the archive with rsync and requires
+  # Apple's /usr/bin/rsync; a Homebrew rsync earlier in PATH makes the
+  # export fail with "Copy failed".
+  ENV["PATH"] = "/usr/bin:#{ENV['PATH']}"
+
   build_app(
     workspace: "RetroArch.xcworkspace",
     scheme: options[:scheme],
     xcconfig: options[:xcconfig],
-    xcodebuild_formatter: 'xcbeautify --renderer github-actions',
+    xcargs: "CURRENT_PROJECT_VERSION=#{options[:versions][:build_number]} " \
+            "MARKETING_VERSION=#{options[:versions][:version_number]}",
+    # Errors only on the CI stream: a GitLab job log is cut off at 4 MB,
+    # and a build's warnings alone were enough to push the error that
+    # failed it past the cut.  The full xcodebuild log is in buildlog/.
+    xcodebuild_formatter: 'xcbeautify --quieter',
     buildlog_path: "buildlog",
+    derived_data_path: "build/DerivedData",
+    archive_path: "build/RetroArch.xcarchive",
+    output_directory: "build",
     export_method: "app-store",
+    include_symbols: true,
     export_options: {
       provisioningProfiles: options[:provisioningProfiles]
     }
   )
 end
 
+private_lane :ra_prior_build_in_review do
+  platform_map = { mac: "MAC_OS", ios: "IOS", appletvos: "TV_OS" }
+  plat = platform_map[lane_context[SharedValues::PLATFORM_NAME]]
+  app_id = CredentialsManager::AppfileConfig.try_fetch_value(:app_identifier)
+  in_review = false
+  begin
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    # Build.all takes no filter and pages through every build the app
+    # has; one page of the newest few, with their review submissions,
+    # is all this needs.
+    builds = Spaceship::ConnectAPI.get_builds(
+      filter: { app: app.id, "preReleaseVersion.platform" => plat },
+      includes: "preReleaseVersion,betaAppReviewSubmission",
+      sort: "-uploadedDate",
+      limit: 5
+    ).to_models
+    in_review = builds.any? do |b|
+      state = b.beta_app_review_submission&.beta_review_state
+      state == "WAITING_FOR_REVIEW" || state == "IN_REVIEW"
+    end
+  rescue => ex
+    UI.important("Could not check prior build review state (#{ex.message}); proceeding as configured")
+  end
+  in_review
+end
+
 private_lane :ra_upload_to_testflight do |options|
   if options[:upload].nil? or options[:upload]
-    info = last_git_commit
-    short_hash = info[:abbreviated_commit_hash]
-    upload_to_testflight(
-      distribute_external: (options[:public].nil? || options[:public]),
-      groups: options[:public].nil? || options[:public] ? ['Invaders', 'Patreons'] : [],
-      changelog: "Rebuild frontend for commit #{short_hash}"
-    )
+    short_hash = nil
+    version_file = File.expand_path("../../../.git_version.h", Dir.pwd)
+    if File.exist?(version_file)
+      content = File.read(version_file)
+      match  = content.match(/#define\s+GIT_VERSION\s+([0-9a-fA-F]+)/)
+      if match
+        short_hash = match[1]
+        UI.message "Using commit from .git_version.h: #{short_hash}"
+      else
+        UI.message ".git_version.h found but no GIT_VERSION; falling back to git"
+      end
+    end
+    if short_hash.nil?
+      info       = last_git_commit
+      short_hash = info[:abbreviated_commit_hash]
+      UI.message "Using git commit from repo: #{short_hash}"
+    end
+
+    make_public = options[:public].nil? || options[:public]
+    if make_public && ra_prior_build_in_review
+      UI.important("A prior build is currently in TestFlight review; uploading without sending this nightly to the testers")
+      make_public = false
+    end
+
+    # A nightly held back from the testers is uploaded with no groups,
+    # not an empty list: pilot submits for beta review whenever groups
+    # are given at all. The next nightly after the review goes out.
+    # The review check above runs before the build's processing wait,
+    # so a build that went into review meanwhile still refuses the
+    # submission; the upload itself has landed by then.
+    begin
+      upload_to_testflight(
+        distribute_external: make_public,
+        submit_beta_review: make_public,
+        groups: make_public ? ['Invaders', 'Patreons'] : nil,
+        changelog: "Rebuild frontend for commit #{short_hash}"
+      )
+    rescue Spaceship::UnexpectedResponse => ex
+      raise unless ex.message.include?("Another build is in review")
+      UI.important("Uploaded; held back from the testers, another build is in review")
+    end
   end
 end
 
 platform :mac do
   desc doc
   lane :build do |options|
-    options[:plist_path] = "OSX/Info_AppStore.plist"
-
     ra_appstore_login
 
     ra_reset_git_repo(options)
 
-    ra_update_versions(options)
+    versions = ra_update_versions(options)
 
     ra_build_app(
       scheme: "RetroArch AppStore",
+      versions: versions,
       provisioningProfiles: {
         "com.libretro.dist.RetroArch" => "macOS App Store"
       }
@@ -208,13 +279,11 @@ end
 platform :ios do
   desc doc
   lane :build do |options|
-    options[:plist_path] = "iOS/Info.plist"
-
     ra_appstore_login
 
     ra_reset_git_repo(options)
 
-    ra_update_versions(options)
+    versions = ra_update_versions(options)
 
     ra_update_signing(
       app_target: "RetroArchiOS",
@@ -226,6 +295,7 @@ platform :ios do
 
     ra_build_app(
       scheme: "RetroArch iOS Release",
+      versions: versions,
       xcconfig: "iOS/AppStore.xcconfig",
       provisioningProfiles: {
         "com.libretro.dist.RetroArch" => "App Store Distribution",
@@ -240,13 +310,11 @@ end
 platform :appletvos do
   desc doc
   lane :build do |options|
-    options[:plist_path] = "tvOS/Info.plist"
-
     ra_appstore_login
 
     ra_reset_git_repo(options)
 
-    ra_update_versions(options)
+    versions = ra_update_versions(options)
 
     ra_update_signing(
       app_target: "RetroArchTV",
@@ -258,6 +326,7 @@ platform :appletvos do
 
     ra_build_app(
       scheme: "RetroArch tvOS Release",
+      versions: versions,
       xcconfig: "iOS/AppStore.xcconfig",
       provisioningProfiles: {
         "com.libretro.dist.RetroArch" => "tvOS App Store",

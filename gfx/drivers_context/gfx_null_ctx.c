@@ -19,27 +19,24 @@
 #include "../../retroarch.h"
 
 static void gfx_ctx_null_get_video_size(
-      void *data, unsigned *width, unsigned *height)
+      void *data, unsigned *dims)
 {
 #ifdef VITA
-   *width  = 960;
-   *height = 544;
+   *dims = VIDEO_SCALE_PACK(960, 544);
 #else
-   *width  = 320;
-   *height = 240;
+   *dims = VIDEO_SCALE_PACK(320, 240);
 #endif
 }
 
 static void gfx_ctx_null_swap_interval(void *data, int interval) { }
 static void gfx_ctx_null_check_window(void *data, bool *quit,
-      bool *resize, unsigned *width, unsigned *height) { }
+      bool *resize, unsigned *dims) { }
 static bool gfx_ctx_null_set_video_mode(void *data,
-      unsigned width, unsigned height,
+      unsigned dims,
       bool fullscreen) { return true; }
 static void gfx_ctx_null_destroy(void *data) { }
 static void gfx_ctx_null_input_driver(void *data,
-      const char *name,
-      input_driver_t **input, void **input_data) { }
+      const char *name) { }
 static bool gfx_ctx_null_has_focus(void *data) { return true; }
 static bool gfx_ctx_null_suppress_screensaver(void *data, bool enable) { return false; }
 static enum gfx_ctx_api gfx_ctx_null_get_api(void *data) { return GFX_CTX_NONE; }
@@ -81,5 +78,7 @@ const gfx_ctx_driver_t gfx_ctx_null = {
    gfx_ctx_null_set_flags,
    gfx_ctx_null_bind_hw_render,
    NULL,
-   NULL
+   NULL,
+   NULL, /* create_surface */
+   NULL  /* destroy_surface */
 };

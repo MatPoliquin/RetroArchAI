@@ -20,8 +20,12 @@
 #include <math.h>
 
 #include <compat/strl.h>
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+#include <retro_timers.h>
+#endif
 #include <features/features_cpu.h>
-#include <string/stdstring.h>
+#include <memalign.h>
+#include <gfx/video_frame.h>
 
 #ifdef _3DS
 #include <3ds/types.h>
@@ -30,112 +34,986 @@
 
 #include "video_driver.h"
 #include "video_thread_wrapper.h"
+#include "gfx_instrument.h"
+
+/* Float <-> bits for the overlay alpha atomics. */
+static INLINE int video_thread_float_bits(float f)
+{
+   int b;
+   memcpy(&b, &f, sizeof(b));
+   return b;
+}
+static INLINE float video_thread_bits_float(int b)
+{
+   float f;
+   memcpy(&f, &b, sizeof(f));
+   return f;
+}
+
+/* The viewport the video thread just took from the driver, and the rate
+ * that came back with it. Video thread only, and that is the whole of
+ * the serialisation: no other thread writes either one. */
+static void video_thread_publish_vp(thread_video_t *thr,
+      const struct video_viewport *vp)
+{
+   retro_atomic_int_t *s = thr->vp_pub;
+   int seq               = retro_atomic_load_relaxed_int(&thr->vp_seq);
+
+   retro_atomic_store_relaxed_int(&thr->vp_seq, seq + 1);
+   retro_atomic_thread_fence_release();
+   retro_atomic_store_relaxed_int(&s[VIDEO_THREAD_VP_POS],
+         (int)vp->pos);
+   retro_atomic_store_relaxed_int(&s[VIDEO_THREAD_VP_WH],
+         (int)vp->dims);
+   retro_atomic_store_relaxed_int(&s[VIDEO_THREAD_VP_FULL_WH],
+         (int)vp->full_dims);
+   retro_atomic_thread_fence_release();
+   retro_atomic_store_release_int(&thr->vp_seq, seq + 2);
+}
+
+static void video_thread_read_vp(thread_video_t *thr,
+      struct video_viewport *vp)
+{
+   retro_atomic_int_t *s = thr->vp_pub;
+   for (;;)
+   {
+      unsigned wh;
+      unsigned full;
+      int s1 = retro_atomic_load_acquire_int(&thr->vp_seq);
+      if (s1 & 1)
+         continue;
+      wh              = (unsigned)retro_atomic_load_relaxed_int(
+            &s[VIDEO_THREAD_VP_WH]);
+      full            = (unsigned)retro_atomic_load_relaxed_int(
+            &s[VIDEO_THREAD_VP_FULL_WH]);
+      vp->pos         = (unsigned)retro_atomic_load_relaxed_int(
+            &s[VIDEO_THREAD_VP_POS]);
+      vp->dims        = wh;
+      vp->full_dims   = full;
+      retro_atomic_thread_fence_acquire();
+      if (retro_atomic_load_relaxed_int(&thr->vp_seq) == s1)
+         break;
+   }
+}
+#ifdef HAVE_GFX_WIDGETS
+#include "gfx_widgets.h"
+#endif
 #include "font_driver.h"
+#ifdef HAVE_VIDEO_FILTER
+#include "video_filter.h"
+#endif
 
 #include "../retroarch.h"
 #include "../runloop.h"
 #include "../verbosity.h"
+#include "../frontend/thread_elevation.h"
 
-static void *video_thread_init_never_call(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+#include <retro_assert.h>
+
+#include "video_thread_hw.h"
+
+/* The reply carries one command's answer, so at most one thread may
+ * wait for it; see the note in video_thread_wrapper.h. Every reply
+ * wait is bracketed by these; only the poster slot's owner waits, so
+ * the counter needs no atomics. */
+#ifdef DEBUG
+#define VIDEO_THREAD_CMD_WAIT_ENTER(thr) \
+   do { \
+      uintptr_t self_ = sthread_get_current_thread_id(); \
+      retro_assert(   (thr)->reply_waiters == 0 \
+                   || (thr)->reply_waiter  == self_); \
+      (thr)->reply_waiter = self_; \
+      (thr)->reply_waiters++; \
+   } while (0)
+#else
+/* Release builds pay nothing; the fields exist unconditionally only so
+ * that the struct layout does not vary with the build type. */
+#define VIDEO_THREAD_CMD_WAIT_ENTER(thr) do { } while (0)
+#endif
+#ifdef DEBUG
+#define VIDEO_THREAD_CMD_WAIT_LEAVE(thr) \
+   do { (thr)->reply_waiters--; } while (0)
+#else
+#define VIDEO_THREAD_CMD_WAIT_LEAVE(thr) do { } while (0)
+#endif
+
+/* The frame ring's word: the sole synchronisation between the push and
+ * the video thread's claim and completion. Every reader of the ring
+ * loads it once and derives tail, pending and busy from the copy. */
+static INLINE int video_thread_ring_load(thread_video_t *thr)
+{
+   return retro_atomic_load_acquire_int(&thr->frame.state);
+}
+
+/* One round of waiting for the ring to move on from 'state': parks on
+ * frame.ring unless the word has already changed, for at most
+ * timeout_us (negative: no bound). A caller loops on its own
+ * predicate; whichever thread moves the word notifies. */
+static VIDEO_NOINLINE void video_thread_ring_sleep(thread_video_t *thr, int state,
+      int64_t timeout_us)
+{
+   int key = retro_eventcount_prepare_wait(&thr->frame.ring);
+   if (retro_atomic_load_acquire_int(&thr->frame.state) != state)
+   {
+      retro_eventcount_cancel_wait(&thr->frame.ring);
+      return;
+   }
+   if (timeout_us < 0)
+      retro_eventcount_commit_wait(&thr->frame.ring, key);
+   else
+      retro_eventcount_commit_wait_timeout(&thr->frame.ring, key, timeout_us);
+}
+
+/* Main thread: waits until no frame is queued or being rendered. On the
+ * main thread of an Apple build the wait is sliced so the worker's
+ * marshalled main-thread jobs can run in between, as the reply waits
+ * do; a wait of one tick, and otherwise unbounded. */
+static bool video_thread_is_self(thread_video_t *thr);
+
+static VIDEO_NOINLINE void video_thread_ring_drain(thread_video_t *thr)
+{
+   /* The claimed frame completes only once the video thread has the
+    * one GL context: a caller holding it gives it up for the wait. */
+   bool held = video_thread_hw_ctx_held(thr)
+      && !video_thread_is_self(thr)
+      && video_thread_hw_ctx_release(thr, false);
+   for (;;)
+   {
+      int st = video_thread_ring_load(thr);
+      if (     !VIDEO_THREAD_RING_PENDING_OF(st)
+            && !VIDEO_THREAD_RING_BUSY_OF(st))
+         break;
+#ifdef __APPLE__
+      video_thread_ring_sleep(thr, st, 1000);
+      video_thread_main_pump();
+#else
+      video_thread_ring_sleep(thr, st, -1);
+#endif
+   }
+   if (held)
+      video_thread_hw_ctx_take(thr, false);
+}
+
+/* Host memory for frame buffers: cache-line aligned, and on the 3DS
+ * from the linear heap the GPU reads */
+static uint8_t *video_thread_host_alloc(size_t size)
+{
+   uint8_t *p;
+#ifdef _3DS
+   p = (uint8_t*)linearMemAlign(size, 0x80);
+#else
+   p = (uint8_t*)memalign_alloc(64, size);
+#endif
+   if (p)
+      memset(p, 0x80, size);
+   return p;
+}
+
+static void video_thread_host_free(uint8_t *p)
+{
+   if (!p)
+      return;
+#ifdef _3DS
+   linearFree(p);
+#else
+   memalign_free(p);
+#endif
+}
+
+/* Main thread: whether frame buffer @i may be written now */
+static INLINE bool video_thread_mem_writable(thread_video_t *thr, int i)
+{
+   return i >= 0 && !retro_atomic_load_acquire_int(&thr->frame.mem[i].busy);
+}
+
+static INLINE bool video_thread_mem_held(thread_video_t *thr, int i)
+{
+   return i == thr->frame.slot[0].mem || i == thr->frame.slot[1].mem
+       || i == thr->frame.spare_mem;
+}
+
+/* Which frame buffers video_thread_mem_take_from() takes */
+#define VIDEO_THREAD_TAKE_ANY    0 /* the driver's before host memory */
+#define VIDEO_THREAD_TAKE_HOST   1 /* host memory only */
+#define VIDEO_THREAD_TAKE_DRIVER 2 /* the driver's only, none made */
+
+/* Main thread: a frame buffer neither slot nor the spare holds and no
+ * frame in flight reads, as @take says; a new host buffer when host
+ * memory will do and there is none. -1 when there is none to be had. */
+static int video_thread_mem_take_from(thread_video_t *thr, int take)
+{
+   int i, host = -1, empty = -1;
+   for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+   {
+      if (!thr->frame.mem[i].ptr)
+      {
+         if (empty < 0)
+            empty = i;
+         continue;
+      }
+      if (     video_thread_mem_held(thr, i)
+            || thr->frame.mem[i].size < thr->frame.buffer_size
+            || !video_thread_mem_writable(thr, i))
+         continue;
+      if (thr->frame.mem[i].id)
+      {
+         if (take != VIDEO_THREAD_TAKE_HOST)
+            return i;
+      }
+      else if (host < 0)
+         host = i;
+   }
+   if (take == VIDEO_THREAD_TAKE_DRIVER)
+      return -1;
+   if (host >= 0)
+      return host;
+   if (     empty >= 0
+         && (thr->frame.mem[empty].ptr =
+            video_thread_host_alloc(thr->frame.buffer_size)))
+   {
+      thr->frame.mem[empty].size   = thr->frame.buffer_size;
+      thr->frame.mem[empty].id     = 0;
+      thr->frame.mem[empty].cached = true;
+      return empty;
+   }
+   return -1;
+}
+
+/* Main thread: frame buffer @cur, or another to write in its place -
+ * the driver's frame memory where @cur is host memory and one is free,
+ * any when @cur is still read by a frame in flight. -1 for none. */
+static int video_thread_mem_writable_for(thread_video_t *thr, int cur)
+{
+   int i;
+   bool ok = video_thread_mem_writable(thr, cur);
+   if (ok && thr->frame.mem[cur].id)
+      return cur;
+   if ((i = video_thread_mem_take_from(thr, VIDEO_THREAD_TAKE_DRIVER)) >= 0)
+      return i;
+   if (ok)
+      return cur;
+   return video_thread_mem_take_from(thr, VIDEO_THREAD_TAKE_ANY);
+}
+
+/* Main thread: the spare, taken when a loan needs one, moved into the
+ * driver's frame memory where it can be, and away from a buffer a frame
+ * in flight still reads. Any frame buffer fits a slot, since a push
+ * swaps the spare into one. */
+static bool video_thread_spare_take(thread_video_t *thr)
+{
+   int i = video_thread_mem_writable_for(thr, thr->frame.spare_mem);
+   if (i < 0)
+   {
+      thr->frame.spare_mem = -1;
+      thr->frame.spare     = NULL;
+      return false;
+   }
+   thr->frame.spare_mem = i;
+   thr->frame.spare     = thr->frame.mem[i].ptr;
+   return true;
+}
+
+/* Main thread: slot @s's buffer, moved as the spare is; false when it
+ * is read by a frame in flight and there is none to move to */
+static bool video_thread_slot_writable(thread_video_t *thr, unsigned s)
+{
+   int i = video_thread_mem_writable_for(thr, thr->frame.slot[s].mem);
+   if (i < 0)
+      return false;
+   thr->frame.slot[s].mem    = i;
+   thr->frame.slot[s].buffer = thr->frame.mem[i].ptr;
+   return true;
+}
+
+/* Video thread: the busy frame buffers the driver has finished reading
+ * go back to the main thread */
+static void video_thread_mem_poll(thread_video_t *thr)
+{
+   unsigned m = thr->frame.mem_busy;
+   while (m)
+   {
+      unsigned i = 0;
+      while (!(m & (1u << i)))
+         i++;
+      m &= ~(1u << i);
+      if (thr->frame.mem_poke->frame_mem_ready(thr->driver_data,
+               thr->frame.mem[i].id))
+      {
+         thr->frame.mem_busy &= ~(1u << i);
+         retro_atomic_store_release_int(&thr->frame.mem[i].busy, 0);
+      }
+   }
+}
+
+static void video_thread_mem_release(thread_video_t *thr, int i)
+{
+   thr->frame.mem_poke->frame_mem_free(thr->driver_data,
+         thr->frame.mem[i].id);
+   thr->frame.mem_busy      &= ~(1u << i);
+   retro_atomic_store_release_int(&thr->frame.mem[i].busy, 0);
+   thr->frame.mem[i].ptr     = NULL;
+   thr->frame.mem[i].size    = 0;
+   thr->frame.mem[i].id      = 0;
+}
+
+/* Video thread, the main thread waiting on it: the slots move into the
+ * driver's frame memory, so a frame the push copied in, or the core
+ * rendered into, goes up from where it lies. What is too small for the
+ * slots goes first; the host buffers stay, for when every one of the
+ * driver's is in flight. A driver without frame memory keeps them. */
+static void video_thread_mem_provision(thread_video_t *thr)
+{
+   const video_poke_interface_t *poke = thr->frame.mem_poke;
+   unsigned have = 0;
+   int i, s;
+
+   if (     !thr->driver_data || !poke || !poke->frame_mem_alloc
+         || !poke->frame_mem_ready || !poke->frame_mem_free)
+      return;
+
+   for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+   {
+      if (!thr->frame.mem[i].id)
+         continue;
+      if (     thr->frame.mem[i].size >= thr->frame.buffer_size
+            || video_thread_mem_held(thr, i))
+         have++;
+      else
+         video_thread_mem_release(thr, i);
+   }
+   for (i = 0; i < VIDEO_THREAD_FRAME_MEM
+         && have < VIDEO_THREAD_FRAME_MEM_DRIVER; i++)
+   {
+      uintptr_t id = 0;
+      bool cached  = false;
+      void *p;
+      if (thr->frame.mem[i].ptr)
+         continue;
+      if (!(p = poke->frame_mem_alloc(thr->driver_data,
+                  thr->frame.buffer_size, &id, &cached,
+                  &thr->frame.pitch_align)))
+         break;
+      thr->frame.mem[i].ptr    = (uint8_t*)p;
+      thr->frame.mem[i].size   = thr->frame.buffer_size;
+      thr->frame.mem[i].id     = id;
+      thr->frame.mem[i].cached = cached;
+      have++;
+   }
+   /* A slot lent to the core stays where the core is writing */
+   for (s = 0; s < 2; s++)
+   {
+      if (     thr->frame.mem[thr->frame.slot[s].mem].id
+            || s == thr->frame.lent)
+         continue;
+      for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+         if (     thr->frame.mem[i].id
+               && thr->frame.mem[i].size >= thr->frame.buffer_size
+               && !video_thread_mem_held(thr, i))
+         {
+            thr->frame.slot[s].mem    = i;
+            thr->frame.slot[s].buffer = thr->frame.mem[i].ptr;
+            break;
+         }
+   }
+}
+
+/* Video thread, before the driver goes: its frame memory goes with it,
+ * and the slots back to host memory */
+static void video_thread_mem_unprovision(thread_video_t *thr)
+{
+   int i, s;
+   /* Two host buffers always remain (init, slots_fit), and with the
+    * spare let go neither is held unless a slot holds it */
+   thr->frame.spare_mem = -1;
+   thr->frame.spare     = NULL;
+   for (s = 0; s < 2; s++)
+   {
+      if (!thr->frame.mem[thr->frame.slot[s].mem].id)
+         continue;
+      for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+         if (     thr->frame.mem[i].ptr && !thr->frame.mem[i].id
+               && !video_thread_mem_held(thr, i))
+         {
+            thr->frame.slot[s].mem    = i;
+            thr->frame.slot[s].buffer = thr->frame.mem[i].ptr;
+            break;
+         }
+   }
+   for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+      if (thr->frame.mem[i].id)
+         video_thread_mem_release(thr, i);
+}
+
+static void *video_thread_init_never_call(const video_info_t *video)
 {
    (void)video;
-   (void)input;
-   (void)input_data;
    RARCH_ERR("Sanity check fail! Threaded mustn't be reinit.\n");
    abort();
    return NULL;
 }
 
+/* The async lists. On the volatile atomic backend, which has no pointer
+ * atomics, a push and a take are made under 'lock' instead. */
+#define VIDEO_THREAD_ASYNC_NEXT(n) \
+   ((video_thread_async_load_t*)(n)->link.next)
+
+static void video_thread_async_push(thread_video_t *thr, mpsc_stack_t *list,
+      video_thread_async_load_t *n)
+{
+#ifndef RETRO_ATOMIC_HAS_PTR
+   slock_lock(thr->lock);
+#endif
+   mpsc_stack_push(list, &n->link);
+#ifndef RETRO_ATOMIC_HAS_PTR
+   slock_unlock(thr->lock);
+#endif
+}
+
+/* The whole list, oldest first. */
+static video_thread_async_load_t *video_thread_async_take(
+      thread_video_t *thr, mpsc_stack_t *list)
+{
+   mpsc_stack_node_t *l;
+   mpsc_stack_node_t *oldest = NULL;
+   if (mpsc_stack_empty(list))
+      return NULL;
+#ifndef RETRO_ATOMIC_HAS_PTR
+   slock_lock(thr->lock);
+#endif
+   l = mpsc_stack_drain(list);
+#ifndef RETRO_ATOMIC_HAS_PTR
+   slock_unlock(thr->lock);
+#endif
+   while (l)
+   {
+      mpsc_stack_node_t *next = l->next;
+      l->next = oldest;
+      oldest  = l;
+      l       = next;
+   }
+   return (video_thread_async_load_t*)oldest;
+}
+
 /* thread -> user */
 static void video_thread_reply(thread_video_t *thr, const thread_packet_t *pkt)
 {
-   slock_lock(thr->lock);
+   if (thr->inline_reply)
+   {
+      *thr->inline_reply = *pkt;
+      return;
+   }
 
+   /* The mailbox is this thread's until the reply is published, and
+    * the command is taken down before it is: the poster may send its
+    * next one the moment it sees the reply. */
    thr->cmd_data  = *pkt;
-
-   thr->reply_cmd = pkt->type;
-   thr->send_cmd  = CMD_VIDEO_NONE;
-
-   scond_signal(thr->cond_cmd);
-   slock_unlock(thr->lock);
+   retro_atomic_store_relaxed_int(&thr->send_cmd, CMD_VIDEO_NONE);
+   retro_atomic_store_release_int(&thr->reply_cmd, pkt->type);
+   retro_eventcount_notify(&thr->reply_ec);
 }
 
-/* user -> thread */
+/* user -> thread. The poster slot is held: the mailbox is ours until
+ * the command is published. */
 static void video_thread_send_packet(thread_video_t *thr,
       const thread_packet_t *pkt)
 {
-   slock_lock(thr->lock);
-
    thr->cmd_data  = *pkt;
+   retro_atomic_store_relaxed_int(&thr->reply_cmd, CMD_VIDEO_NONE);
+   /* Counted from the send, not from the wait that follows it: the
+    * video thread may take the command and ask for a call on this
+    * thread before this thread has reached its wait. */
+   retro_atomic_fetch_add_int(&thr->waiter_call.waiters, 1);
+   /* Published last: the video thread tests it, then reads cmd_data */
+   retro_atomic_store_release_int(&thr->send_cmd, pkt->type);
 
-   thr->send_cmd  = pkt->type;
-   thr->reply_cmd = CMD_VIDEO_NONE;
+   retro_eventcount_notify(&thr->work);
+}
 
-   scond_signal(thr->cond_thread);
-   slock_unlock(thr->lock);
+/* As video_thread_send_packet(), but drops the packet and reports
+ * failure once the worker takes no more commands (CMD_FREE). The
+ * poster slot is held, and CMD_FREE is a command sent under it, so
+ * the worker cannot stop between the test and the send. */
+static bool video_thread_send_packet_if_running(thread_video_t *thr,
+      const thread_packet_t *pkt)
+{
+   if (!retro_atomic_load_acquire_int(&thr->worker_running))
+      return false;
+   video_thread_send_packet(thr, pkt);
+   return true;
+}
 
+/* Commits a wait prepared on @ec. A main-thread waiter on Apple comes
+ * up every millisecond to drain the cocoa main-thread trampoline, so
+ * work the worker marshals back via cocoa_main_thread_sync() runs and
+ * the handshake does not deadlock (the worker blocks on the main
+ * thread while the main thread blocks on the reply). Pumping only the
+ * trampoline's private mode keeps draw observers, timers and input
+ * sources from running reentrantly under the wait. */
+static void video_thread_commit_wait(retro_eventcount_t *ec, int key)
+{
+#ifdef __APPLE__
+   if (sthread_is_main_thread())
+   {
+      void cocoa_main_thread_pump(void);
+      retro_eventcount_commit_wait_timeout(ec, key, 1000);
+      cocoa_main_thread_pump();
+      return;
+   }
+#endif
+   retro_eventcount_commit_wait(ec, key);
+}
+
+/* True when the caller is the video thread itself. A marshalled call
+ * that reaches the wrapper from inside driver->frame() - the menu
+ * drivers do this with set_viewport - must go to the driver directly:
+ * sending a command from the thread that answers commands waits on
+ * itself forever. */
+static bool video_thread_is_self(thread_video_t *thr)
+{
+   return thr->thread
+       && sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id();
+}
+
+static bool video_thread_reply_ready(thread_video_t *thr,
+      const thread_packet_t *pkt)
+{
+   return    retro_atomic_load_acquire_int(&thr->reply_cmd) == (int)pkt->type
+          || retro_atomic_load_acquire_int(&thr->waiter_call.pending);
 }
 
 /* user -> thread */
 static void video_thread_wait_reply(thread_video_t *thr, thread_packet_t *pkt)
 {
-   slock_lock(thr->lock);
-
-   while (pkt->type != thr->reply_cmd)
-      scond_wait(thr->cond_cmd, thr->lock);
+   VIDEO_THREAD_CMD_WAIT_ENTER(thr);
+   for (;;)
+   {
+      int key;
+      if (retro_atomic_load_acquire_int(&thr->reply_cmd) == (int)pkt->type)
+         break;
+      if (retro_atomic_load_acquire_int(&thr->waiter_call.pending))
+      {
+         /* The video thread needs this thread: run its call here, and
+          * tell it. */
+         retro_atomic_store_relaxed_int(&thr->waiter_call.pending, 0);
+         thr->waiter_call.fn(thr->waiter_call.data);
+         retro_atomic_store_release_int(&thr->waiter_call.done, 1);
+         retro_eventcount_notify(&thr->reply_ec);
+         continue;
+      }
+      key = retro_eventcount_prepare_wait(&thr->reply_ec);
+      if (video_thread_reply_ready(thr, pkt))
+      {
+         retro_eventcount_cancel_wait(&thr->reply_ec);
+         continue;
+      }
+      video_thread_commit_wait(&thr->reply_ec, key);
+   }
+   retro_atomic_fetch_sub_int(&thr->waiter_call.waiters, 1);
+   VIDEO_THREAD_CMD_WAIT_LEAVE(thr);
 
    *pkt               = thr->cmd_data;
    thr->cmd_data.type = CMD_VIDEO_NONE;
+}
 
-   slock_unlock(thr->lock);
+/* user -> thread: take the poster slot. Waits while another thread's
+ * command is in flight, until its reply has been consumed.
+ *
+ * A main-thread waiter pumps the cocoa trampoline here as it does in
+ * video_thread_wait_reply(): the slot holder's command may itself be
+ * blocked in cocoa_main_thread_sync() waiting on the main thread, so a
+ * plain wait here would close the cycle.
+ *
+ * The slot is counted rather than exclusive so that a re-entry from the
+ * owning thread does not deadlock on itself. That is the only thing the
+ * depth buys: a command posted from inside the trampoline while the
+ * worker is blocked in cocoa_main_thread_sync() has nobody to service
+ * it and overwrites the mailbox under the outstanding command, which is
+ * the same failure this slot exists to prevent. Nested posting is a bug
+ * in the caller, not a supported path. */
+static void video_thread_user_acquire(thread_video_t *thr)
+{
+   uintptr_t self = sthread_get_current_thread_id();
+
+   /* Only this thread ever stores its own id here. */
+   if ((uintptr_t)retro_atomic_load_acquire_size(&thr->user_owner) != self)
+   {
+      for (;;)
+      {
+         int key;
+         if (retro_atomic_cas_int(&thr->user_busy, 0, 1))
+            break;
+         key = retro_eventcount_prepare_wait(&thr->user_ec);
+         if (!retro_atomic_load_acquire_int(&thr->user_busy))
+         {
+            retro_eventcount_cancel_wait(&thr->user_ec);
+            continue;
+         }
+         video_thread_commit_wait(&thr->user_ec, key);
+      }
+      retro_atomic_store_release_size(&thr->user_owner, (size_t)self);
+   }
+   thr->user_depth++;
+}
+
+static void video_thread_user_release(thread_video_t *thr)
+{
+   if (--thr->user_depth == 0)
+   {
+      retro_atomic_store_release_size(&thr->user_owner, 0);
+      retro_atomic_store_release_int(&thr->user_busy, 0);
+      retro_eventcount_notify(&thr->user_ec);
+   }
 }
 
 /* user -> thread */
+static bool video_thread_handle_packet(thread_video_t *thr,
+      const thread_packet_t *incoming);
+typedef struct video_thread_tex_retire video_thread_tex_retire_t;
+
+static void video_thread_tex_retire_run(thread_video_t *thr,
+      video_thread_tex_retire_t *list);
+static void video_thread_lend_forget(thread_video_t *thr, uintptr_t id);
+
+/* Queues a command the caller wants nothing back from, for the video
+ * thread to run on its next pass. False when it could not be queued -
+ * no thread to run it, or the queue is full - and the caller sends it
+ * the waiting way instead. */
+static bool video_thread_defer_packet(thread_video_t *thr,
+      const thread_packet_t *pkt)
+{
+   int head, tail;
+
+   if (     !thr->thread
+         || sthread_get_thread_id(thr->thread)
+            == sthread_get_current_thread_id())
+      return false;
+
+   /* The worker still takes commands, as for the waiting send: 'alive'
+    * is the window's answer and goes false while it still runs. */
+   if (     !thr->deferred
+         || !retro_atomic_load_acquire_int(&thr->worker_running))
+      return false;
+
+   /* This thread owns head, so it may read it plainly; tail is the
+    * video thread's and is read with an acquire. */
+   head = retro_atomic_load_acquire_int(&thr->deferred_head);
+   tail = retro_atomic_load_acquire_int(&thr->deferred_tail);
+   if (head - tail >= VIDEO_THREAD_DEFERRED_MAX)
+      return false;
+
+   thr->deferred[head & (VIDEO_THREAD_DEFERRED_MAX - 1)] = *pkt;
+   /* The packet is written before the video thread is told it is
+    * there. */
+   retro_atomic_store_release_int(&thr->deferred_head, head + 1);
+
+   /* A ring that was empty may have a sleeping thread to wake. A ring
+    * that was not empty has a thread that cannot sleep before draining
+    * it, so a burst notifies once rather than once a packet. */
+   if (head == tail)
+      retro_eventcount_notify(&thr->work);
+
+   return true;
+}
+
+/* Video thread: runs what was queued, with the replies going nowhere -
+ * inline_reply is what the handlers write to, and no sender is waiting
+ * on one. */
+static void video_thread_run_deferred(thread_video_t *thr)
+{
+   thread_packet_t sink;
+   thread_packet_t *saved_reply;
+   int head, tail;
+
+   if (!thr->deferred)
+      return;
+
+   /* The empty check is one load of the producer's index: no lock, and
+    * nothing copied, on a pass with nothing queued. */
+   tail = retro_atomic_load_acquire_int(&thr->deferred_tail);
+   if ((head = retro_atomic_load_acquire_int(&thr->deferred_head)) == tail)
+      return;
+
+   saved_reply       = thr->inline_reply;
+   thr->inline_reply = &sink;
+   /* Run where they lie: the producer cannot reuse a slot before tail
+    * says it is free, which is after the packet has run. */
+   for (; tail != head; tail++)
+   {
+      video_thread_handle_packet(thr,
+            &thr->deferred[tail & (VIDEO_THREAD_DEFERRED_MAX - 1)]);
+      retro_atomic_store_release_int(&thr->deferred_tail, tail + 1);
+   }
+   thr->inline_reply = saved_reply;
+}
+
 static void video_thread_send_and_wait_user_to_thread(thread_video_t *thr, thread_packet_t *pkt)
 {
-   video_thread_send_packet(thr, pkt);
-   video_thread_wait_reply(thr, pkt);
+   GFX_INSTR_INC(GFX_INSTR_WRAPPER_CMD);
+   /* On the video thread already - a wrapper entry point reached from
+    * inside driver->frame(), as the menu drivers do with set_viewport -
+    * the command runs here and now. Sending it would wait for a reply
+    * from the only thread that could give one. The reply lands in the
+    * caller's packet, leaving the mailbox to whatever the main thread
+    * may have sent meanwhile. */
+   if (video_thread_is_self(thr))
+   {
+      /* Saved and put back, not cleared: this can be reached from
+       * inside another packet's handler, and leaving NULL behind would
+       * send that one's reply to the mailbox - where it would answer,
+       * or cancel, whatever the main thread is waiting on. */
+      thread_packet_t *saved_reply = thr->inline_reply;
+      thr->inline_reply            = pkt;
+      video_thread_handle_packet(thr, pkt);
+      thr->inline_reply            = saved_reply;
+      return;
+   }
+
+   {
+      /* The video thread may need the one context to answer; a main
+       * thread holding it would wait for a reply that waits for it. */
+      bool held = video_thread_hw_ctx_release(thr, false);
+      video_thread_user_acquire(thr);
+      video_thread_send_packet(thr, pkt);
+      video_thread_wait_reply(thr, pkt);
+      video_thread_user_release(thr);
+      if (held)
+         video_thread_hw_ctx_take(thr, false);
+   }
 }
+
+void video_thread_main_pump(void)
+{
+#ifdef __APPLE__
+   void cocoa_main_thread_pump(void);
+   cocoa_main_thread_pump();
+#endif
+}
+
+/* The wrapper instance, captured on the main thread at init and
+ * cleared at free: the entry points below are callable from the
+ * video thread itself (fonts and textures live there under the
+ * wrapper), and they reach the wrapper through this capture, never
+ * through the video singleton's getter. Pointer-stable for exactly
+ * the window in which the video thread exists. */
+static thread_video_t *video_thread_thr_capture;
+
+/* The core's thread takes the one context around the core's work and
+ * gives it up between, so the video thread can draw while the core is
+ * not running (the menu over a paused core). No-ops without a ring
+ * that hands off. */
+void video_thread_core_context_take(void)
+{
+   thread_video_t *thr = video_thread_thr_capture;
+   if (thr)
+      video_thread_hw_ctx_take(thr, false);
+}
+
+void video_thread_core_context_release(void)
+{
+   thread_video_t *thr = video_thread_thr_capture;
+   if (thr)
+      video_thread_hw_ctx_release(thr, false);
+}
+
+
+/* The instance video_thread_free() is tearing down, for the length of
+ * its CMD_FREE. The capture is cleared before that command is sent,
+ * but the command is where the driver and the hardware ring are freed,
+ * and both hand work back to the main thread from inside it - the ring
+ * gives up the core's GL context there, which only the thread holding
+ * it can do. With only the capture to go by, that call found no
+ * wrapper and was dropped without a word: the context stayed current
+ * on the main thread, and the video thread's own teardown then tried
+ * to take it - fatal on GLX (BadAccess), a failed wglMakeCurrent and a
+ * context that cannot be deleted on WGL. */
+static thread_video_t *video_thread_thr_freeing;
+
+void video_thread_call_on_waiter(void (*fn)(void *data), void *data)
+{
+   thread_video_t *thr = video_thread_thr_capture;
+   if (!fn)
+      return;
+   if (!thr)
+      thr = video_thread_thr_freeing;
+   /* No wrapper at all: the call is the caller's to make, as it is in
+    * a build without threads. Never dropped. */
+   if (!thr)
+   {
+      fn(data);
+      return;
+   }
+   if (!video_driver_thread_wrapper_active() || !video_thread_is_self(thr))
+   {
+      fn(data);
+      return;
+   }
+   /* A command in flight has a poster that waits for its reply, which
+    * only this thread gives: it stays in its wait until then. */
+   if (!retro_atomic_load_acquire_int(&thr->waiter_call.waiters))
+   {
+      /* No one to hand it to: the call runs here, as it always did. */
+      fn(data);
+      return;
+   }
+   thr->waiter_call.fn      = fn;
+   thr->waiter_call.data    = data;
+   retro_atomic_store_relaxed_int(&thr->waiter_call.done, 0);
+   retro_atomic_store_release_int(&thr->waiter_call.pending, 1);
+   retro_eventcount_notify(&thr->reply_ec);
+   for (;;)
+   {
+      int key;
+      if (retro_atomic_load_acquire_int(&thr->waiter_call.done))
+         break;
+      key = retro_eventcount_prepare_wait(&thr->reply_ec);
+      if (retro_atomic_load_acquire_int(&thr->waiter_call.done))
+      {
+         retro_eventcount_cancel_wait(&thr->reply_ec);
+         break;
+      }
+      retro_eventcount_commit_wait(&thr->reply_ec, key);
+   }
+}
+
+#ifdef HAVE_MENU
+static void video_thread_menu_mem_update(thread_video_t *thr)
+{
+   const video_poke_interface_t *poke = thr->poke;
+   unsigned i;
+   unsigned align;
+   unsigned dims = (unsigned)retro_atomic_load_acquire_int(
+         &thr->texture.request_dims);
+   size_t width = VIDEO_SCALE_W(dims);
+   size_t height = VIDEO_SCALE_H(dims);
+   size_t need;
+   size_t row_pitch;
+
+   if (!thr->driver_data || !poke || !poke->menu_mem_alloc
+         || !poke->frame_mem_ready || !poke->frame_mem_free)
+      return;
+   if (!width || !height || width > (size_t)-1 / height / 4)
+      return;
+   align = poke->menu_mem_pitch_align ? poke->menu_mem_pitch_align : 1;
+   if (     (align & (align - 1))
+         || width * 4 > (size_t)-1 - (align - 1))
+      return;
+   row_pitch = (width * 4 + align - 1) & ~((size_t)align - 1);
+   if (row_pitch > (size_t)-1 / height)
+      return;
+   need = row_pitch * height;
+   if (thr->texture.refused_size != need)
+      thr->texture.refused_size = 0;
+   for (i = 0; i < VIDEO_THREAD_MENU_MEM; i++)
+   {
+      struct video_thread_menu_mem *m = &thr->texture.mem[i];
+      int state = retro_atomic_load_acquire_int(&m->state);
+      if (state == VIDEO_THREAD_MENU_GPU)
+      {
+         if (!poke->frame_mem_ready(thr->driver_data, m->id))
+            continue;
+         retro_atomic_store_release_int(&m->state, VIDEO_THREAD_MENU_READY);
+         state = VIDEO_THREAD_MENU_READY;
+      }
+      if (state != VIDEO_THREAD_MENU_EMPTY && state != VIDEO_THREAD_MENU_READY)
+         continue;
+      if (!retro_atomic_cas_int(&m->state, state, VIDEO_THREAD_MENU_BUILD))
+         continue;
+      if (m->size < need && thr->texture.refused_size != need)
+      {
+         if (m->ptr)
+            poke->frame_mem_free(thr->driver_data, m->id);
+         m->id = 0;
+         m->ptr = poke->menu_mem_alloc(thr->driver_data, need, &m->id);
+         m->size = m->ptr ? need : 0;
+         if (!m->ptr)
+            thr->texture.refused_size = need;
+      }
+      m->pitch_align = align;
+      retro_atomic_store_release_int(&m->state, m->ptr
+            ? VIDEO_THREAD_MENU_READY : VIDEO_THREAD_MENU_EMPTY);
+   }
+}
+
+/* CMD_FREE runs with the producer parked. */
+static void video_thread_menu_mem_free(thread_video_t *thr)
+{
+   unsigned i;
+   for (i = 0; i < VIDEO_THREAD_MENU_MEM; i++)
+   {
+      struct video_thread_menu_mem *m = &thr->texture.mem[i];
+      if (m->ptr)
+         thr->poke->frame_mem_free(thr->driver_data, m->id);
+      m->ptr = NULL;
+      m->size = 0;
+      m->id = 0;
+      retro_atomic_store_release_int(&m->state, VIDEO_THREAD_MENU_EMPTY);
+   }
+   for (i = 0; i < 3; i++)
+      thr->texture.slot[i].mem = 0;
+   retro_atomic_store_release_int(&thr->texture.request_dims, 0);
+}
+#endif
 
 static void thread_update_driver_state(thread_video_t *thr)
 {
 #ifdef HAVE_MENU
-   if (thr->texture.frame_updated)
    {
-      if (thr->driver_data && thr->poke && thr->poke->set_texture_frame)
+      struct video_thread_menu_texture *t;
+      int enable;
+      video_thread_menu_mem_update(thr);
+      t = (struct video_thread_menu_texture*)
+         retro_triple_buffer_take(&thr->texture.frames);
+      enable = retro_atomic_load_acquire_int(&thr->texture.enable);
+      if (t && thr->driver_data && thr->poke && thr->poke->set_texture_frame)
+      {
+         const void *pixels = t->frame;
+         if (t->mem)
+         {
+            struct video_thread_menu_mem *m = &thr->texture.mem[t->mem - 1];
+            pixels = m->ptr;
+            retro_atomic_store_release_int(&m->state, VIDEO_THREAD_MENU_GPU);
+            t->mem = 0;
+         }
          thr->poke->set_texture_frame(thr->driver_data,
-               thr->texture.frame, thr->texture.rgb32,
-               thr->texture.width, thr->texture.height,
-               thr->texture.alpha);
-      thr->texture.frame_updated = false;
+               pixels, t->rgb32, t->dims, t->alpha);
+      }
+      if (thr->driver_data && thr->poke && thr->poke->set_texture_enable)
+         thr->poke->set_texture_enable(thr->driver_data,
+               (enable & VIDEO_THREAD_TEXTURE_ENABLE) != 0,
+               (enable & VIDEO_THREAD_TEXTURE_FULL_SCREEN) != 0);
    }
-
-   if (thr->driver_data && thr->poke && thr->poke->set_texture_enable)
-      thr->poke->set_texture_enable(thr->driver_data,
-            thr->texture.enable, thr->texture.full_screen);
 #endif
 
 #ifdef HAVE_OVERLAY
-   slock_lock(thr->alpha_lock);
-   if (thr->alpha_update)
+   /* Clear first, then read: see alpha_mod in the header. */
+   if (retro_atomic_fetch_and_int(&thr->alpha_update, 0))
    {
       if (thr->driver_data && thr->overlay && thr->overlay->set_alpha)
       {
          int i;
+         /* Only an image whose alpha changed is set: a driver may pay
+          * per set (D3D10/11/12 map the sprite buffer for each). */
          for (i = 0; i < (int)thr->alpha_mods; i++)
-            thr->overlay->set_alpha(thr->driver_data, i, thr->alpha_mod[i]);
+         {
+            int bits = retro_atomic_load_relaxed_int(&thr->alpha_mod[i]);
+            if (thr->alpha_applied)
+            {
+               if (!thr->alpha_reset && thr->alpha_applied[i] == bits)
+                  continue;
+               thr->alpha_applied[i] = bits;
+            }
+            thr->overlay->set_alpha(thr->driver_data, i,
+                  video_thread_bits_float(bits));
+         }
+         thr->alpha_reset = false;
       }
-      thr->alpha_update = false;
    }
-   slock_unlock(thr->alpha_lock);
 #endif
 
-   if (thr->apply_state_changes)
+   if (retro_atomic_exchange_int(&thr->apply_state_changes, 0))
    {
       if (thr->driver_data && thr->poke && thr->poke->apply_state_changes)
          thr->poke->apply_state_changes(thr->driver_data);
-      thr->apply_state_changes = false;
    }
 }
 
@@ -151,10 +1029,39 @@ static bool video_thread_handle_packet(
       case CMD_INIT:
          if (thr->driver && thr->driver->init)
          {
-            thr->driver_data = thr->driver->init(&thr->info,
-                  thr->input, thr->input_data);
+            thr->driver_data = thr->driver->init(&thr->info);
+            if (thr->driver_data && thr->driver->poke_interface)
+               thr->driver->poke_interface(thr->driver_data,
+                     &thr->frame.mem_poke);
+            video_thread_mem_provision(thr);
             if (thr->driver_data && thr->driver->viewport_info)
-               thr->driver->viewport_info(thr->driver_data, &thr->vp);
+            {
+               struct video_viewport vp;
+               vp.pos  = VIDEO_POS_PACK(0, 0);
+               vp.dims = vp.full_dims = 0;
+               thr->driver->viewport_info(thr->driver_data, &vp);
+               video_thread_publish_vp(thr, &vp);
+            }
+#ifdef HAVE_OVERLAY
+            /* Taken here, on the thread that reads it: the frame path
+             * and the overlay commands both run on this one, and a
+             * driver hands back a table of its own that outlives the
+             * call. Taking it from the main thread instead is a write
+             * against those reads with nothing between them. */
+            thr->overlay = NULL;
+            if (thr->driver_data && thr->driver->overlay_interface)
+               thr->driver->overlay_interface(thr->driver_data,
+                     &thr->overlay);
+#endif
+            /* Drivers that have handed the OSD font lifecycle up get
+             * it created here rather than in video_driver.c, because
+             * this runs on the video thread that owns the graphics
+             * context. Unmigrated drivers still do it themselves,
+             * also from here, inside their own init(). */
+            if (     thr->driver_data
+                  && thr->driver->font_backend)
+               font_driver_init_osd(thr->driver_data, &thr->info,
+                     true, thr->driver->font_backend);
          }
          else
             thr->driver_data = NULL;
@@ -163,9 +1070,74 @@ static bool video_thread_handle_packet(
          break;
 
       case CMD_FREE:
+         video_thread_movie_discard(&thr->frame.slot[0].movie);
+         video_thread_movie_discard(&thr->frame.slot[1].movie);
+         /* Before the driver goes: the font owns GPU objects created
+          * against it, and this is the thread they belong to. */
+         if (     thr->driver
+               && thr->driver->font_backend)
+            font_driver_free_osd_for(thr->driver_data);
+         /* No frame will age what this thread retired */
+         font_driver_free_pending(true);
+         /* Textures unloaded since the last frame are still waiting
+          * for a frame that will never come. The driver does not know
+          * them - a loaded texture is the caller's handle, not a
+          * driver object - so it would not take them with it: they
+          * go through the driver now, on its thread, while it is
+          * still here. No frame is in flight: this is the last
+          * command, after the ring drained. */
+         {
+            unsigned i;
+            video_thread_tex_retire_t *l;
+            for (i = 0; i < 2; i++)
+            {
+               l                             = (video_thread_tex_retire_t*)
+                  thr->frame.slot[i].tex_retire;
+               thr->frame.slot[i].tex_retire = NULL;
+               video_thread_tex_retire_run(thr, l);
+            }
+            l = (video_thread_tex_retire_t*)mpsc_stack_drain(&thr->tex_retire);
+            video_thread_tex_retire_run(thr, l);
+         }
+         /* Uploads that completed but were not delivered yet hold a
+          * texture of this driver's that nobody will ever unload:
+          * their done() is answered with 0 after the join, so the
+          * texture goes back to the driver here. An update names the
+          * poster's own texture and is left alone. */
+         {
+            /* Taken off the list and put back in the same order, for
+             * the main thread's delivery; this thread is out's only
+             * producer. */
+            video_thread_async_load_t *n = video_thread_async_take(thr,
+                  &thr->async.out);
+            while (n)
+            {
+               video_thread_async_load_t *next = VIDEO_THREAD_ASYNC_NEXT(n);
+               if (     (n->kind == VIDEO_THREAD_ASYNC_LOAD || n->made)
+                     && n->handle
+                     && thr->poke && thr->poke->unload_texture
+                     && thr->driver_data)
+                  thr->poke->unload_texture(thr->driver_data, false,
+                        n->handle);
+               n->handle = 0;
+               video_thread_async_push(thr, &thr->async.out, n);
+               n = next;
+            }
+         }
+         /* The lent memory goes with the driver, as does its frame
+          * memory */
+         video_thread_lend_forget(thr, 0);
+         video_thread_mem_unprovision(thr);
+#ifdef HAVE_MENU
+         video_thread_menu_mem_free(thr);
+#endif
+         /* The hardware ring's fences belong to the device. */
+         video_thread_hw_free(thr);
          if (thr->driver_data && thr->driver && thr->driver->free)
             thr->driver->free(thr->driver_data);
          thr->driver_data = NULL;
+         /* The last command this thread takes */
+         retro_atomic_store_release_int(&thr->worker_running, 0);
          video_thread_reply(thr, &pkt);
          return true;
 
@@ -175,21 +1147,46 @@ static bool video_thread_handle_packet(
          video_thread_reply(thr, &pkt);
          break;
 
+      case CMD_SET_VIEWPORT:
+         if (thr->driver_data && thr->driver && thr->driver->set_viewport)
+            thr->driver->set_viewport(thr->driver_data,
+                  pkt.data.set_viewport.dims,
+                  pkt.data.set_viewport.force_full,
+                  pkt.data.set_viewport.allow_rotate);
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_SET_NONBLOCK:
+         /* The swapchain lives on this thread; swap interval and
+          * adaptive vsync are its settings and have to be applied here. */
+         if (thr->driver_data && thr->driver && thr->driver->set_nonblock_state)
+            thr->driver->set_nonblock_state(thr->driver_data,
+                  pkt.data.nonblock.nonblock,
+                  pkt.data.nonblock.adaptive_vsync,
+                  pkt.data.nonblock.swap_interval);
+         video_thread_reply(thr, &pkt);
+         break;
+
       case CMD_READ_VIEWPORT:
-         if (thr->driver_data && thr->driver &&
-               thr->driver->viewport_info && thr->driver->read_viewport)
+      case CMD_READ_VIEWPORT_HDR:
+         if (thr->driver_data && thr->driver && thr->driver->viewport_info
+               && (pkt.type == CMD_READ_VIEWPORT_HDR
+                  ? thr->driver->read_viewport_hdr != NULL
+                  : thr->driver->read_viewport != NULL))
          {
             struct video_viewport vp;
 
-            vp.x           = 0;
-            vp.y           = 0;
-            vp.width       = 0;
-            vp.height      = 0;
-            vp.full_width  = 0;
-            vp.full_height = 0;
+            vp.pos         = VIDEO_POS_PACK(0, 0);
+            vp.dims        = 0;
+            vp.full_dims   = 0;
 
             thr->driver->viewport_info(thr->driver_data, &vp);
-            if (!memcmp(&vp, &thr->read_vp, sizeof(vp)))
+            if (     vp.pos == (unsigned)retro_atomic_load_acquire_int(
+                        &thr->read_vp[VIDEO_THREAD_VP_POS])
+                  && vp.dims == (unsigned)retro_atomic_load_acquire_int(
+                        &thr->read_vp[VIDEO_THREAD_VP_WH])
+                  && vp.full_dims == (unsigned)retro_atomic_load_acquire_int(
+                        &thr->read_vp[VIDEO_THREAD_VP_FULL_WH]))
             {
                /* We can read safely
                 *
@@ -201,12 +1198,15 @@ static bool video_thread_handle_packet(
                 * be called from this thread, causing a timeout, and
                 * no frame to be rendered.
                 *
-                * To avoid this, set a flag so wrapper can see if
-                * it's called in this "special" way. */
-               thr->frame.within_thread = true;
-               pkt.data.b = thr->driver->read_viewport(thr->driver_data,
-                     (uint8_t*)pkt.data.v, thr->is_idle);
-               thr->frame.within_thread = false;
+                * video_thread_frame() sees that it is on this thread
+                * and renders straight through. */
+               if (pkt.type == CMD_READ_VIEWPORT_HDR)
+                  pkt.data.b = thr->driver->read_viewport_hdr(thr->driver_data,
+                        pkt.data.hdr_viewport.buffer, thr->is_idle,
+                        pkt.data.hdr_viewport.metadata);
+               else
+                  pkt.data.b = thr->driver->read_viewport(thr->driver_data,
+                        (uint8_t*)pkt.data.v, thr->is_idle);
             }
             else
             {
@@ -229,11 +1229,87 @@ static bool video_thread_handle_packet(
          video_thread_reply(thr, &pkt);
          break;
 
+      case CMD_SHADER_LOAD_BEGIN:
+         {
+            shader_load_deferred_t *d = (shader_load_deferred_t*)pkt.data.v;
+            video_driver_shader_deferred_take(d, true);
+            pkt.data.b = thr->driver_data && thr->driver
+               && thr->driver->shader_load_begin
+               && thr->driver->shader_load_begin(thr->driver_data, d);
+         }
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_SHADER_LOAD_STEP:
+         {
+            shader_load_deferred_t *d = (shader_load_deferred_t*)pkt.data.v;
+            /* The main thread asked for the load to end: the writes the
+             * driver's step reads as that are made here, on its thread. */
+            if (retro_atomic_load_acquire_int(&d->cancel))
+            {
+               d->current_pass = d->total_passes;
+               d->state        = SHADER_LOAD_FAILED;
+            }
+            video_driver_shader_deferred_take(d, false);
+            if (thr->driver_data && thr->driver && thr->driver->shader_load_step)
+               pkt.data.b = thr->driver->shader_load_step(thr->driver_data, d);
+            else
+            {
+               d->state   = SHADER_LOAD_FAILED;
+               pkt.data.b = false;
+            }
+            if (!pkt.data.b)
+               video_driver_shader_deferred_take(d, true);
+            /* publishes the step's writes to the main thread's tick */
+            retro_atomic_store_release_int(&d->busy, 0);
+         }
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_SUPPRESS_SCREENSAVER:
+         /* The inhibit belongs to the window, and the window to this
+          * thread. */
+         if (thr->driver_data && thr->driver && thr->driver->suppress_screensaver)
+            pkt.data.b = thr->driver->suppress_screensaver(thr->driver_data,
+                  pkt.data.b);
+         else
+            pkt.data.b = false;
+         video_thread_reply(thr, &pkt);
+         break;
+
       case CMD_ALIVE:
          if (thr->driver_data && thr->driver && thr->driver->alive)
             pkt.data.b = thr->driver->alive(thr->driver_data);
          else
             pkt.data.b = false;
+         /* Published as a frame's would be, so a caller that asked
+          * without waiting has it on its next pass. This thread is the
+          * word's only writer. */
+         {
+            int f = retro_atomic_load_acquire_int(&thr->win_flags)
+               & ~VIDEO_THREAD_WIN_ALIVE;
+            if (pkt.data.b)
+               f |= VIDEO_THREAD_WIN_ALIVE;
+            retro_atomic_store_release_int(&thr->win_flags, f);
+         }
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_POLL_PRESENTABLE:
+         /* The runloop read "nothing to present to" and is waiting a
+          * frame on it. That answer was published after the last frame
+          * this thread drew; a swapchain or presenter rebuilt since, or
+          * a window shown again, has not been seen if no frame has come
+          * in between. Asked again here, as a frame's would be, without
+          * waiting for one. This thread is the word's only writer. */
+         {
+            int f = retro_atomic_load_acquire_int(&thr->win_flags)
+               & ~VIDEO_THREAD_WIN_PRESENTABLE;
+            if (     !thr->driver_data
+                  || video_context_driver_presentable_direct())
+               f |= VIDEO_THREAD_WIN_PRESENTABLE;
+            retro_atomic_store_release_int(&thr->win_flags, f);
+         }
          video_thread_reply(thr, &pkt);
          break;
 
@@ -245,35 +1321,50 @@ static bool video_thread_handle_packet(
          break;
 
       case CMD_OVERLAY_LOAD:
+      case CMD_OVERLAY_LOAD_TEXTURES:
          {
             unsigned tmp_alpha_mods = pkt.data.image.num;
 
-            if (thr->driver_data && thr->overlay && thr->overlay->load)
-               pkt.data.b = thr->overlay->load(thr->driver_data,
-                  pkt.data.image.data, pkt.data.image.num);
-            else
+            if (!thr->driver_data || !thr->overlay)
                pkt.data.b = false;
+            else if (pkt.type == CMD_OVERLAY_LOAD_TEXTURES)
+               pkt.data.b = thr->overlay->load_textures
+                  && thr->overlay->load_textures(thr->driver_data,
+                        pkt.data.image.textures, pkt.data.image.num);
+            else
+               pkt.data.b = thr->overlay->load
+                  && thr->overlay->load(thr->driver_data,
+                        pkt.data.image.data, pkt.data.image.num);
 
             if (tmp_alpha_mods > 0)
             {
-               float *tmp_alpha_mod = (float*)realloc(thr->alpha_mod,
-                  tmp_alpha_mods * sizeof(float));
+               retro_atomic_int_t *tmp_alpha_mod = (retro_atomic_int_t*)
+                  realloc((void*)thr->alpha_mod,
+                     tmp_alpha_mods * sizeof(retro_atomic_int_t));
                if (tmp_alpha_mod)
                {
                   /* Avoid temporary garbage data. */
                   int i;
                   for (i = 0; i < (int)tmp_alpha_mods; i++)
-                     tmp_alpha_mod[i] = 1.0f;
+                     retro_atomic_store_relaxed_int(&tmp_alpha_mod[i],
+                           video_thread_float_bits(1.0f));
                   thr->alpha_mods = tmp_alpha_mods;
                   thr->alpha_mod  = tmp_alpha_mod;
                }
+               free(thr->alpha_applied);
+               thr->alpha_applied = (int*)malloc(
+                     thr->alpha_mods * sizeof(int));
             }
             else
             {
-               free(thr->alpha_mod);
-               thr->alpha_mods = 0;
-               thr->alpha_mod  = NULL;
+               free((void*)thr->alpha_mod);
+               free(thr->alpha_applied);
+               thr->alpha_mods    = 0;
+               thr->alpha_mod     = NULL;
+               thr->alpha_applied = NULL;
             }
+            /* Whatever the driver holds now, it is not alpha_applied. */
+            thr->alpha_reset = true;
          }
          video_thread_reply(thr, &pkt);
          break;
@@ -310,8 +1401,7 @@ static bool video_thread_handle_packet(
       case CMD_POKE_SET_VIDEO_MODE:
          if (thr->driver_data && thr->poke && thr->poke->set_video_mode)
             thr->poke->set_video_mode(thr->driver_data,
-                  pkt.data.new_mode.width,
-                  pkt.data.new_mode.height,
+                  pkt.data.new_mode.dims,
                   pkt.data.new_mode.fullscreen);
          video_thread_reply(thr, &pkt);
          break;
@@ -331,6 +1421,32 @@ static bool video_thread_handle_packet(
          video_thread_reply(thr, &pkt);
          break;
 
+      case CMD_POKE_SET_FRAME_FORMAT:
+         pkt.data.frame_format.ret =
+               thr->driver_data && thr->poke && thr->poke->set_frame_format
+            && thr->poke->set_frame_format(thr->driver_data,
+                  pkt.data.frame_format.rgb32,
+                  pkt.data.frame_format.input_scale);
+         /* The slots may have grown into host memory: back into the
+          * driver's, at the new size */
+         video_thread_mem_provision(thr);
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_POKE_SET_VIEW_COUNT:
+         if (thr->driver_data && thr->poke && thr->poke->set_view_count)
+            thr->poke->set_view_count(thr->driver_data,
+                  (unsigned)pkt.data.i);
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_POKE_HW_CONTEXT_DESTROYING:
+         if (     thr->driver_data && thr->poke
+               && thr->poke->hw_context_destroying)
+            thr->poke->hw_context_destroying(thr->driver_data);
+         video_thread_reply(thr, &pkt);
+         break;
+
       case CMD_FONT_INIT:
          if (pkt.data.font_init.method)
             pkt.data.font_init.return_value = pkt.data.font_init.method(
@@ -339,7 +1455,7 @@ static bool video_thread_handle_packet(
                pkt.data.font_init.video_data,
                pkt.data.font_init.font_path,
                pkt.data.font_init.font_size,
-               pkt.data.font_init.api,
+               pkt.data.font_init.backend,
                pkt.data.font_init.is_threaded
             );
          video_thread_reply(thr, &pkt);
@@ -347,8 +1463,20 @@ static bool video_thread_handle_packet(
 
       case CMD_CUSTOM_COMMAND:
          if (pkt.data.custom_command.method)
+         {
+            /* The user thread is blocked in video_thread_wait_reply for
+             * the whole of this call. On some platforms that waiter is a
+             * higher-priority (e.g. main/UI) thread while this worker runs
+             * at a lower scheduling class, so the wait is a priority
+             * inversion; slock/scond do not propagate priority. Lift this
+             * thread for the duration of the synchronous work (no-op where
+             * unsupported), covering the heavy GPU uploads the custom
+             * command path carries (texture/font resource commands). */
+            void *qos_override = sthread_priority_override_begin();
             pkt.data.custom_command.return_value =
                pkt.data.custom_command.method(pkt.data.custom_command.data);
+            sthread_priority_override_end(qos_override);
+         }
          video_thread_reply(thr, &pkt);
          break;
 
@@ -369,11 +1497,11 @@ static bool video_thread_handle_packet(
           * thread sends command right after frame update. */
          break;
 
-      case CMD_POKE_SET_HDR_MAX_NITS:
-         if (thr->driver_data && thr->poke && thr->poke->set_hdr_max_nits)
-            thr->poke->set_hdr_max_nits(
+      case CMD_POKE_SET_HDR_MENU_NITS:
+         if (thr->driver_data && thr->poke && thr->poke->set_hdr_menu_nits)
+            thr->poke->set_hdr_menu_nits(
                thr->driver_data,
-               pkt.data.hdr.max_nits
+               pkt.data.hdr.menu_nits
             );
          video_thread_reply(thr, &pkt);
          break;
@@ -388,21 +1516,31 @@ static bool video_thread_handle_packet(
          video_thread_reply(thr, &pkt);
          break;
 
-      case CMD_POKE_SET_HDR_CONTRAST:
-         if (thr->driver_data && thr->poke && thr->poke->set_hdr_contrast)
-            thr->poke->set_hdr_contrast(
-               thr->driver_data,
-               pkt.data.hdr.contrast
-            );
-         video_thread_reply(thr, &pkt);
-         break;
-
       case CMD_POKE_SET_HDR_EXPAND_GAMUT:
          if (thr->driver_data && thr->poke && thr->poke->set_hdr_expand_gamut)
             thr->poke->set_hdr_expand_gamut(
                thr->driver_data,
                pkt.data.hdr.expand_gamut
             );
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_POKE_SET_HDR_SCANLINES:
+         if (thr->driver_data && thr->poke && thr->poke->set_hdr_scanlines)
+            thr->poke->set_hdr_scanlines(
+               thr->driver_data,
+               pkt.data.hdr.scanlines
+            );
+         video_thread_reply(thr, &pkt);
+         break;
+
+      case CMD_POKE_SET_HDR_SUBPIXEL_LAYOUT:
+         if (thr->driver_data && thr->poke && thr->poke->set_hdr_subpixel_layout)
+            thr->poke->set_hdr_subpixel_layout(
+               thr->driver_data,
+               pkt.data.hdr.subpixel_layout
+            );
+
          video_thread_reply(thr, &pkt);
          break;
 
@@ -414,65 +1552,1526 @@ static bool video_thread_handle_packet(
    return false;
 }
 
+/* One read of the published statistics: whatever a caller wants, taken
+ * in a single seqlock pass rather than one per readout. */
+typedef struct
+{
+   uint64_t     repeats;
+   uint64_t     swaps;
+   retro_time_t latency_avg;
+   retro_time_t latency_max;
+   retro_time_t input_age_avg;
+   retro_time_t input_age_max;
+   retro_time_t core_time;
+   retro_time_t render_time;
+   retro_time_t present_wait;
+   retro_time_t fence_wait;
+   retro_time_t lock_wait;
+   retro_time_t present_period;
+   retro_time_t next_present;
+   int          flags;
+} video_thread_stat_snap_t;
+
+/* A 64-bit value across two int-wide slots, low half first. */
+static void video_thread_stat_put64(retro_atomic_int_t *s, int lo, uint64_t v)
+{
+   retro_atomic_store_relaxed_int(&s[lo],     (int)(uint32_t)v);
+   retro_atomic_store_relaxed_int(&s[lo + 1], (int)(uint32_t)(v >> 32));
+}
+
+static uint64_t video_thread_stat_get64(retro_atomic_int_t *s, int lo)
+{
+   uint32_t l = (uint32_t)retro_atomic_load_relaxed_int(&s[lo]);
+   uint32_t h = (uint32_t)retro_atomic_load_relaxed_int(&s[lo + 1]);
+   return ((uint64_t)h << 32) | l;
+}
+
+/* Publishes the statistics snapshot the overlay reads, and the
+ * presenter's inputs display pacing takes from the same snapshot.
+ * Video thread only, which is what keeps two publishes from
+ * overlapping; it precedes the ring release, so a ring waiter that
+ * sees the slot free has seen this snapshot. The two the main thread
+ * feeds - core_time and display_pacing - are taken from the words it
+ * publishes them in, at one frame's lag. */
+static void video_thread_publish_stats(thread_video_t *thr)
+{
+   retro_atomic_int_t *s = thr->stats;
+   int seq               = retro_atomic_load_relaxed_int(&thr->stats_seq);
+   int flags             =
+        (thr->present_repeat       ? VIDEO_THREAD_STAT_F_PRESENT_REPEAT : 0)
+      | (thr->phase_from_display   ? VIDEO_THREAD_STAT_F_PHASE_DISPLAY  : 0)
+      | (thr->latency_from_display ? VIDEO_THREAD_STAT_F_LAT_DISPLAY    : 0)
+      | (retro_atomic_load_relaxed_int(&thr->display_pacing_pub)
+                                   ? VIDEO_THREAD_STAT_F_DISPLAY_PACING : 0);
+
+   /* present_last() on the main thread answers with this */
+   retro_atomic_store_release_int(&thr->repeat_group,
+         thr->present_repeat ? (int)thr->present_group : 0);
+
+   retro_atomic_store_relaxed_int(&thr->stats_seq, seq + 1);
+   retro_atomic_thread_fence_release();
+   retro_atomic_store_relaxed_int(&s[VIDEO_THREAD_STAT_FLAGS], flags);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_REPEATS_LO,
+         thr->frames_repeated);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_LAT_AVG_LO,
+         (uint64_t)thr->latency_avg);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_LAT_MAX_LO,
+         (uint64_t)thr->latency_max);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_INPUT_AVG_LO,
+         (uint64_t)thr->input_age_avg);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_INPUT_MAX_LO,
+         (uint64_t)thr->input_age_max);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_CORE_LO,
+         (uint64_t)(unsigned)retro_atomic_load_relaxed_int(&thr->core_time_us));
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_RENDER_LO,
+         (uint64_t)thr->render_time);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_WAIT_LO,
+         (uint64_t)thr->present_wait);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_FENCE_LO,
+         (uint64_t)thr->fence_wait);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_LOCK_LO,
+         (uint64_t)thr->lock_wait);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_SWAPS_LO,
+         thr->video_st->swap_count);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_PERIOD_LO,
+         (uint64_t)thr->present_period);
+   video_thread_stat_put64(s, VIDEO_THREAD_STAT_NEXT_LO,
+         (uint64_t)thr->next_present);
+   retro_atomic_thread_fence_release();
+   retro_atomic_store_release_int(&thr->stats_seq, seq + 2);
+}
+
+/* Video thread: the slot it was rendering is done with; the ring's
+ * waiters - a paced push, a drain, a hardware-ring fence - re-test. */
+static void video_thread_ring_complete(thread_video_t *thr)
+{
+   int st = video_thread_ring_load(thr);
+   while (!retro_atomic_cas_int(&thr->frame.state, st,
+            st & ~VIDEO_THREAD_RING_BUSY))
+      st = video_thread_ring_load(thr);
+   retro_eventcount_notify(&thr->frame.ring);
+}
+
+/* Seqlock read: retry while a publish is in flight (odd) or lands
+ * across the copy. The publisher runs once a presented frame, so this
+ * converges in one pass; shaped so no comparison sees an unset
+ * counter. */
+static void video_thread_read_stats(thread_video_t *thr,
+      video_thread_stat_snap_t *out)
+{
+   retro_atomic_int_t *s = thr->stats;
+   for (;;)
+   {
+      int s1 = retro_atomic_load_acquire_int(&thr->stats_seq);
+      if (s1 & 1)
+         continue;
+      out->repeats     = video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_REPEATS_LO);
+      out->latency_avg = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_LAT_AVG_LO);
+      out->latency_max = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_LAT_MAX_LO);
+      out->input_age_avg = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_INPUT_AVG_LO);
+      out->input_age_max = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_INPUT_MAX_LO);
+      out->core_time   = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_CORE_LO);
+      out->render_time = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_RENDER_LO);
+      out->present_wait = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_WAIT_LO);
+      out->fence_wait  = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_FENCE_LO);
+      out->lock_wait   = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_LOCK_LO);
+      out->swaps       = video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_SWAPS_LO);
+      out->present_period = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_PERIOD_LO);
+      out->next_present   = (retro_time_t)video_thread_stat_get64(s,
+            VIDEO_THREAD_STAT_NEXT_LO);
+      out->flags       = retro_atomic_load_relaxed_int(
+            &s[VIDEO_THREAD_STAT_FLAGS]);
+      retro_atomic_thread_fence_acquire();
+      if (retro_atomic_load_relaxed_int(&thr->stats_seq) == s1)
+         break;
+   }
+}
+
+/* Video thread: how much a frame had to spare, for a driver whose
+ * present waits for the vblank and comes back with the frame out.
+ *
+ * The hold aims the frame at its vblank with the drawing time and a
+ * margin in hand - an eighth of the drawing time, half a millisecond
+ * at least. For a present that queues, a frame a little late is seen
+ * by nobody here. For one that waits it is seen exactly: the wait is
+ * what the frame had to spare, and a wait of most of a period is a
+ * frame that arrived after its vblank and sat out the next - a period
+ * late on screen. Half a millisecond is not always there to be had: on
+ * a loaded machine the video thread is not woken that fast, and every
+ * frame missed.
+ *
+ * So the margin is learned from the waits:
+ * - a frame that missed adds a millisecond, at once;
+ * - while no frame misses, the least any frame had to spare over two
+ *   seconds says whether there is too much: over a millisecond and a
+ *   half, half of what is over a millisecond is given back.
+ * Never below nothing - the hold's own margin stays - and never over a
+ * quarter of a period. Only misses raise it, and only a present that
+ * waits can show one: a swap that does not wait, whatever it reports,
+ * is left as it was.
+ *
+ * And one miss does not end with itself. The thread sits in the missed
+ * frame's swap until the next vblank, the core's next frame arrives in
+ * that time and is drawn only when the swap comes back - just after
+ * the vblank it was meant for, so it misses too, and so does every
+ * frame after it: each one on time, each one a period late on screen,
+ * for good. No margin gets out of that; one skipped period does. The
+ * second miss in a row asks the hold for it, the way a queue that ran
+ * a frame deep does (drain_pending), and the frames after go out on
+ * their own vblank again. */
+static void video_thread_margin_learn(thread_video_t *thr, retro_time_t waited)
+{
+   retro_time_t period = thr->present_period;
+   retro_time_t now;
+   int extra;
+
+   /* Only while the hold is steering frames at the vblank. Without it
+    * a present that waits simply waits out each period, which is no
+    * miss. */
+   if (period <= 0 || !retro_atomic_load_relaxed_int(&thr->display_pacing_pub))
+      return;
+   extra = retro_atomic_load_relaxed_int(&thr->margin_extra_us);
+   now   = cpu_features_get_time_usec();
+
+   if (waited > period / 2)
+   {
+      /* missed its vblank: the first of a run for want of margin, the
+       * rest for being behind the first */
+      if (++thr->miss_run == 1)
+         extra += 1000;
+      else if (!thr->drain_cooldown)
+      {
+         retro_atomic_store_release_int(&thr->drain_pending, 1);
+         thr->drain_cooldown = 4;
+      }
+      thr->slack_min       = period;
+      thr->slack_window_at = now;
+   }
+   else
+   {
+      thr->miss_run = 0;
+      if (thr->slack_window_at <= 0)
+      {
+         thr->slack_min       = period;
+         thr->slack_window_at = now;
+      }
+      if (waited < thr->slack_min)
+         thr->slack_min = waited;
+      if (now - thr->slack_window_at < 2000000)
+         return;
+      if (thr->slack_min > 1500)
+         extra -= (int)((thr->slack_min - 1000) / 2);
+      thr->slack_min       = period;
+      thr->slack_window_at = now;
+   }
+   if (extra < 0)
+      extra = 0;
+   if (extra > (int)(period / 4))
+      extra = (int)(period / 4);
+   retro_atomic_store_release_int(&thr->margin_extra_us, extra);
+}
+
+/* Called on the video thread after a present. Sets when a repeat falls
+ * due: a period after the display's own timestamp for that present when
+ * the driver reports one, else after now; and never at or before now,
+ * so a stale or late report cannot make the next wait fire at once. */
+static void video_thread_schedule_next(thread_video_t *thr)
+{
+   retro_time_t now;
+   retro_time_t base = 0;
+   retro_time_t next;
+
+   if (     (thr->present_timing_ask || thr->present_shown)
+         && thr->driver_data && thr->poke && thr->poke->get_last_present_time)
+      base = thr->poke->get_last_present_time(thr->driver_data);
+   /* The callback can cross a display tick: compare against its return
+    * time so a newly reported present is not mistaken for the future. */
+   now = cpu_features_get_time_usec();
+   thr->phase_from_display = base > 0 && base <= now;
+   if (!thr->phase_from_display)
+      base = now;
+
+   next = base + thr->present_period;
+   if (thr->present_period > 0)
+      while (next <= now)
+         next += thr->present_period;
+   thr->next_present = next;
+
+   /* The present's end for the latency readout. The driver's report is
+    * a vblank or swap that has already happened, and the frame just
+    * queued goes out on the first one after it: that is next, on the
+    * display's grid when the driver gave one, else on a grid laid from
+    * the clock, which is an estimate and is labelled as one. The clock
+    * after the present call is not an end at all - a present that
+    * does not block returns in well under a millisecond, and a number
+    * measured to there says nothing about when the frame is seen. */
+   thr->last_present_end = thr->present_period > 0 ? next : now;
+   /* Confirmed completion uses its display timestamp when available,
+    * otherwise the return time. Consume it before any repeat. */
+   if (thr->present_shown)
+   {
+      thr->last_present_end = thr->phase_from_display ? base : now;
+      thr->present_shown    = false;
+   }
+}
+
+/* Video thread: the record of slot @slot of texture @id lent, or -1 */
+static int video_thread_lend_find(const thread_video_t *thr, uintptr_t id,
+      const void *mem)
+{
+   int i;
+   for (i = 0; i < VIDEO_THREAD_LEND_MAX; i++)
+      if (     thr->lend[i].used && thr->lend[i].id == id
+            && thr->lend[i].mem == mem)
+         return i;
+   return -1;
+}
+
+/* Video thread: an update from lent memory has left the GPU reading it */
+static void video_thread_lend_mark(thread_video_t *thr, uintptr_t id,
+      const void *pixels)
+{
+   int i = video_thread_lend_find(thr, id, pixels);
+   if (i < 0 || retro_atomic_load_relaxed_int(&thr->lend[i].busy))
+      return;
+   retro_atomic_store_release_int(&thr->lend[i].busy, 1);
+   if (thr->lend[i].refresh)
+      thr->lend[i].mem = NULL;
+   thr->lend_busy++;
+}
+
+/* Video thread: lend the slots an update asked for, now that the
+ * texture streams. Pitch-aware producers receive the backend's rows;
+ * other producers require packed rows. */
+static void video_thread_lend_slots(thread_video_t *thr,
+      video_thread_async_load_t *n, const struct texture_image *img)
+{
+   size_t pitch = (size_t)img->width * (img->fp16 ? 8 : 4);
+   unsigned slot;
+   n->lend_refresh = 0;
+   for (slot = 0; slot < 2; slot++)
+   {
+      int i;
+      void *mem;
+      size_t actual = pitch;
+      if (!(n->lend & (1u << slot)))
+         continue;
+      /* Asked again, as for a surface that took none of a partial
+       * lend: the record there is */
+      for (i = 0; i < VIDEO_THREAD_LEND_MAX; i++)
+         if (     thr->lend[i].used && thr->lend[i].id == n->handle
+               && thr->lend[i].slot == slot)
+            break;
+      if (i < VIDEO_THREAD_LEND_MAX)
+      {
+         if (!n->lend_padded && thr->lend[i].pitch != pitch)
+            continue;
+         n->lent_mem[slot] = thr->lend[i].mem;
+         n->lent_pitch[slot] = thr->lend[i].pitch;
+         n->lent_idx[slot] = (int8_t)i;
+         if (thr->lend[i].refresh)
+            n->lend_refresh |= (uint8_t)(1u << slot);
+         continue;
+      }
+      for (i = 0; i < VIDEO_THREAD_LEND_MAX && thr->lend[i].used; i++) ;
+      if (     i == VIDEO_THREAD_LEND_MAX
+            || !(mem = thr->poke->texture_lend(thr->driver_data,
+                  n->handle, slot, pitch, n->lend_padded ? &actual : NULL)))
+         continue;
+      thr->lend[i].mem  = mem;
+      thr->lend[i].pitch = actual;
+      thr->lend[i].row_pitch = pitch;
+      thr->lend[i].id   = n->handle;
+      thr->lend[i].slot = slot;
+      thr->lend[i].used = true;
+      thr->lend[i].refresh = thr->poke->texture_lend_per_write;
+      thr->lend[i].padded = n->lend_padded != 0;
+      retro_atomic_store_relaxed_int(&thr->lend[i].busy, 0);
+      n->lent_mem[slot] = mem;
+      n->lent_pitch[slot] = actual;
+      n->lent_idx[slot] = (int8_t)i;
+      if (thr->lend[i].refresh)
+         n->lend_refresh |= (uint8_t)(1u << slot);
+   }
+}
+
+/* Video thread: lent slots whose last update the GPU has finished
+ * reading may be written again. Only while some are busy. */
+static void video_thread_lend_poll(thread_video_t *thr)
+{
+   int i;
+   for (i = 0; i < VIDEO_THREAD_LEND_MAX; i++)
+      if (     thr->lend[i].used
+            && retro_atomic_load_relaxed_int(&thr->lend[i].busy)
+            && (     !thr->poke || !thr->poke->texture_lend_ready
+                  || !thr->driver_data
+                  || thr->poke->texture_lend_ready(thr->driver_data,
+                     thr->lend[i].id, thr->lend[i].slot)))
+      {
+         if (thr->lend[i].refresh)
+         {
+            size_t pitch = thr->lend[i].row_pitch;
+            thr->lend[i].mem = thr->poke && thr->poke->texture_lend
+               ? thr->poke->texture_lend(thr->driver_data,
+                     thr->lend[i].id, thr->lend[i].slot,
+                     thr->lend[i].row_pitch,
+                     thr->lend[i].padded ? &pitch : NULL) : NULL;
+            thr->lend[i].pitch = pitch;
+         }
+         retro_atomic_store_release_int(&thr->lend[i].busy, 0);
+         thr->lend_busy--;
+      }
+}
+
+/* Video thread: the texture @id is going, and its lent memory with it;
+ * 0 forgets every record (the driver is going) */
+static void video_thread_lend_forget(thread_video_t *thr, uintptr_t id)
+{
+   int i;
+   for (i = 0; i < VIDEO_THREAD_LEND_MAX; i++)
+      if (thr->lend[i].used && (!id || thr->lend[i].id == id))
+      {
+         if (retro_atomic_load_relaxed_int(&thr->lend[i].busy))
+            thr->lend_busy--;
+         retro_atomic_store_release_int(&thr->lend[i].busy, 0);
+         thr->lend[i].used = false;
+         thr->lend[i].mem  = NULL;
+         thr->lend[i].id   = 0;
+      }
+}
+
+/* Video thread: take the whole in list, upload each
+ * node with the driver directly (this is the driver's thread), release
+ * the image, and queue the handle for the main thread. */
+static void video_thread_async_run(thread_video_t *thr)
+{
+   video_thread_async_load_t *n;
+   /* The driver to upload through, taken once for the batch. Both are
+    * this thread's: they change only on it, through a command. */
+   const video_poke_interface_t *poke;
+   void                         *driver_data;
+
+   /* Nearly every pass has nothing posted */
+   if (!(n = video_thread_async_take(thr, &thr->async.in)))
+      return;
+
+   poke              = thr->poke;
+   driver_data       = thr->driver_data;
+
+   while (n)
+   {
+      video_thread_async_load_t *next = VIDEO_THREAD_ASYNC_NEXT(n);
+      if (n->kind == VIDEO_THREAD_ASYNC_IMPORT)
+      {
+         enum video_texture_update r = VIDEO_TEXTURE_UPDATE_REFUSED;
+         uintptr_t id                = n->handle;
+         if (driver_data && poke && poke->import_texture)
+         {
+            r = VIDEO_TEXTURE_UPDATE_DONE;
+            if (id && poke->prepare_import_texture)
+               r = poke->prepare_import_texture(driver_data, id,
+                     (const video_frame_import_t*)n->img);
+            if (r == VIDEO_TEXTURE_UPDATE_DONE)
+               r = poke->import_texture(driver_data, &id,
+                     (const video_frame_import_t*)n->img, n->filter);
+         }
+         n->made    = (!n->handle && id && r != VIDEO_TEXTURE_UPDATE_REFUSED);
+         n->dropped = (r == VIDEO_TEXTURE_UPDATE_DROPPED);
+         n->handle  = (r == VIDEO_TEXTURE_UPDATE_REFUSED) ? 0 : id;
+      }
+      else if (n->kind == VIDEO_THREAD_ASYNC_UPDATE)
+      {
+         /* The handle is the poster's texture; it comes back as the
+          * result so done() sees the same value on success, 0 when
+          * the driver refused to update it in place. */
+         enum video_texture_update r = VIDEO_TEXTURE_UPDATE_REFUSED;
+         const struct texture_image *img =
+               (const struct texture_image*)n->img;
+         if (driver_data && poke && poke->update_texture)
+            r = poke->update_texture(driver_data, n->handle, img, false);
+         n->dropped = (r == VIDEO_TEXTURE_UPDATE_DROPPED);
+         if (r == VIDEO_TEXTURE_UPDATE_DONE)
+         {
+            /* An update from lent memory leaves the GPU reading it */
+            if (thr->lend_used)
+               video_thread_lend_mark(thr, n->handle, img->pixels);
+            if (n->lend && poke->texture_lend)
+            {
+               video_thread_lend_slots(thr, n, img);
+               thr->lend_used = true;
+            }
+         }
+         if (r == VIDEO_TEXTURE_UPDATE_REFUSED)
+         {
+            GFX_INSTR_INC(GFX_INSTR_TEX_UPDATE_REFUSED);
+            n->handle = 0;
+         }
+         else
+            GFX_INSTR_INC(n->dropped ? GFX_INSTR_TEX_UPDATE_DROPPED
+                  : GFX_INSTR_TEX_UPDATE);
+      }
+      else if (n->kind == VIDEO_THREAD_ASYNC_JOB)
+      {
+         const video_thread_async_job_t *job
+               = (const video_thread_async_job_t *)n->img;
+         n->handle = job && job->run
+               ? job->run(driver_data, poke, job->user) : 0;
+      }
+      else
+      {
+         const struct texture_image *ti =
+               (const struct texture_image*)n->img;
+         /* Counted here, on the thread that runs it: the synchronous
+          * entry point counts its own, and a load posted through the
+          * list never passes through it. */
+         GFX_INSTR_INC(GFX_INSTR_TEX_LOAD);
+         n->handle = 0;
+         /* A payload the driver samples as it is; 0 if it no longer
+          * does, and the poster decodes it */
+         if (ti && ti->compressed && !ti->pixels)
+         {
+            if (     driver_data && poke
+                  && poke->load_texture_compressed
+                  && poke->supports_texture_format
+                  && poke->supports_texture_format(driver_data,
+                        ti->compressed->format))
+               n->handle = poke->load_texture_compressed(driver_data,
+                     ti->compressed, false, n->filter);
+         }
+         else if (driver_data && poke && poke->load_texture)
+            n->handle = poke->load_texture(driver_data,
+                  n->img, false, n->filter);
+      }
+      if (n->release)
+         n->release(n->img);
+      n->img  = NULL;
+
+      video_thread_async_push(thr, &thr->async.out, n);
+
+      n = next;
+   }
+}
+
+/* Main thread: deliver everything in the out list. Runs done() with
+ * the lock released, so a done() that uploads or unloads a texture
+ * is fine. */
+static void video_thread_async_deliver(thread_video_t *thr)
+{
+   video_thread_async_load_t *n;
+
+   /* Nearly every frame has nothing to deliver */
+   if (!(n = video_thread_async_take(thr, &thr->async.out)))
+      return;
+
+   while (n)
+   {
+      video_thread_async_load_t *next = VIDEO_THREAD_ASYNC_NEXT(n);
+      /* done() may repost the node at once, which rewrites its link:
+       * nothing of the node is read after the call. */
+      GFX_INSTR_INC(GFX_INSTR_ASYNC_DONE);
+      if (n->done)
+         n->done(n->user, n->handle);
+      n = next;
+   }
+}
+
+/* Teardown, after the join: nothing else touches the lists now. Loads
+ * never uploaded are released; every waiter learns of the handle 0,
+ * since any real one died with the driver. */
+static void video_thread_async_drop_all(thread_video_t *thr)
+{
+   video_thread_async_load_t *n = video_thread_async_take(thr,
+         &thr->async.in);
+   while (n)
+   {
+      video_thread_async_load_t *next = VIDEO_THREAD_ASYNC_NEXT(n);
+      if (n->release && n->img)
+         n->release(n->img);
+      if (n->done)
+         n->done(n->user, 0);
+      n = next;
+   }
+   n = video_thread_async_take(thr, &thr->async.out);
+   while (n)
+   {
+      video_thread_async_load_t *next = VIDEO_THREAD_ASYNC_NEXT(n);
+      if (n->done)
+         n->done(n->user, 0);
+      n = next;
+   }
+}
+
+bool video_thread_async_post(video_thread_async_load_t *n)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t *thr;
+
+   if (!video_st->thread_wrapper_active || !n)
+      return false;
+   thr = (thread_video_t*)video_st->data;
+   if (!thr || !thr->thread)
+      return false;
+   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id())
+      return false;
+
+   GFX_INSTR_INC(GFX_INSTR_ASYNC_POST);
+
+   if (!(retro_atomic_load_acquire_int(&thr->win_flags)
+            & VIDEO_THREAD_WIN_ALIVE))
+      return false;
+   video_thread_async_push(thr, &thr->async.in, n);
+   retro_eventcount_notify(&thr->work);
+   return true;
+}
+
+bool video_thread_lend_ready(int idx)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t *thr;
+   if (     idx < 0 || idx >= VIDEO_THREAD_LEND_MAX
+         || !video_st->thread_wrapper_active
+         || !(thr = (thread_video_t*)video_st->data))
+      return true;
+   return !retro_atomic_load_acquire_int(&thr->lend[idx].busy);
+}
+
+bool video_thread_lend_get(int idx, void **mem, size_t *pitch)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t *thr;
+   if (     idx < 0 || idx >= VIDEO_THREAD_LEND_MAX || !mem || !pitch
+         || !video_st->thread_wrapper_active
+         || !(thr = (thread_video_t*)video_st->data)
+         || retro_atomic_load_acquire_int(&thr->lend[idx].busy))
+      return false;
+   *mem = thr->lend[idx].mem;
+   *pitch = thr->lend[idx].pitch;
+   return true;
+}
+
+bool video_thread_texture_can_update(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t *thr;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   thr = (thread_video_t*)video_st->data;
+   return thr && thr->poke && thr->poke->update_texture;
+}
+
+bool video_thread_is_video_thread(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t *thr;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   thr = (thread_video_t*)video_st->data;
+   return thr && video_thread_is_self(thr);
+}
+
+void video_thread_async_poll(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t *thr;
+   if (!video_st->thread_wrapper_active)
+      return;
+   thr = (thread_video_t*)video_st->data;
+   if (!thr)
+      return;
+   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id())
+      return;
+   video_thread_async_deliver(thr);
+}
+
+/* Source pixel format conversion, on the thread that draws: a frame
+ * staged by video_thread_defer_convert() arrives in the core's format.
+ * The scaler and the narrowing scratch buffer hold still while frames
+ * are in flight; the video driver deinit waits this thread idle before
+ * freeing them. */
+static void video_thread_convert(thread_video_t *thr,
+      unsigned kind, const void **data,
+      unsigned dims, unsigned *pitch)
+{
+   video_driver_state_t *video_st = thr->video_st;
+
+   if (!*data)
+      return;
+
+   switch (kind)
+   {
+      case VIDEO_THREAD_CONVERT_0RGB1555:
+         if (video_st->scaler_ptr)
+         {
+            video_pixel_frame_scale(
+                  video_st->scaler_ptr->scaler,
+                  video_st->scaler_ptr->scaler_out,
+                  *data, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), *pitch);
+            *data  = video_st->scaler_ptr->scaler_out;
+            *pitch = video_st->scaler_ptr->scaler->out_stride;
+         }
+         break;
+      case VIDEO_THREAD_CONVERT_XRGB2101010:
+         {
+            size_t      conv_pitch = *pitch;
+            const void *converted  = video_driver_convert_xrgb2101010(
+                  video_st, *data, dims, *pitch, &conv_pitch);
+            if (converted)
+            {
+               *data  = converted;
+               *pitch = (unsigned)conv_pitch;
+            }
+         }
+         break;
+      default:
+         break;
+   }
+}
+
+void video_thread_defer_convert(enum video_thread_convert kind)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+
+   if (!video_st->thread_wrapper_active)
+      return;
+   if (!(thr = (thread_video_t*)video_st->data))
+      return;
+   thr->convert_next = (unsigned)kind;
+}
+
+#ifdef HAVE_VIDEO_FILTER
+/* The software filter, on the thread that draws: a frame staged by
+ * video_thread_defer_filter() arrives raw, in the core's format, with
+ * the filter it was staged with. One replaced since is retired behind
+ * the frames that name it (video_thread_retire_filter()). */
+static void video_thread_filter(void *filter, void *buffer,
+      unsigned out_bpp, const void **data, unsigned *dims, unsigned *pitch)
+{
+   unsigned out_dims = 0;
+   unsigned out_pitch;
+
+   if (!*data || !filter || !buffer)
+      return;
+
+   rarch_softfilter_get_output_size((rarch_softfilter_t*)filter,
+         &out_dims, *dims);
+   out_pitch = VIDEO_SCALE_W(out_dims) * out_bpp;
+   rarch_softfilter_process((rarch_softfilter_t*)filter, buffer,
+         out_pitch, *data, *dims, *pitch);
+
+   *data     = buffer;
+   *dims     = out_dims;
+   *pitch    = out_pitch;
+}
+
+void video_thread_defer_filter(unsigned in_bpp)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+
+   if (!video_st->thread_wrapper_active)
+      return;
+   if (!(thr = (thread_video_t*)video_st->data))
+      return;
+   thr->filter_next = in_bpp;
+}
+#endif
+
+/* GPU recording under the wrapper. The main thread names one of these
+ * in every frame it hands over while recording; the video thread reads
+ * each such frame back into buf[back] once drawn and publishes it with
+ * one exchange of 'ready', and the main thread takes the newest with
+ * another. Each buffer is at any time the video thread's, the main
+ * thread's or the one in 'ready', so neither side ever waits. The main
+ * thread frees it once no slot the video thread holds names it.
+ *
+ * The hand-off is the exchange, so the feature needs a backend that
+ * has one. retro_atomic.h offers the extended operations on the
+ * backends that can express them and asks callers to gate on the
+ * primitive; a target without one takes the -2 from
+ * video_thread_record_take() and records off the frontend's own frame
+ * copy, as it does whenever the driver has no read-back. */
+#if defined(RETRO_ATOMIC_LOCK_FREE) && defined(retro_atomic_exchange_int)
+#define VIDEO_THREAD_HAS_REC 1
+#endif
+#define VIDEO_THREAD_REC_FRESH 4
+typedef struct video_thread_rec
+{
+   struct video_thread_rec *next;  /* the main thread's retired list */
+   uint8_t *buf[3];
+   bool (*read)(void *data, uint8_t *buffer, bool bgrx, bool *bottom_up);
+   uint8_t *source;
+   struct scaler_ctx scaler;
+   size_t source_size;
+   /* The buffer holding the newest frame read back, with
+    * VIDEO_THREAD_REC_FRESH until the main thread takes it */
+   retro_atomic_int_t ready;
+   unsigned dims;
+   unsigned back;                  /* the video thread's */
+   unsigned front;                 /* the main thread's */
+   unsigned source_dims;
+   bool taken;                     /* the main thread has taken one */
+   bool bgrx;                      /* B,G,R,X rows, else BGR24 */
+   /* Each buffer's row order, written with it by the video thread */
+   bool bottom_up[3];
+} video_thread_rec_t;
+
+/* Keep the shared wrapper and frame-slot layouts unchanged. */
+typedef struct video_thread_private
+{
+   thread_video_t base;
+   video_thread_rec_t *rec;
+   video_thread_rec_t *rec_retired;
+   video_thread_rec_t *rec_slot[2];
+} video_thread_private_t;
+
+#ifdef VIDEO_THREAD_HAS_REC
+
+/* Resize on the worker, preserving the encoder's dimensions and aspect. */
+static void video_thread_rec_read(thread_video_t *thr,
+      video_thread_rec_t *rec, const struct video_viewport *vp)
+{
+   uint8_t *out   = rec->buf[rec->back];
+   bool *bottom_up = &rec->bottom_up[rec->back];
+   unsigned bpp   = rec->bgrx ? 4 : 3;
+   unsigned vp_w  = VIDEO_SCALE_W(vp->dims);
+   unsigned vp_h  = VIDEO_SCALE_H(vp->dims);
+   if (!vp_w || !vp_h || vp_w > INT_MAX / 4
+         || vp_h > INT_MAX
+         || (size_t)vp_w > (size_t)-1 / 4 / vp_h)
+      return;
+   if (vp->dims != rec->dims)
+   {
+      struct scaler_ctx *ctx = &rec->scaler;
+      size_t size = (size_t)vp_w * vp_h * bpp;
+      unsigned x, y;
+      if (size > rec->source_size)
+      {
+         uint8_t *source = (uint8_t*)realloc(rec->source, size);
+         if (!source)
+            return;
+         rec->source      = source;
+         rec->source_size = size;
+      }
+      if (rec->source_dims != vp->dims)
+      {
+         unsigned width, height;
+         if (  (uint64_t)vp_w * VIDEO_SCALE_H(rec->dims)
+             > (uint64_t)vp_h * VIDEO_SCALE_W(rec->dims))
+         {
+            width  = VIDEO_SCALE_W(rec->dims);
+            height = (unsigned)((uint64_t)vp_h * width / vp_w);
+         }
+         else
+         {
+            height = VIDEO_SCALE_H(rec->dims);
+            width  = (unsigned)((uint64_t)vp_w * height / vp_h);
+         }
+         scaler_ctx_gen_reset(ctx);
+         ctx->in_width    = vp_w;
+         ctx->in_height   = vp_h;
+         ctx->in_stride   = vp_w * bpp;
+         ctx->out_width   = width ? width : 1;
+         ctx->out_height  = height ? height : 1;
+         ctx->out_stride  = VIDEO_SCALE_W(rec->dims) * bpp;
+         /* B,G,R,X bytes are a little-endian ARGB8888 word */
+         ctx->in_fmt      = rec->bgrx ? SCALER_FMT_ARGB8888 : SCALER_FMT_BGR24;
+         ctx->out_fmt     = ctx->in_fmt;
+         ctx->scaler_type = SCALER_TYPE_BILINEAR;
+         /* A failed rebuild must also invalidate the previous dimensions. */
+         rec->source_dims = 0;
+         if (!scaler_ctx_gen_filter(ctx))
+            return;
+         rec->source_dims   = vp->dims;
+      }
+      /* The scaler keeps the row order the read left. */
+      if (!rec->read(thr->driver_data, rec->source, rec->bgrx, bottom_up))
+         return;
+      x = (VIDEO_SCALE_W(rec->dims) - ctx->out_width)  / 2;
+      y = (VIDEO_SCALE_H(rec->dims) - ctx->out_height) / 2;
+      memset(out, 0, VIDEO_SCALE_AREA(rec->dims) * bpp);
+      scaler_ctx_scale_direct(ctx, out
+            + ((size_t)y * VIDEO_SCALE_W(rec->dims) + x) * bpp, rec->source);
+   }
+   else if (!rec->read(thr->driver_data, out, rec->bgrx, bottom_up))
+      return;
+   rec->back = (unsigned)retro_atomic_exchange_int(&rec->ready,
+         (int)(rec->back | VIDEO_THREAD_REC_FRESH)) & 3u;
+}
+#endif
+
+/* Main thread: whether a slot the video thread is drawing or will
+ * claim names rec, given the ring word 'st'. The pending slot is tail,
+ * both are pending at two, and the one being drawn is tail ^ 1. */
+static bool video_thread_rec_in_flight(const thread_video_t *thr,
+      const video_thread_rec_t *rec, int st)
+{
+   unsigned s;
+   unsigned tail    = VIDEO_THREAD_RING_TAIL_OF(st);
+   unsigned pending = VIDEO_THREAD_RING_PENDING_OF(st);
+   bool busy        = VIDEO_THREAD_RING_BUSY_OF(st);
+   for (s = 0; s < 2; s++)
+   {
+      if (((video_thread_private_t*)thr)->rec_slot[s] != rec)
+         continue;
+      if (     pending == 2
+            || (pending == 1 && s == tail)
+            || (busy && s == (tail ^ 1)))
+         return true;
+   }
+   return false;
+}
+
+bool video_thread_record_gpu_in_flight(void *data, const void *recorder)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   unsigned s, tail, pending;
+   bool busy;
+   int state;
+   if (!thr || !recorder) return false;
+   state = video_thread_ring_load(thr);
+   tail = VIDEO_THREAD_RING_TAIL_OF(state);
+   pending = VIDEO_THREAD_RING_PENDING_OF(state);
+   busy = VIDEO_THREAD_RING_BUSY_OF(state);
+   for (s = 0; s < 2; s++)
+      if ((pending == 2 || (pending == 1 && s == tail)
+               || (busy && s == (tail ^ 1)))
+            && thr->frame.slot[s].video_info.recording_gpu == recorder)
+         return true;
+   return false;
+}
+
+static void video_thread_rec_free_list(video_thread_rec_t *rec)
+{
+   while (rec)
+   {
+      video_thread_rec_t *next = rec->next;
+      scaler_ctx_gen_reset(&rec->scaler);
+      free(rec->source);
+      free(rec);
+      rec = next;
+   }
+}
+
+/* Main thread: frees the retired buffers no slot in flight names, once
+ * a recording has stopped. The ring word is read once for the test: a
+ * slot the video thread completes after the read is freed on a later
+ * pass, and one it has not been handed cannot come into flight. Out of
+ * line and never inlined: video_thread_frame() reaches it only through
+ * a pointer test, and it runs for a handful of frames after a
+ * recording ends, not on the per-frame path. */
+#ifdef __GNUC__
+__attribute__((noinline))
+#endif
+static void video_thread_rec_reap(thread_video_t *thr)
+{
+   video_thread_rec_t *done = NULL;
+   video_thread_rec_t **pp  = &((video_thread_private_t*)thr)->rec_retired;
+   int st                   = video_thread_ring_load(thr);
+   while (*pp)
+   {
+      video_thread_rec_t *rec = *pp;
+      if (video_thread_rec_in_flight(thr, rec, st))
+         pp = &rec->next;
+      else
+      {
+         *pp       = rec->next;
+         rec->next = done;
+         done      = rec;
+      }
+   }
+   video_thread_rec_free_list(done);
+}
+
+void video_thread_record_stop(void *data)
+{
+   thread_video_t     *thr = (thread_video_t*)data;
+   video_thread_rec_t *rec;
+   if (!thr || !(rec = ((video_thread_private_t*)thr)->rec))
+      return;
+   /* Named in no frame from here on; freed once none in flight does */
+   rec->next        = ((video_thread_private_t*)thr)->rec_retired;
+   ((video_thread_private_t*)thr)->rec_retired = rec;
+   ((video_thread_private_t*)thr)->rec         = NULL;
+}
+
+bool video_thread_record_has_reader(void *data)
+{
+#ifdef VIDEO_THREAD_HAS_REC
+   thread_video_t *thr = (thread_video_t*)data;
+   return thr && thr->poke && thr->poke->record_read;
+#else
+   (void)data;
+   return false;
+#endif
+}
+
+int video_thread_record_take(void *data, unsigned dims, bool bgrx,
+      const uint8_t **frame, bool *bottom_up)
+{
+#ifdef VIDEO_THREAD_HAS_REC
+   thread_video_t     *thr = (thread_video_t*)data;
+   video_thread_rec_t *rec;
+   if (!video_thread_record_has_reader(thr))
+      return -2;
+   if (!VIDEO_SCALE_W(dims) || !VIDEO_SCALE_H(dims) || VIDEO_SCALE_W(dims) > INT_MAX / 4
+         || VIDEO_SCALE_H(dims) > INT_MAX
+         || (size_t)VIDEO_SCALE_W(dims) > (((size_t)-1 - sizeof(*rec)) / 12) / VIDEO_SCALE_H(dims))
+      return -1;
+   rec           = ((video_thread_private_t*)thr)->rec;
+   if (!rec || rec->dims != dims || rec->bgrx != bgrx)
+   {
+      /* One allocation: the header, then the three buffers */
+      size_t size = VIDEO_SCALE_AREA(dims) * (bgrx ? 4 : 3);
+      video_thread_record_stop(thr);
+      if (!(rec = (video_thread_rec_t*)malloc(sizeof(*rec) + 3 * size)))
+         return -1;
+      memset(rec, 0, sizeof(*rec));
+      rec->next   = NULL;
+      rec->buf[0] = (uint8_t*)(rec + 1);
+      rec->buf[1] = rec->buf[0] + size;
+      rec->buf[2] = rec->buf[1] + size;
+      rec->dims   = dims;
+      retro_atomic_int_init(&rec->ready, 0);
+      rec->front  = 1;
+      rec->back   = 2;
+      rec->taken  = false;
+      rec->bgrx   = bgrx;
+      rec->read   = thr->poke->record_read;
+      ((video_thread_private_t*)thr)->rec    = rec;
+      return -1;
+   }
+   if (!(retro_atomic_load_acquire_int(&rec->ready) & VIDEO_THREAD_REC_FRESH))
+      return rec->taken ? 0 : -1;
+   /* Hands the buffer read last back, takes the newest */
+   rec->front = (unsigned)retro_atomic_exchange_int(&rec->ready,
+         (int)rec->front) & 3u;
+   rec->taken = true;
+   *frame     = rec->buf[rec->front];
+   *bottom_up = rec->bottom_up[rec->front];
+   return 1;
+#else
+   (void)data;
+   (void)dims;
+   (void)bgrx;
+   (void)frame;
+   (void)bottom_up;
+   return -2;
+#endif
+}
+
+/* A texture the frontend released, waiting for the video thread to free
+ * it: the thread that holds the GPU context is the only one that may,
+ * and only once every frame that could still name it has been drawn. */
+struct video_thread_tex_retire
+{
+   mpsc_stack_node_t node;   /* first: the list link is the node */
+   uintptr_t id;
+#ifdef HAVE_VIDEO_FILTER
+   /* Or a software filter and its output buffer, when set */
+   void *filter;
+   void *filter_buf;
+#endif
+};
+
+/* Video thread: frees the textures the frame just drawn carried. Called
+ * with no lock held, after the frame, so the driver's delete runs on
+ * the thread whose context it belongs to. */
+static void video_thread_tex_retire_run(thread_video_t *thr,
+      video_thread_tex_retire_t *list)
+{
+   while (list)
+   {
+      video_thread_tex_retire_t *next =
+         (video_thread_tex_retire_t*)list->node.next;
+#ifdef HAVE_VIDEO_FILTER
+      if (list->filter || list->filter_buf)
+      {
+         if (list->filter)
+            rarch_softfilter_free((rarch_softfilter_t*)list->filter);
+         if (list->filter_buf)
+         {
+#ifdef _3DS
+            linearFree(list->filter_buf);
+#else
+            memalign_free(list->filter_buf);
+#endif
+         }
+         free(list);
+         list = next;
+         continue;
+      }
+#endif
+      if (thr->lend_used)
+         video_thread_lend_forget(thr, list->id);
+      if (thr->poke && thr->poke->unload_texture && thr->driver_data)
+         thr->poke->unload_texture(thr->driver_data, false, list->id);
+      free(list);
+      list = next;
+   }
+}
+
+#ifdef HAVE_VIDEO_FILTER
+bool video_thread_retire_filter(void *filter, void *buffer)
+{
+   video_driver_state_t      *video_st = video_state_get_ptr();
+   thread_video_t            *thr;
+   video_thread_tex_retire_t *node;
+
+   if (     !video_st->thread_wrapper_active
+         || !(thr = (thread_video_t*)video_st->data)
+         || !thr->thread
+         || !(node = (video_thread_tex_retire_t*)malloc(sizeof(*node))))
+      return false;
+   node->id         = 0;
+   node->filter     = filter;
+   node->filter_buf = buffer;
+   mpsc_stack_push(&thr->tex_retire, &node->node);
+   return true;
+}
+#endif
+
+#ifdef HAVE_GFX_WIDGETS
+/* Keeps a slot's copies of the widget paths in step with the main
+ * thread's, without writing them again every frame: one call out of
+ * line, so the frame handoff carries neither the compares nor the
+ * copies. They are paths - after the first frame these never differ. */
+static void video_thread_slot_widget_paths(
+      struct video_thread_frame_slot *s,
+      const video_frame_info_t *video_info)
+{
+   const char *dir  = video_info->widget_dir_assets
+      ? video_info->widget_dir_assets  : "";
+   const char *font = video_info->widget_path_font
+      ? video_info->widget_path_font   : "";
+
+   if (strcmp(s->widget_dir_assets, dir) != 0)
+      strlcpy(s->widget_dir_assets, dir, sizeof(s->widget_dir_assets));
+   if (strcmp(s->widget_path_font, font) != 0)
+      strlcpy(s->widget_path_font, font, sizeof(s->widget_path_font));
+
+   s->video_info.widget_dir_assets = s->widget_dir_assets;
+   s->video_info.widget_path_font  = s->widget_path_font;
+
+   {
+      /* The menu's two, on the same terms */
+      const char *preset = video_info->menu.rgui_theme_preset
+         ? video_info->menu.rgui_theme_preset      : "";
+      const char *wall   = video_info->menu.dynamic_wallpapers_dir
+         ? video_info->menu.dynamic_wallpapers_dir : "";
+      if (strcmp(s->menu_rgui_theme_preset, preset) != 0)
+         strlcpy(s->menu_rgui_theme_preset, preset,
+               sizeof(s->menu_rgui_theme_preset));
+      if (strcmp(s->menu_dynamic_wallpapers_dir, wall) != 0)
+         strlcpy(s->menu_dynamic_wallpapers_dir, wall,
+               sizeof(s->menu_dynamic_wallpapers_dir));
+      s->video_info.menu.rgui_theme_preset      = s->menu_rgui_theme_preset;
+      s->video_info.menu.dynamic_wallpapers_dir = s->menu_dynamic_wallpapers_dir;
+   }
+}
+#endif
+
+static bool video_thread_prefer_fast_cores;
+static bool video_thread_raise_priority;
+
+void video_thread_set_prefer_fast_cores(bool prefer)
+{
+   video_thread_prefer_fast_cores = prefer;
+}
+
+void video_thread_set_raise_priority(bool raise)
+{
+   video_thread_raise_priority = raise;
+}
+
+/* Video thread: whether this pass has anything to do. A repeat that has
+ * fallen due, or been asked for, counts; repeat_request is taken here
+ * with a fetch_and so an ask that lands mid-test is not lost. */
+static bool video_thread_work_due(thread_video_t *thr, int st,
+      bool *repeat_due)
+{
+   if (     retro_atomic_load_acquire_int(&thr->send_cmd) != CMD_VIDEO_NONE
+         || VIDEO_THREAD_RING_PENDING_OF(st)
+         || !mpsc_stack_empty(&thr->async.in)
+         || retro_atomic_load_acquire_int(&thr->deferred_head)
+            != retro_atomic_load_acquire_int(&thr->deferred_tail))
+      return true;
+   if (thr->present_repeat && thr->present_period > 0)
+   {
+      /* Taken whichever way the repeat falls due, so an ask that
+       * coincides with the deadline is not a second repeat */
+      bool asked = retro_atomic_fetch_and_int(&thr->repeat_request, 0) != 0;
+      if (asked || cpu_features_get_time_usec() >= thr->next_present)
+      {
+         *repeat_due = true;
+         return true;
+      }
+   }
+   return false;
+}
+
 static void video_thread_loop(void *data)
 {
+   video_thread_tex_retire_t *tex_retire = NULL;
    thread_packet_t pkt;
-   bool updated;
+   unsigned slot;
+   bool claimed;
+   bool have_cmd;
+   thread_elevation_token_t elevation;
    thread_video_t *thr = (thread_video_t*)data;
+
+   sthread_setname("ra-video");
+   if (video_thread_prefer_fast_cores && sthread_prefer_fast_cores())
+      RARCH_LOG("[Video] Video thread placed on the performance cores.\n");
+   memset(&elevation, 0, sizeof(elevation));
+   {
+      enum thread_elevation_result r = THREAD_ELEVATION_REFUSED;
+      if (video_thread_raise_priority)
+         r = thread_elevation_raise_current(THREAD_ELEVATION_TASK_GAMES,
+               &elevation, NULL, NULL);
+      thread_elevation_note(THREAD_ELEVATION_SLOT_VIDEO, r, &elevation,
+            video_thread_raise_priority);
+      if (r == THREAD_ELEVATION_GRANTED)
+         RARCH_LOG("[Video] Video thread priority raised.\n");
+   }
 
    for (;;)
    {
-      slock_lock(thr->lock);
-      while (thr->send_cmd == CMD_VIDEO_NONE && !thr->frame.updated)
-         scond_wait(thr->cond_thread, thr->lock);
+      bool repeat_due = false;
+      int  st;
 
-      updated = thr->frame.updated;
+      /* Park until there is work: a frame in the ring, a command, an
+       * upload, a deferred packet, or - with a frame retained - the
+       * repeat deadline. The deferred ring belongs in this test as
+       * much as the rest: a packet queued while nothing else is due
+       * has no frame behind it to carry it. Each producer writes its
+       * work before it notifies, so the re-check between prepare and
+       * commit sees it. */
+      for (;;)
+      {
+         int key;
 
-      /* To avoid race condition where send_cmd is updated
-       * right after the switch is checked. */
-      pkt     = thr->cmd_data;
+         st = video_thread_ring_load(thr);
+         if (video_thread_work_due(thr, st, &repeat_due))
+            break;
 
-      slock_unlock(thr->lock);
+         key = retro_eventcount_prepare_wait(&thr->work);
+         st  = video_thread_ring_load(thr);
+         if (video_thread_work_due(thr, st, &repeat_due))
+         {
+            retro_eventcount_cancel_wait(&thr->work);
+            break;
+         }
+         /* With a frame retained, the wait has a deadline: the next
+          * display period after the last present. Passing it with
+          * nothing new is what a repeat is for. */
+         if (thr->present_repeat && thr->present_period > 0)
+         {
+            retro_time_t now = cpu_features_get_time_usec();
+            if (thr->next_present > now)
+               retro_eventcount_commit_wait_timeout(&thr->work, key,
+                     thr->next_present - now);
+            else
+               retro_eventcount_cancel_wait(&thr->work);
+         }
+         else
+            retro_eventcount_commit_wait(&thr->work, key);
+      }
 
-      if (video_thread_handle_packet(thr, &pkt))
+      /* Claim the oldest filled slot: from the claim until completion
+       * the slot is this thread's and the main thread routes new
+       * frames to the other one. The compare-and-swap is what keeps a
+       * push taking back this same slot from succeeding too. */
+      claimed = false;
+      slot    = 0;
+      for (;;)
+      {
+         unsigned pending = VIDEO_THREAD_RING_PENDING_OF(st);
+         if (!pending)
+            break;
+         slot = VIDEO_THREAD_RING_TAIL_OF(st);
+         if (retro_atomic_cas_int(&thr->frame.state, st,
+               VIDEO_THREAD_RING_MAKE(slot ^ 1, pending - 1, true)))
+         {
+            claimed = true;
+            break;
+         }
+         st = video_thread_ring_load(thr);
+      }
+      if (claimed)
+      {
+         video_thread_hw_note_claim(thr, thr->frame.slot[slot].hw_slot);
+         /* The paced wait in video_thread_frame() blocks on pending
+          * dropping, which just happened; tell it now rather than a
+          * whole render later at completion. */
+         retro_eventcount_notify(&thr->frame.ring);
+      }
+
+      /* One GL context handed between the threads: this pass holds it
+       * from here, and gives it back at the end. After the claim, which
+       * needs no GL: a push waiting for ring space while it holds the
+       * context is answered by the claim, not by this wait. */
+      video_thread_hw_ctx_take(thr, true);
+
+      /* A command is in the mailbox for as long as send_cmd says so:
+       * the reply clears it, so a pass after the reply - this thread
+       * wakes on its own for repeats - does not run the command again
+       * off the reply still sitting in cmd_data. */
+      have_cmd = retro_atomic_load_acquire_int(&thr->send_cmd)
+         != CMD_VIDEO_NONE;
+      if (have_cmd)
+         pkt = thr->cmd_data;
+
+      video_thread_run_deferred(thr);
+
+      /* A readback follows the frame claimed on this pass. */
+      if (have_cmd && (!claimed || (pkt.type != CMD_READ_VIEWPORT
+                  && pkt.type != CMD_READ_VIEWPORT_HDR))
+            && video_thread_handle_packet(thr, &pkt))
+      {
+         thread_elevation_lower_current(&elevation);
+         thread_elevation_note(THREAD_ELEVATION_SLOT_VIDEO,
+               THREAD_ELEVATION_REFUSED, NULL, false);
          return;
+      }
 
-      if (updated)
+      video_thread_async_run(thr);
+      if (thr->lend_busy)
+         video_thread_lend_poll(thr);
+      if (thr->frame.mem_busy)
+         video_thread_mem_poll(thr);
+
+      if (claimed)
       {
          struct video_viewport vp;
+         uint64_t        presents = 0;
+         float       refresh_rate = 0.0f;
+         retro_time_t render_start = 0;
+         retro_time_t render_took  = 0;
+         retro_time_t   new_period = 0;
+         bool           new_repeat = false;
+         bool              new_ask = false;
+         bool           ret_frame = false;
          bool               alive = false;
          bool               focus = false;
          bool        has_windowed = false;
+         /* True unless the context says otherwise, so a driver without
+          * the hook keeps pacing exactly as it did. */
+         bool         presentable = true;
+         int            frame_mem = -1;
 
-         vp.x                     = 0;
-         vp.y                     = 0;
-         vp.width                 = 0;
-         vp.height                = 0;
-         vp.full_width            = 0;
-         vp.full_height           = 0;
+         vp.pos                   = VIDEO_POS_PACK(0, 0);
+         vp.dims                  = 0;
+         vp.full_dims             = 0;
 
-         slock_lock(thr->frame.lock);
-
+         /* The menu texture, its enable flags and a requested state
+          * apply arrive through a triple buffer and atomics, so the
+          * main thread's setters never wait on this thread. The driver
+          * copies the texture's pixels inside set_texture_frame() and
+          * keeps no pointer, so the slot taken here is free again by
+          * the next take. */
          thread_update_driver_state(thr);
+         video_thread_movie_apply(&thr->movie_state,
+               &thr->frame.slot[slot].movie,
+               thr->driver_data, thr->poke);
 
          if (thr->driver_data && thr->driver)
          {
             if (thr->driver->frame)
             {
-               video_frame_info_t video_info;
-               bool               ret;
+               unsigned out_dims_o;
+               bool ret;
+               video_frame_info_t *video_info = &thr->frame.slot[slot].video_info;
 
-               /* TODO/FIXME - not thread-safe - should get
-                * rid of this */
-               video_driver_build_info(&video_info);
+               /* The frame info was built on the main thread when the
+                * frame was pushed, with the output size known then. A
+                * window resize is noticed on this thread, in the
+                * driver's alive() between frames, which records the new
+                * size; a frame pushed before that carries the old one,
+                * and a driver that sizes its swapchain and viewport
+                * from the frame info would rebuild them at the old size
+                * and draw the menu into a corner of the window. The size
+                * the driver reported last is what it must draw to now. */
+               out_dims_o = video_driver_get_output_dims();
+               if (VIDEO_SCALE_W(out_dims_o) && VIDEO_SCALE_H(out_dims_o))
+                  video_info->dims = out_dims_o;
 
-               ret = thr->driver->frame(thr->driver_data,
-                  thr->frame.buffer, thr->frame.width, thr->frame.height,
-                  thr->frame.count, thr->frame.pitch,
-                  *thr->frame.msg ? thr->frame.msg : NULL,
-                  &video_info);
+               /* video_driver_build_info() resolves userdata from
+                * video_driver_st, and video_thread_free() clears
+                * thread_wrapper_active before this thread
+                * stops, so a frame built inside that window would carry
+                * the thread_video_t wrapper instead of the real driver
+                * data.  This thread knows its own. The slot is discarded
+                * after this call, so the driver may scribble on it. */
+               video_info->userdata   = thr->driver_data;
+               /* This thread presents, so it owns the swap counter; the
+                * value carried from the main thread is whatever it read
+                * when the frame was built and is superseded here. */
+               video_info->swap_count = thr->video_st->swap_count;
+               /* Retain what this frame puts on screen when the setting
+                * is on and the driver can put it there again. Shader
+                * sub-frames opt out: each is a different shader output
+                * and only the last would be retained. BFI is fine, the
+                * driver replays the whole group. */
+               video_info->retain_output =
+                     video_info->threaded_present_repeat
+                  && thr->poke && thr->poke->present_last
+                  && video_info->shader_subframes <= 1;
 
-               slock_unlock(thr->frame.lock);
+               render_start = cpu_features_get_time_usec();
+               /* This thread draws the frame's text, so the glyph
+                * caches' frame begins here, and its own fonts follow a
+                * language change before they draw */
+               font_driver_frame_begin();
+               font_driver_follow_language();
+#ifdef HAVE_OPENXR
+               /* The eyes the core drew this frame from */
+               if (video_info->vr_give)
+                  video_driver_vr_give(video_info->vr_give - 1);
+#endif
+#ifdef HAVE_GFX_WIDGETS
+               /* This thread draws the widgets, so it advances and lays
+                * them out too, before the driver's frame asks whether
+                * any are visible - where the runloop does it without
+                * the wrapper */
+               if (video_info->widgets_active)
+                  gfx_widgets_worker_step(video_info,
+                        thr->frame.slot[slot].status_text,
+                        thr->frame.slot[slot].status_text_len);
+#endif
+               if (thr->frame.slot[slot].hw_slot >= 0)
+               {
+                  /* A hardware frame: the driver reads the core's
+                   * image and command buffers from its own state,
+                   * which this thread now fills from the ring slot. */
+                  video_thread_hw_before_frame(thr, thr->frame.slot[slot].hw_slot,
+                        false);
+                  ret = thr->driver->frame(thr->driver_data,
+                     RETRO_HW_FRAME_BUFFER_VALID,
+                     thr->frame.slot[slot].dims,
+                     thr->frame.slot[slot].count,
+                     thr->frame.slot[slot].pitch,
+                     *thr->frame.slot[slot].msg
+                        ? thr->frame.slot[slot].msg : NULL,
+                     video_info);
+                  video_thread_hw_after_frame(thr, thr->frame.slot[slot].hw_slot);
+               }
+               else
+               {
+                  /* A dupe goes to the driver as the NULL the core
+                   * sent, exactly as it does without the wrapper. */
+                  const void *fdata = thr->frame.slot[slot].dupe
+                     ? NULL : thr->frame.slot[slot].buffer
+                            + thr->frame.slot[slot].offset;
+                  unsigned fdims    = thr->frame.slot[slot].dims;
+                  unsigned fpitch   = thr->frame.slot[slot].pitch;
+                  /* A dupe of a hardware frame draws the last presented
+                   * HW slot again, and on Vulkan so does a software
+                   * frame, so it is installed and fenced like the frame
+                   * that first drew it: the core's wait on the slot
+                   * then covers this read as well. */
+                  int dupe_hw_slot  = video_thread_hw_dupe_slot(thr,
+                        thr->frame.slot[slot].dupe);
+                  if (fdata && thr->frame.slot[slot].convert)
+                     video_thread_convert(thr, thr->frame.slot[slot].convert,
+                           &fdata, fdims, &fpitch);
+#ifdef HAVE_VIDEO_FILTER
+                  if (fdata && thr->frame.slot[slot].filter_bpp)
+                     video_thread_filter(thr->frame.slot[slot].filter,
+                           thr->frame.slot[slot].filter_buf,
+                           thr->frame.slot[slot].filter_out_bpp,
+                           &fdata, &fdims, &fpitch);
+#endif
+                  if (dupe_hw_slot >= 0)
+                     video_thread_hw_before_frame(thr, dupe_hw_slot, true);
+                  ret = thr->driver->frame(thr->driver_data,
+                     fdata, fdims,
+                     thr->frame.slot[slot].count,
+                     fpitch,
+                     *thr->frame.slot[slot].msg
+                        ? thr->frame.slot[slot].msg : NULL,
+                     video_info);
+                  if (dupe_hw_slot >= 0)
+                     video_thread_hw_after_frame(thr, dupe_hw_slot);
+                  /* Read from the driver's frame memory where it lies:
+                   * held from the main thread until the read is done */
+                  if (     fdata && fdata == thr->frame.slot[slot].buffer
+                           + thr->frame.slot[slot].offset
+                        && thr->frame.mem[thr->frame.slot[slot].mem].id)
+                     frame_mem = thr->frame.slot[slot].mem;
+               }
+
+               ret_frame  = ret;
+               render_took = cpu_features_get_time_usec() - render_start;
+               /* The fonts this thread retired come due behind the
+                * frames that drew with them */
+               font_driver_free_pending(false);
+               /* A present that waited for the display: the wait is
+                * not drawing, and is not held back for before the next
+                * vblank; and where the frame is out as the call
+                * returns, that is when it went out. A swap that waits
+                * for the vblank was counted whole as render time - so
+                * the hold started the core a wait earlier each frame,
+                * until it started a period early - and its frame was
+                * counted to the vblank after its own. */
+               thr->present_shown = false;
+               if (ret && thr->poke && thr->poke->get_last_present_wait)
+               {
+                  bool shown          = false;
+                  retro_time_t waited = thr->poke->get_last_present_wait(
+                        thr->driver_data, &shown);
+                  if (waited > render_took)
+                     waited = render_took;
+                  thr->present_shown = shown;
+                  if (waited > 0)
+                     render_took -= waited;
+                  if (shown)
+                     video_thread_margin_learn(thr, waited);
+                  /* for the statistics, averaged as the render time is */
+                  thr->present_wait = thr->present_wait
+                     ? (thr->present_wait * 7 + waited) / 8 : waited;
+               }
+               if (ret && thr->poke && thr->poke->get_last_present_sync)
+               {
+                  retro_time_t fence = 0, lock = 0;
+                  thr->poke->get_last_present_sync(thr->driver_data,
+                        &fence, &lock);
+                  thr->fence_wait = thr->fence_wait
+                     ? (thr->fence_wait * 7 + fence) / 8 : fence;
+                  thr->lock_wait  = thr->lock_wait
+                     ? (thr->lock_wait * 7 + lock) / 8 : lock;
+               }
+               if (ret)
+               {
+                  /* The presenter's clock: this frame just went out,
+                   * and the next one is due a display period later.
+                   * driver_refresh_rate is this thread's own value. */
+                  float hz = thr->driver_refresh_rate > 0.0f
+                     ? thr->driver_refresh_rate : video_info->refresh_rate;
+                  presents = video_driver_presents_per_frame(video_info);
+                  /* A repeat replays the whole group, so it is due a
+                   * group's worth of display periods later. Stored to
+                   * the presenter's fields below and published with
+                   * the snapshot. */
+                  new_period = hz > 0.0f
+                     ? (retro_time_t)(1000000.0f * (float)presents / hz) : 0;
+                  new_repeat = video_info->retain_output;
+                  new_ask    = video_info->present_timing_from_display;
+               }
+               else
+                  thr->present_repeat = false;
 
                if (ret)
                {
@@ -482,32 +3081,385 @@ static void video_thread_loop(void *data)
                      focus = thr->driver->focus(thr->driver_data);
                   if (thr->driver->has_windowed)
                      has_windowed = thr->driver->has_windowed(thr->driver_data);
+                  /* Direct: this is the video thread, which owns the
+                   * context, and the dispatching call would read back
+                   * the value published here on the previous frame. */
+                  presentable = video_context_driver_presentable_direct();
+                  if (thr->poke && thr->poke->get_refresh_rate)
+                     refresh_rate = thr->poke->get_refresh_rate(thr->driver_data);
                }
             }
-            else
-               slock_unlock(thr->frame.lock);
 
             if (thr->driver->viewport_info)
                thr->driver->viewport_info(thr->driver_data, &vp);
+
+            /* GPU recording: what was just drawn, read back */
+#ifdef VIDEO_THREAD_HAS_REC
+            if (ret_frame && ((video_thread_private_t*)thr)->rec_slot[slot])
+               video_thread_rec_read(thr,
+                     ((video_thread_private_t*)thr)->rec_slot[slot], &vp);
+#endif
+         }
+
+         retro_atomic_store_release_int(&thr->win_flags,
+                 (alive        ? VIDEO_THREAD_WIN_ALIVE        : 0)
+               | (focus        ? VIDEO_THREAD_WIN_FOCUS        : 0)
+               | (presentable  ? VIDEO_THREAD_WIN_PRESENTABLE  : 0)
+               | (has_windowed ? VIDEO_THREAD_WIN_HAS_WINDOWED : 0));
+         video_thread_publish_vp(thr, &vp);
+         /* Statistics. The viewport maths ran on this thread during
+          * thr->driver->frame() above, so publish the result rather
+          * than letting the main thread read video_driver_st. */
+         retro_atomic_store_release_int(&thr->scale_packed,
+               (int)thr->video_st->scale_dims);
+         /* Under the wrapper this thread owns swap_count; every advance
+          * happens here and is published with the snapshot
+          * video_thread_swap_count() reads. */
+         thr->video_st->swap_count += presents;
+         thr->driver_refresh_rate = refresh_rate;
+         retro_atomic_store_release_int(&thr->refresh_rate_bits,
+               video_thread_float_bits(refresh_rate));
+         if (ret_frame)
+         {
+            /* The presenter's and the pacer's inputs; the main thread
+             * takes them from the snapshot published below. */
+            thr->present_period     = new_period;
+            thr->present_repeat     = new_repeat;
+            thr->present_group      = (unsigned)presents;
+            thr->present_timing_ask = new_ask;
+         }
+         if (ret_frame)
+         {
+            /* A frame handed over more than a content period and a
+             * half before the vblank it went out on was queued behind
+             * another: its swap waited on that vblank, not on
+             * rendering. The wait is not render cost to reserve
+             * against - reserving it would release the core a period
+             * early and keep the queue full - and the frame behind is
+             * drained by holding the core one extra period, once. The
+             * content's period, not the display's: a 60 fps frame on a
+             * 120 Hz display is due every other vblank, and against the
+             * display's 8 ms a render of a few milliseconds plus the
+             * wait to its vblank read as a queue, draining frames that
+             * were never queued. */
+            bool early = false;
+            retro_time_t queue_period  = thr->present_period;
+            retro_time_t content_period = (retro_time_t)
+               retro_atomic_load_acquire_int(&thr->content_period_us);
+            if (content_period > queue_period)
+               queue_period = content_period;
+
+            video_thread_schedule_next(thr);
+            /* Latency: from the core's handover of this slot to the
+             * present's end just recorded. Repeats present in their
+             * own branch below and add nothing here. */
+            if (thr->last_present_end > thr->frame.slot[slot].pushed_at)
+            {
+               retro_time_t lat = thr->last_present_end - thr->frame.slot[slot].pushed_at;
+               if (     thr->present_period > 0
+                     && lat >= queue_period * 3 / 2)
+               {
+                  early = true;
+                  /* Frames pushed before a drain still report the
+                   * queue they were in; one drain per few presents. */
+                  if (!thr->drain_cooldown)
+                  {
+                     retro_atomic_store_release_int(&thr->drain_pending, 1);
+                     thr->drain_cooldown = 4;
+                  }
+               }
+               if (thr->drain_cooldown)
+                  thr->drain_cooldown--;
+               thr->latency_avg = thr->latency_avg
+                  ? (thr->latency_avg * 7 + lat) / 8 : lat;
+               /* The worst over the last couple of seconds, not since
+                * launch: a hitch at content load or a menu trip stood
+                * on the line for the whole session otherwise, and said
+                * nothing about the pacing now. */
+               if (lat > thr->latency_max
+                     || thr->last_present_end - thr->latency_max_at > 2000000)
+               {
+                  thr->latency_max    = lat;
+                  thr->latency_max_at = thr->last_present_end;
+               }
+               thr->latency_from_display = thr->phase_from_display;
+
+               /* The input's age: the same present, measured from the
+                * poll that read the devices for this frame rather than
+                * from the handover. A frame with no stamp - the
+                * statistics are off, so polls are not stamped - clears
+                * the figure. A stamp from long before the handover is
+                * not this frame's input (the core did not poll: a menu
+                * frame, a pause) and is left out. */
+               {
+                  retro_time_t in_at = thr->frame.slot[slot].input_at;
+                  retro_time_t at    = thr->frame.slot[slot].pushed_at;
+                  if (in_at <= 0)
+                     thr->input_age_avg = thr->input_age_max = 0;
+                  else if (in_at <= at && at - in_at < 1000000)
+                  {
+                     retro_time_t age   = thr->last_present_end - in_at;
+                     thr->input_age_avg = thr->input_age_avg
+                        ? (thr->input_age_avg * 7 + age) / 8 : age;
+                     if (     age > thr->input_age_max
+                           || thr->last_present_end - thr->input_age_max_at > 2000000)
+                     {
+                        thr->input_age_max    = age;
+                        thr->input_age_max_at = thr->last_present_end;
+                     }
+                  }
+               }
+            }
+            /* Moving average, weighted to the recent, of the render
+             * with its swap; a swap that only waited for a queued
+             * frame's vblank is left out. */
+            if (!early)
+               thr->render_time = thr->render_time
+                  ? (thr->render_time * 7 + render_took) / 8 : render_took;
+         }
+         /* Before the release below, so a waiter that sees the ring
+          * free has seen this frame's numbers too. */
+         video_thread_publish_stats(thr);
+         /* The textures this frame carried: every frame that could name
+          * one has been drawn now, so they can go. Taken before the
+          * slot is released, freed after. */
+         tex_retire         = (video_thread_tex_retire_t*)
+            thr->frame.slot[slot].tex_retire;
+         thr->frame.slot[slot].tex_retire = NULL;
+         if (frame_mem >= 0)
+         {
+            thr->frame.mem_busy |= 1u << frame_mem;
+            retro_atomic_store_release_int(&thr->frame.mem[frame_mem].busy, 1);
+         }
+         video_thread_ring_complete(thr);
+
+         if (tex_retire)
+         {
+            video_thread_tex_retire_run(thr, tex_retire);
+            tex_retire = NULL;
+         }
+#ifdef HAVE_OPENXR
+         /* The core's next frame is sampled here, past those queued */
+         video_driver_vr_publish(VIDEO_THREAD_RING_PENDING_OF(
+                  video_thread_ring_load(thr)));
+#endif
+      }
+      else if (repeat_due)
+      {
+         /* Nothing new by the deadline: show the retained frame again
+          * so the display keeps its cadence. No shader chain runs and
+          * no menu texture is touched, so this is not a rendered frame
+          * for the purposes of video_thread_wait_idle(). */
+         unsigned swaps = 0;
+         /* The comment above is the reason this takes no lock: a repeat
+          * touches no menu texture, so there is no handoff to serialise
+          * against, and the main thread never calls the driver. */
+         if (thr->driver_data && thr->poke && thr->poke->present_last)
+            swaps = thr->poke->present_last(thr->driver_data);
+
+         if (swaps)
+         {
+            thr->video_st->swap_count += swaps;
+            thr->frames_repeated++;
+            video_thread_schedule_next(thr);
          }
          else
-            slock_unlock(thr->frame.lock);
-
-         slock_lock(thr->lock);
-         thr->alive         = alive;
-         thr->focus         = focus;
-         thr->has_windowed  = has_windowed;
-         thr->vp            = vp;
-         thr->frame.updated = false;
-         scond_signal(thr->cond_cmd);
-         slock_unlock(thr->lock);
+            thr->present_repeat = false;
+         video_thread_publish_stats(thr);
       }
+      if (have_cmd && claimed && (pkt.type == CMD_READ_VIEWPORT
+               || pkt.type == CMD_READ_VIEWPORT_HDR))
+         video_thread_handle_packet(thr, &pkt);
+
+      video_thread_hw_ctx_release(thr, true);
    }
+}
+
+/* The thread a wrapper's loop runs on.
+ *
+ * It used to be made for one wrapper and joined when that wrapper was
+ * freed: a restart of the video driver ended one video thread and
+ * started another. That is still what happens - unless something on
+ * the thread asks for it to be held (video_thread_host_hold()), which
+ * the Windows window code does when it leaves its window up for the
+ * driver that comes next. A window belongs to the thread that made it
+ * and is destroyed when that thread ends, so a window can only be
+ * reused across a restart if the thread is.
+ *
+ * Held, the thread waits here between two wrappers; the next wrapper's
+ * loop runs on it. If no wrapper comes - the next driver is not
+ * threaded, or there is none - whoever holds it lets it go
+ * (video_thread_host_stop()), and the hook given with the hold runs on
+ * the thread before it ends, to take down what was left on it. */
+#define VIDEO_THREAD_HOST_JOB  (1 << 0) /* 'job' is to be run */
+#define VIDEO_THREAD_HOST_BUSY (1 << 1) /* a wrapper's loop is running */
+#define VIDEO_THREAD_HOST_HOLD (1 << 2) /* do not end when it returns */
+#define VIDEO_THREAD_HOST_QUIT (1 << 3)
+
+static struct
+{
+   retro_eventcount_t ec;
+   sthread_t *thread;
+   thread_video_t *job;     /* published by the release of JOB */
+   void (*on_exit)(void);   /* the host thread's own; run before it ends */
+#ifdef _WIN32
+   void (*cleanup)(void);
+#endif
+   retro_atomic_int_t flags;
+   bool ec_ready;
+} video_thread_host;
+
+/* Parks until one of @mask is set in the flags, or, with @clear, until
+ * none is. Returns the flags it woke on. */
+static int video_thread_host_wait(int mask, bool clear)
+{
+   for (;;)
+   {
+      int key;
+      int f = retro_atomic_load_acquire_int(&video_thread_host.flags);
+      if (clear ? !(f & mask) : (f & mask))
+         return f;
+      key = retro_eventcount_prepare_wait(&video_thread_host.ec);
+      f   = retro_atomic_load_acquire_int(&video_thread_host.flags);
+      if (clear ? !(f & mask) : (f & mask))
+      {
+         retro_eventcount_cancel_wait(&video_thread_host.ec);
+         return f;
+      }
+      retro_eventcount_commit_wait(&video_thread_host.ec, key);
+   }
+}
+
+static void video_thread_host_loop(void *data)
+{
+   (void)data;
+   for (;;)
+   {
+      int f = video_thread_host_wait(
+            VIDEO_THREAD_HOST_JOB | VIDEO_THREAD_HOST_QUIT, false);
+
+      if (!(f & VIDEO_THREAD_HOST_JOB))
+      {
+         void (*on_exit)(void)     = video_thread_host.on_exit;
+         video_thread_host.on_exit = NULL;
+         if (on_exit)
+            on_exit();
+#ifdef _WIN32
+         if (video_thread_host.cleanup)
+         {
+            void (*cleanup)(void) = video_thread_host.cleanup;
+            video_thread_host.cleanup = NULL;
+            cleanup();
+         }
+#endif
+         return;
+      }
+      retro_atomic_fetch_and_int(&video_thread_host.flags,
+            ~VIDEO_THREAD_HOST_JOB);
+
+      video_thread_loop(video_thread_host.job);
+
+      retro_atomic_fetch_and_int(&video_thread_host.flags,
+            ~VIDEO_THREAD_HOST_BUSY);
+      retro_eventcount_notify(&video_thread_host.ec);
+   }
+}
+
+/* Runs a wrapper's loop on the host thread, starting the thread if
+ * there is none. Returns the thread, or NULL. */
+static sthread_t *video_thread_host_run(thread_video_t *thr)
+{
+   if (!video_thread_host.ec_ready)
+   {
+      if (!retro_eventcount_init(&video_thread_host.ec))
+         return NULL;
+      video_thread_host.ec_ready = true;
+   }
+
+   video_thread_host.job = thr;
+   retro_atomic_store_release_int(&video_thread_host.flags,
+         VIDEO_THREAD_HOST_JOB | VIDEO_THREAD_HOST_BUSY);
+   retro_eventcount_notify(&video_thread_host.ec);
+
+   if (     !video_thread_host.thread
+         && !(video_thread_host.thread =
+               sthread_create(video_thread_host_loop, NULL)))
+   {
+      retro_atomic_store_release_int(&video_thread_host.flags, 0);
+      video_thread_host.job = NULL;
+      return NULL;
+   }
+   return video_thread_host.thread;
+}
+
+void video_thread_host_stop(void)
+{
+   sthread_t *thread = video_thread_host.thread;
+
+   if (!thread)
+      return;
+   retro_atomic_fetch_or_int(&video_thread_host.flags,
+         VIDEO_THREAD_HOST_QUIT);
+   retro_atomic_fetch_and_int(&video_thread_host.flags,
+         ~VIDEO_THREAD_HOST_HOLD);
+   retro_eventcount_notify(&video_thread_host.ec);
+   sthread_join(thread);
+   video_thread_host.thread  = NULL;
+   video_thread_host.on_exit = NULL;
+}
+
+/* A wrapper's loop has returned (CMD_FREE): waits for the thread to be
+ * back in its own loop, then ends it unless it is held. */
+static void video_thread_host_done(void)
+{
+   if (!(video_thread_host_wait(VIDEO_THREAD_HOST_BUSY, true)
+            & VIDEO_THREAD_HOST_HOLD))
+      video_thread_host_stop();
+}
+
+bool video_thread_host_hold(void (*on_exit)(void))
+{
+   if (     !video_thread_host.thread
+         || sthread_get_thread_id(video_thread_host.thread)
+            != sthread_get_current_thread_id())
+      return false;
+   for (;;)
+   {
+      int f = retro_atomic_load_acquire_int(&video_thread_host.flags);
+      if (f & VIDEO_THREAD_HOST_QUIT)
+         return false;
+      if (retro_atomic_cas_int(&video_thread_host.flags, f,
+               f | VIDEO_THREAD_HOST_HOLD))
+         break;
+   }
+   video_thread_host.on_exit = on_exit;
+   return true;
+}
+
+#ifdef _WIN32
+bool video_thread_host_set_cleanup(void (*cleanup)(void))
+{
+   if (!video_thread_host.thread
+         || sthread_get_thread_id(video_thread_host.thread)
+            != sthread_get_current_thread_id())
+      return false;
+   if (video_thread_host.cleanup && video_thread_host.cleanup != cleanup)
+      return false;
+   video_thread_host.cleanup = cleanup;
+   return true;
+}
+
+#endif
+
+bool video_thread_host_is_held(void)
+{
+   return video_thread_host.thread
+      && (retro_atomic_load_acquire_int(&video_thread_host.flags)
+         & VIDEO_THREAD_HOST_HOLD);
 }
 
 static bool video_thread_alive(void *data)
 {
-   bool ret;
    uint32_t runloop_flags;
    thread_video_t *thr = (thread_video_t*)data;
 
@@ -516,91 +3468,555 @@ static bool video_thread_alive(void *data)
 
    runloop_flags       = runloop_get_flags();
 
+   /* Paused, the video thread draws nothing, and what it publishes
+    * after a frame is where this answer comes from: without a frame it
+    * would never hear that the window had gone. So it is asked - but
+    * not waited on. The answer lands in the same word the frames
+    * publish to, and is read here on the next pass through, a frame
+    * later than a driver that drew would have said it. Waiting for it
+    * meant a round trip to the video thread for every iteration of a
+    * paused frontend. */
    if (runloop_flags & RUNLOOP_FLAG_PAUSED)
    {
       thread_packet_t pkt;
       pkt.type = CMD_ALIVE;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
-
-      return pkt.data.b;
+      if (!video_thread_defer_packet(thr, &pkt))
+      {
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
+         return pkt.data.b;
+      }
    }
 
-   slock_lock(thr->lock);
-   ret = thr->alive;
-   slock_unlock(thr->lock);
-
-   return ret;
+   return (retro_atomic_load_acquire_int(&thr->win_flags)
+         & VIDEO_THREAD_WIN_ALIVE) != 0;
 }
 
 static bool video_thread_focus(void *data)
 {
-   bool ret;
    thread_video_t *thr = (thread_video_t*)data;
 
    if (!thr)
       return false;
 
-   slock_lock(thr->lock);
-   ret = thr->focus;
-   slock_unlock(thr->lock);
-
-   return ret;
+   return (retro_atomic_load_acquire_int(&thr->win_flags)
+         & VIDEO_THREAD_WIN_FOCUS) != 0;
 }
 
 static bool video_thread_suppress_screensaver(void *data, bool enable)
 {
-   bool ret;
+   thread_packet_t pkt;
    thread_video_t *thr = (thread_video_t*)data;
 
    if (!thr)
       return false;
 
-   slock_lock(thr->lock);
-   ret = thr->suppress_screensaver;
-   slock_unlock(thr->lock);
-
-   return ret;
+   pkt.type   = CMD_SUPPRESS_SCREENSAVER;
+   pkt.data.b = enable;
+   video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   return pkt.data.b;
 }
 
 static bool video_thread_has_windowed(void *data)
 {
-   bool ret;
    thread_video_t *thr = (thread_video_t*)data;
 
    if (!thr)
       return false;
 
-   slock_lock(thr->lock);
-   ret = thr->has_windowed;
-   slock_unlock(thr->lock);
+   return (retro_atomic_load_acquire_int(&thr->win_flags)
+         & VIDEO_THREAD_WIN_HAS_WINDOWED) != 0;
+}
 
-   return ret;
+/* The handoff statistics, off the push's own path: a window starts,
+ * a push is accounted, a window is closed. Main thread. */
+static VIDEO_NOINLINE void video_thread_handoff_begin(thread_video_t *thr)
+{
+   /* The lend counts run whether or not the overlay is up; a window
+    * starts clean when it comes up */
+   thr->handoff.asked  = thr->handoff.lent   = 0;
+   thr->handoff.lapsed = 0;
+   thr->handoff.declined_ring = thr->handoff.declined_size = 0;
+}
+
+static VIDEO_NOINLINE void video_thread_handoff_account(thread_video_t *thr,
+      uint64_t handoff, uint64_t c_copy, uint64_t c_wait, size_t copied,
+      bool hw, bool zero_copy, bool waited, bool dropped)
+{
+   thr->handoff.handoff_sum += handoff;
+   if (handoff > thr->handoff.handoff_max)
+      thr->handoff.handoff_max = handoff;
+   thr->handoff.copy_sum    += c_copy;
+   if (c_copy > thr->handoff.copy_max)
+      thr->handoff.copy_max    = c_copy;
+   thr->handoff.wait_sum    += c_wait;
+   if (c_wait > thr->handoff.wait_max)
+      thr->handoff.wait_max    = c_wait;
+   thr->handoff.bytes       += copied;
+   if (hw)
+      thr->handoff.hw++;
+   else if (zero_copy)
+      thr->handoff.zero_copy++;
+   else if (copied)
+      thr->handoff.copied++;
+   if (waited)
+      thr->handoff.waits++;
+   if (dropped)
+      thr->handoff.dropped++;
+}
+
+/* The window's tick rate comes from this push's span between the two
+ * clock reads it makes anyway; after 120 pushes the window closes. */
+static VIDEO_NOINLINE void video_thread_handoff_latch(thread_video_t *thr,
+      uint64_t span_ticks, uint64_t span_us)
+{
+   thr->handoff.span_ticks += span_ticks;
+   thr->handoff.span_us    += span_us;
+   if (++thr->handoff.frames >= 120 && thr->handoff.span_ticks)
+   {
+      unsigned n    = thr->handoff.frames;
+      uint64_t tk   = thr->handoff.span_ticks;
+      uint64_t us   = thr->handoff.span_us;
+      video_thread_handoff_stats_t *l = &thr->handoff.last;
+      /* x100 microseconds = ticks * 100 * us / ticks-of-span */
+      l->handoff_avg_x100 = thr->handoff.handoff_sum * 100 * us / tk / n;
+      l->handoff_worst    = thr->handoff.handoff_max * us / tk;
+      l->copy_avg_x100    = thr->handoff.copy_sum * 100 * us / tk / n;
+      l->copy_worst       = thr->handoff.copy_max * us / tk;
+      l->wait_avg_x100    = thr->handoff.wait_sum * 100 * us / tk / n;
+      l->wait_worst       = thr->handoff.wait_max * us / tk;
+      l->bytes_per_frame  = thr->handoff.bytes / n;
+      l->frames_copied    = thr->handoff.copied;
+      l->frames_zero_copy = thr->handoff.zero_copy;
+      l->frames_hw        = thr->handoff.hw;
+      l->waits            = thr->handoff.waits;
+      l->dropped          = thr->handoff.dropped;
+      l->drains           = thr->handoff.drains;
+      l->asked            = thr->handoff.asked;
+      l->lent             = thr->handoff.lent;
+      l->lapsed           = thr->handoff.lapsed;
+      l->declined_ring    = thr->handoff.declined_ring;
+      l->declined_size    = thr->handoff.declined_size;
+      thr->handoff.handoff_sum = thr->handoff.handoff_max = 0;
+      thr->handoff.copy_sum    = thr->handoff.copy_max    = 0;
+      thr->handoff.wait_sum    = thr->handoff.wait_max    = 0;
+      thr->handoff.span_ticks  = thr->handoff.span_us     = 0;
+      thr->handoff.bytes       = 0;
+      thr->handoff.copied      = thr->handoff.zero_copy   = 0;
+      thr->handoff.hw          = thr->handoff.waits       = 0;
+      thr->handoff.asked       = thr->handoff.lent        = 0;
+      thr->handoff.lapsed      = 0;
+      thr->handoff.declined_ring = thr->handoff.declined_size = 0;
+      thr->handoff.dropped     = thr->handoff.drains      = 0;
+      thr->handoff.frames      = 0;
+   }
+}
+
+   /* Display pacing: hold the runloop here so the next core frame
+    * starts as late as its display slot allows. The frame just pushed
+    * is due at next_present; the one after it at next_present + period.
+    * Reserve the render time the video thread measures, the core time
+    * measured here, and a margin, and wait until then. A frame that
+    * still runs long is repeated by the presenter, not missed. Skipped
+    * in fast-forward only. In the menu it holds too, to the display's
+    * period rather than the content's: with the gap limiter standing
+    * aside for display pacing, nothing else paces the menu, and it ran
+    * unthrottled the moment the content stopped. Fast-forward, not the
+    * driver's nonblock state:
+    * that state is also set with vsync off, and a core paced to the
+    * display's vblank with a non-blocking present is the point - the
+    * frame goes out on the next scanout, and the core should have
+    * started as late as that allowed. With this on nonblock, vsync off
+    * silently turned display pacing off.
+    *
+    * A frame Driver Pacing released (@driver_released: its identity in
+    * the frame info) is the driver's to hold: the runloop sleeps on the
+    * driver before the next frame, at the content's period, which the
+    * runloop gives the driver as its minimum interval. That interval
+    * keeps the rate but not the phase: with the display's own vblank
+    * in hand the hold still places the frame on it, and the driver's
+    * sleep after it, a period from the last, has nothing left to wait.
+    * Without one - a grid laid from the clock - the hold stands aside
+    * rather than sleep a second time. */
+static VIDEO_NOINLINE void video_thread_pace_hold(thread_video_t *thr,
+      retro_time_t now, bool driver_released)
+{
+   video_thread_stat_snap_t snap;
+
+   if (!thr->display_pacing || thr->fast_forward)
+      return;
+
+   /* The presenter's period, next vblank and render time, as one
+    * snapshot from the video thread's last completion */
+   video_thread_read_stats(thr, &snap);
+
+   if (     driver_released
+         && !(snap.flags & VIDEO_THREAD_STAT_F_PHASE_DISPLAY))
+   {
+      double fps = thr->video_st->av_info.timing.fps;
+      /* The video thread still judges a queued frame by the content's
+       * period. The schedule starts over when the hold holds again,
+       * and a drain asked for meanwhile went to a queue the driver
+       * keeps. */
+      if (fps > 1.0)
+         retro_atomic_store_release_int(&thr->content_period_us,
+               (int)(1000000.0 / fps));
+      thr->content_due = 0;
+      retro_atomic_fetch_and_int(&thr->drain_pending, 0);
+      thr->driver_released++;
+      return;
+   }
+
+   if (     snap.present_period > 0
+         && snap.next_present > 0)
+   {
+      retro_time_t reserve = snap.render_time + thr->core_time;
+      retro_time_t margin  = reserve / 8;
+      retro_time_t period  = snap.present_period;
+      retro_time_t next    = snap.next_present;
+      retro_time_t content;
+      retro_time_t vblank;
+      retro_time_t target;
+      bool drained         = false;
+      double fps = thr->video_st->av_info.timing.fps;
+      if (margin < 500)
+         margin = 500;
+      /* and what a present that waits has been found to need */
+      margin += (retro_time_t)
+         retro_atomic_load_acquire_int(&thr->margin_extra_us);
+      /* The snapshot's vblank was the next one when the video thread
+       * last presented.  With nothing presented since - the loop
+       * stalled, or the display idled - it has passed, and a target
+       * measured from it releases every frame at once until the
+       * presenter catches up: the core ran at the display's rate after
+       * each hitch.  Carried forward on the display's grid instead. */
+      if (next <= now)
+         next += ((now - next) / period + 1) * period;
+
+      /* The content's own period, not the display's: on a 120 Hz
+       * display a 60 fps core is due every other vblank, and a hold
+       * that released it every vblank ran it at four times speed. The
+       * due time accumulates in the content's period exactly, so the
+       * cadence is the content's over any stretch; each frame then
+       * goes out on the first vblank at or after its due time, which
+       * is where the target is measured from. After a stall the
+       * schedule restarts from the presenter's next vblank rather than
+       * carrying a backlog. */
+      content = (fps > 1.0) ? (retro_time_t)(1000000.0 / fps) : period;
+      /* With the core stopped - paused, or under a menu that pauses
+       * it - the frames are the menu's or a repeat, not content, and
+       * run at the display's rate. A core running under the menu keeps
+       * the content's period: the display's ran it at the display's
+       * rate, twice its speed on a 120 Hz panel. */
+      /* ...unless the menu is held at the content's rate, Menu Frame
+       * Rate 'Content Rate': then this hold is what holds it there,
+       * with the timer standing aside for it (runloop_pace_sources). */
+      if (!thr->core_running && !thr->menu_content_rate)
+         content = period;
+      thr->content_period = content;
+      /* For the video thread, which judges a queued frame by it */
+      retro_atomic_store_release_int(&thr->content_period_us,
+            (int)content);
+      if (thr->content_due <= 0 || thr->content_due < now - content)
+         thr->content_due = next;
+      else
+         thr->content_due += content;
+      /* Once after a frame went out a period late for having queued
+       * behind another: skip a content period, so the queue drains and
+       * the frames after go out on their own vblank. The due time
+       * moves with it, or the cadence would catch straight back up. */
+      if (retro_atomic_fetch_and_int(&thr->drain_pending, 0))
+      {
+         thr->content_due  += content;
+         drained            = true;
+         thr->handoff.drains++;
+      }
+      /* Not before the display's next vblank. A grid laid from the
+       * video thread's clock is only its last completion plus a
+       * period, late whenever that thread was: clamped to it, the
+       * schedule lost that lateness every frame on a busy machine. */
+      if (     thr->content_due < next
+            && (snap.flags & VIDEO_THREAD_STAT_F_PHASE_DISPLAY))
+         thr->content_due = next;
+      /* The vblank nearest the due time, not the first at or after it:
+       * the due time accumulates in the content's period and the grid
+       * in the display's, and a due time a hair past a vblank belongs
+       * to that vblank, not the next.  A grid the video thread laid
+       * from its own clock - vsync off, no timestamps - is no scanout
+       * at all, just its last completion plus a period: it sits a
+       * margin ahead of the due time every frame, and the frame is
+       * aimed at the due time itself. */
+      vblank = next;
+      if (!(snap.flags & VIDEO_THREAD_STAT_F_PHASE_DISPLAY))
+         vblank = thr->content_due;
+      else if (period > 0)
+         while (vblank + period / 2 < thr->content_due)
+            vblank += period;
+
+      target = vblank - reserve - margin;
+      /* Never hold longer than a content period: the estimate can be
+       * wrong. A drain holds one longer. */
+      if (target > now + content * (drained ? 2 : 1))
+         target = now + content * (drained ? 2 : 1);
+      while (now < target)
+      {
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+         /* A timed wait on the ring is a kernel timeout, which on
+          * Windows ends on the system timer's tick - 15.6 ms unless
+          * something in the process has lowered it, as some GPU
+          * drivers do and others do not. The hold overshot to that
+          * tick: the loop ran at under the display's rate, frames were
+          * dropped and the audio starved. A ring wake only re-reads
+          * the clock, so the hold sleeps on the high resolution timer
+          * instead. */
+         retro_sleep_us((unsigned)(target - now));
+#else
+         /* A ring wake in between only re-reads the clock */
+         video_thread_ring_sleep(thr, video_thread_ring_load(thr),
+               target - now);
+#endif
+         now = cpu_features_get_time_usec();
+      }
+   }
+}
+
+/* A movie import or clear going into the ring with this frame; most
+ * frames carry neither, so it stays out of video_thread_frame. */
+static VIDEO_NOINLINE void video_thread_slot_movie(thread_video_t *thr,
+      unsigned slot)
+{
+   video_thread_movie_t *to = &thr->frame.slot[slot].movie;
+   video_thread_movie_move(to, &thr->movie_next);
+   thr->frame.slot[slot].movie_control = to->pending || to->reset;
+}
+
+/* Main thread: the slot the push fills. A slot is free when the worker
+ * neither renders it (tail ^ 1 while busy) nor will claim it next
+ * (tail). When both are taken, the newest unclaimed frame is taken
+ * back and replaced rather than the new one dropped, and the worker
+ * keeps rendering what it holds. Taking it back moves the ring word,
+ * and the worker may be claiming that same slot: the compare-and-swap
+ * decides who has it, and a lost exchange picks again from the new
+ * word. Out of line: the exchange loop is the push's one branchy
+ * stretch, and it runs once a frame. */
+static VIDEO_NOINLINE unsigned video_thread_ring_pick(thread_video_t *thr,
+      bool dupe, bool *dropped, bool *dupe_dropped)
+{
+   for (;;)
+   {
+      int st           = video_thread_ring_load(thr);
+      unsigned tail    = VIDEO_THREAD_RING_TAIL_OF(st);
+      unsigned pending = VIDEO_THREAD_RING_PENDING_OF(st);
+      bool busy        = VIDEO_THREAD_RING_BUSY_OF(st);
+      unsigned slot;
+
+      *dropped      = false;
+      *dupe_dropped = false;
+      if (!pending)
+         return tail;
+      if (pending == 1 && !busy)
+         return tail ^ 1;
+      slot     = (pending == 2) ? (tail ^ 1) : tail;
+      *dropped = true;
+      /* A dupe carries no image. Letting it replace a real frame the
+       * worker has not claimed yet would throw away the only new image
+       * the core produced (a 30 fps game sends real, dupe, real, dupe)
+       * and show the frame before it for two periods. Without the
+       * wrapper a NULL push never loses a frame; here the dupe is what
+       * gets dropped, and the real frame stays queued. */
+      if (dupe && (!thr->frame.slot[slot].dupe
+               || thr->frame.slot[slot].movie_control))
+      {
+         *dupe_dropped = true;
+         return slot;
+      }
+      if (retro_atomic_cas_int(&thr->frame.state, st,
+            VIDEO_THREAD_RING_MAKE(tail, pending - 1, busy)))
+         return slot;
+   }
+}
+
+/* Main thread: the picked slot is filled; the worker may claim it. */
+static VIDEO_NOINLINE void video_thread_ring_publish(thread_video_t *thr)
+{
+   int st = video_thread_ring_load(thr);
+   while (!retro_atomic_cas_int(&thr->frame.state, st,
+            st + (1 << VIDEO_THREAD_RING_PENDING_SHIFT)))
+      st = video_thread_ring_load(thr);
+   retro_eventcount_notify(&thr->work);
+}
+
+/* The rows of a frame this wide that fit a slot, and in *stride the
+ * row size they are kept at. A frame the worker filters travels in the
+ * core's format, filter_bpp bytes a pixel. */
+static unsigned video_thread_slot_rows(const thread_video_t *thr,
+      unsigned width, unsigned filter_bpp, unsigned *stride)
+{
+   unsigned s = width *
+      (thr->info.source_fp16 ? 8 :
+         (thr->info.rgb32 ? sizeof(uint32_t) : sizeof(uint16_t)));
+   if (filter_bpp)
+      s = width * filter_bpp;
+   if (stride)
+      *stride = s;
+   return s ? (unsigned)(thr->frame.buffer_size / s) : 0;
+}
+
+/* Cached-frame replay stays off the normal handoff path. */
+static VIDEO_NOINLINE bool video_thread_frame_replay(thread_video_t *thr,
+      const void *frame_, unsigned dims, uint64_t frame_count,
+      unsigned pitch, const char *msg, video_frame_info_t *video_info,
+      unsigned filter_bpp, unsigned convert)
+{
+   unsigned width  = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
+
+   thread_update_driver_state(thr);
+   if (video_info)
+      video_info->swap_count = thr->video_st->swap_count;
+
+   if (thr->driver_data && thr->driver && thr->driver->frame)
+   {
+      /* Cropped as a ring frame is, so a frame drawn again from
+       * here, as a screenshot's is, draws as it was shown. */
+      unsigned rows = video_thread_slot_rows(thr, width, filter_bpp,
+            NULL);
+      int hw_slot = video_thread_hw_dupe_slot(thr,
+            !frame_ || frame_ == RETRO_HW_FRAME_BUFFER_VALID);
+      /* cached_frame() represents a hardware replay as NULL. The
+       * ring installs that slot before frame(), whose HW marker
+       * advances GL onto the installed texture. */
+      if (hw_slot >= 0 && !frame_)
+         frame_ = RETRO_HW_FRAME_BUFFER_VALID;
+      if (frame_ && frame_ != RETRO_HW_FRAME_BUFFER_VALID && height > rows)
+         dims = VIDEO_SCALE_PACK(width, rows);
+      if (convert)
+         video_thread_convert(thr, convert, &frame_, dims, &pitch);
+#ifdef HAVE_VIDEO_FILTER
+      if (filter_bpp)
+         video_thread_filter(thr->video_st->state_filter,
+               thr->video_st->state_buffer, thr->video_st->state_out_bpp,
+               &frame_, &dims, &pitch);
+#endif
+      font_driver_frame_begin();
+#ifdef HAVE_OPENXR
+      if (video_info && video_info->vr_give)
+         video_driver_vr_give(video_info->vr_give - 1);
+#endif
+      /* A cached HW frame samples the retained slot again. The
+       * readback completes it before returning; a nested replay is
+       * covered by its enclosing frame's slot fence. */
+      if (hw_slot >= 0)
+         video_thread_hw_before_frame(thr, hw_slot, true);
+      return thr->driver->frame(thr->driver_data, frame_,
+         dims, frame_count, pitch, msg, video_info);
+   }
+
+   return false;
 }
 
 static bool video_thread_frame(void *data, const void *frame_,
-      unsigned width, unsigned height, uint64_t frame_count,
+      unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info)
 {
+   unsigned width = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
+   unsigned slot       = 0;
+   int hw_slot         = -1;
+   unsigned taken_back = 0;
+   bool ctx_held       = false;
+   bool dropped        = false;
+   bool dupe_dropped   = false;
+   bool zero_copy      = false;
+   bool spare_in       = false;
+   bool waited         = false;
+   size_t lent_off     = 0;
+   unsigned filter_bpp = 0;
+   unsigned convert;
+   retro_time_t now;
+   /* Handoff statistics, in cycles, only while the overlay shows them */
+   bool         timed  = video_info && video_info->statistics_show;
+   uint64_t     c_in   = 0;
+   uint64_t     c_now  = 0;
+   uint64_t     c_wait = 0;
+   uint64_t     c_copy = 0;
+   retro_time_t t_now  = 0;
+   size_t       copied = 0;
    thread_video_t *thr = (thread_video_t*)data;
 
    if (!thr)
       return false;
 
-   /* If called from within read_viewport, we're actually in the
-    * driver thread, so just render directly. */
-   if (thr->frame.within_thread)
+   /* Taken once, so a push that goes no further leaves nothing staged
+    * for the next frame */
+#ifdef HAVE_VIDEO_FILTER
+   filter_bpp          = thr->filter_next;
+   thr->filter_next    = 0;
+#endif
+   convert             = thr->convert_next;
+   thr->convert_next   = 0;
+
+   /* Already on the video thread: render straight through rather than
+    * hand off to a thread that is here.  Two callers arrive this way --
+    * a driver's read_viewport(), which renders a cached frame to get
+    * the back buffer it reads, and the Win32 modal size/move loop,
+    * which pumps on the thread that owns the window and is this one.
+    *
+    * Thread identity rather than a flag: the runloop thread can be
+    * inside this function at the same time, parked on the ring while
+    * the video thread sits in a modal loop, and a flag one thread sets
+    * is a flag the other can read. */
+   if (video_thread_is_self(thr))
+      return video_thread_frame_replay(thr, frame_, dims, frame_count,
+            pitch, msg, video_info, filter_bpp, convert);
+
+   /* Asynchronous uploads that finished since the last frame reach
+    * their owners before the frame that may draw with them. Their
+    * owners are main-thread code, so this is after the video thread's
+    * own way in above. */
+   video_thread_async_deliver(thr);
+
+   if (timed)
    {
-      thread_update_driver_state(thr);
+      c_in = (uint64_t)cpu_features_get_perf_counter();
+      if (!thr->handoff.counting)
+         video_thread_handoff_begin(thr);
+   }
+   thr->handoff.counting = timed;
 
-      if (thr->driver_data && thr->driver && thr->driver->frame)
-         return thr->driver->frame(thr->driver_data, frame_,
-            width, height, frame_count, pitch, msg, video_info);
-
-      return false;
+   /* One clock read for the handover. Everything below that wants
+    * "now" - the core-time sample, the slot's push time, the hold's
+    * start - means this instant, unless the ring wait below ran, in
+    * which case it is read again once after. The clock is a syscall
+    * on more than one console, and this is the paced path. */
+   now = cpu_features_get_time_usec();
+   if (timed)
+   {
+      /* Paired with the clock read above: the window's tick rate */
+      c_now = (uint64_t)cpu_features_get_perf_counter();
+      t_now = now;
    }
 
-   slock_lock(thr->lock);
+   /* Time since the last handoff returned: the core's frame plus the
+    * runloop around it, which is what display pacing has to reserve. */
+   if (thr->run_start)
+   {
+      retro_time_t took = now - thr->run_start;
+      thr->core_time    = thr->core_time
+         ? (thr->core_time * 7 + took) / 8 : took;
+      /* For the statistics snapshot the video thread publishes */
+      retro_atomic_store_relaxed_int(&thr->core_time_us,
+            (int)thr->core_time);
+   }
+   if (video_info)
+   {
+      thr->display_pacing = video_info->threaded_display_pacing;
+      thr->fast_forward   = video_info->input_driver_nonblock_state;
+      thr->core_running   = video_info->core_running;
+      thr->menu_content_rate = video_info->menu_content_rate;
+      retro_atomic_store_relaxed_int(&thr->display_pacing_pub,
+            thr->display_pacing ? 1 : 0);
+   }
 
    if (!thr->nonblock)
    {
@@ -608,66 +4024,366 @@ static bool video_thread_frame(void *data, const void *frame_,
          (retro_time_t)roundf(1000000 / video_info->refresh_rate);
       retro_time_t target            = thr->last_time + target_frame_time;
 
-      /* Ideally, use absolute time, but that is only a good idea on POSIX. */
-      while (thr->frame.updated)
+      /* Pace against the worker claiming the previous frame, not
+       * finishing it: the copy below then overlaps that render.
+       * Ideally, use absolute time, but that is only a good idea on POSIX. */
+      for (;;)
       {
-         retro_time_t current = cpu_features_get_time_usec();
-         retro_time_t delta   = target - current;
+         retro_time_t current;
+         retro_time_t delta;
+         int st = video_thread_ring_load(thr);
+         if (!VIDEO_THREAD_RING_PENDING_OF(st))
+            break;
+         current = cpu_features_get_time_usec();
+         delta   = target - current;
+         waited  = true;
 
          if (delta <= 0)
             break;
 
-         if (!scond_wait_timeout(thr->cond_cmd, thr->lock, delta))
-            break;
+         video_thread_ring_sleep(thr, st, delta);
       }
    }
+   /* The push time and the hold's start are after the wait, if there
+    * was one; otherwise the entry read still is now. */
+   if (waited)
+   {
+      now = cpu_features_get_time_usec();
+      if (timed)
+         c_wait = (uint64_t)cpu_features_get_perf_counter() - c_in;
+   }
 
-   /* Drop frame if updated flag is still set, as thread is
-    * still working on last frame. */
-   if (!thr->frame.updated)
+   /* A hardware-rendered frame: there is no pixel data to copy, the
+    * core's image lives in the HW ring. Publish the HW slot the core
+    * just filled through whichever ring slot is free. */
+   hw_slot = -1;
+   if (frame_ == RETRO_HW_FRAME_BUFFER_VALID)
+   {
+      /* One GL context: the publish gives it up once the frame is
+       * captured, the present needs it; taken back after the hold
+       * below, before the core gets video_refresh() back. A push from
+       * outside the core's run (the menu's) held nothing and takes
+       * nothing back. */
+      ctx_held = video_thread_hw_ctx_held(thr);
+      hw_slot  = video_thread_hw_publish(thr, &taken_back);
+      video_thread_hw_ctx_release(thr, false);
+      frame_   = NULL;
+      /* No ring: the driver cannot take a hardware frame from this
+       * thread. frame_ is NULL now, which this function treats as a
+       * dupe, rather than read as pixels. */
+   }
+
+   /* A frame rendered straight into the lent buffer: publish it, no
+    * copy. A lent ring slot was kept free by the loan, so it is still
+    * neither pending nor being rendered, and it is the slot. A lent
+    * spare goes to whichever slot the pick below chooses, swapped in by
+    * pointer; the buffer it displaces is the next spare. The frame may
+    * start anywhere inside the buffer and carry any pitch: a core that
+    * renders a whole surface into the loan and crops by pointer offset,
+    * or keeps its own stride, is still in place. Any other push means
+    * the core rendered elsewhere; the loan lapses and the slot is
+    * picked as usual. */
+   if (thr->frame.lent >= 0)
+   {
+      unsigned l = (unsigned)thr->frame.lent;
+      /* Compared as integers: a core that rendered elsewhere pushes a
+       * pointer into some other object, and ordering two pointers into
+       * different objects with < is undefined in C. The subtraction
+       * cannot wrap once the address is known to be at or past the
+       * buffer's start. */
+      uintptr_t f = (uintptr_t)frame_;
+      uintptr_t b = (l == VIDEO_THREAD_LEND_SPARE)
+         ? (uintptr_t)thr->frame.spare
+         : (uintptr_t)thr->frame.slot[l].buffer;
+      thr->frame.lent = -1;
+      if (f && f >= b && f - b < thr->frame.buffer_size)
+      {
+         zero_copy = true;
+         lent_off  = (size_t)(f - b);
+         if (l == VIDEO_THREAD_LEND_SPARE)
+            spare_in = true;
+         else
+            slot   = l;
+      }
+      else
+         thr->handoff.lapsed++;
+   }
+
+   /* Pick the slot to fill; a zero-copy frame in a ring slot is
+    * already in it */
+   if (!(zero_copy && !spare_in))
+   {
+      slot = video_thread_ring_pick(thr, !frame_ && hw_slot < 0
+            && !thr->movie_next.pending && !thr->movie_next.reset,
+            &dropped, &dupe_dropped);
+      if (dropped)
+         thr->miss_count++;
+      if (dropped && !dupe_dropped)
+         video_thread_hw_drop(thr, thr->frame.slot[slot].hw_slot);
+   }
+   /* A push the hardware ring took frames back for counts as one that
+    * replaced a frame does: once. */
+   if (taken_back && !dropped)
+   {
+      thr->miss_count++;
+      dropped = true;
+   }
+
+   /* The picked slot is unclaimed, so the worker holds no pointer into
+    * its buffer; it reads the new one after claiming it, which the
+    * publish below orders. */
+   if (spare_in)
+   {
+      int displaced                  = thr->frame.slot[slot].mem;
+      thr->frame.slot[slot].mem      = thr->frame.spare_mem;
+      thr->frame.slot[slot].buffer   = thr->frame.spare;
+      thr->frame.spare_mem           = displaced;
+      thr->frame.spare               = thr->frame.mem[displaced].ptr;
+   }
+
+   /* Recording buffers stopped earlier that no slot in flight names */
+   if (((video_thread_private_t*)thr)->rec_retired)
+      video_thread_rec_reap(thr);
+
+   if (!dupe_dropped)
    {
       const uint8_t *src   = (const uint8_t*)frame_;
-      uint8_t       *dst   = thr->frame.buffer;
-      unsigned copy_stride = width *
-         (thr->info.rgb32 ? sizeof(uint32_t) : sizeof(uint16_t));
+      uint8_t       *dst;
+      unsigned copy_stride;
+      unsigned row_bytes;
+      unsigned rows;
 
-      if (src)
+      /* A slot buffer a frame in flight still reads is swapped for a
+       * free one. With none to be had, which takes the GPU holding
+       * every one, the frame is not taken: the push stands as a dupe. */
+      if (     src && !zero_copy
+            && !video_thread_slot_writable(thr, slot))
       {
-         int i; /* TODO/FIXME - increment counter never meaningfully used */
-         for (i = 0; i < (int)height; i++, src += pitch, dst += copy_stride)
-            memcpy(dst, src, copy_stride);
+         thr->miss_count++;
+         src = NULL;
+      }
+      dst = thr->frame.slot[slot].buffer;
+      /* The slot holds the maximum geometry the core declared at init.
+       * A core is free to hand over a bigger frame than that, so publish
+       * only the rows that fit: the worker renders slot height rows out
+       * of this same buffer, so an unclamped height would be read past
+       * the end of the allocation whether or not anything was copied
+       * into it. A stride too wide for a single row yields zero. A
+       * hardware frame stays in the core's image and keeps its size. */
+      rows                 = video_thread_slot_rows(thr, width,
+            filter_bpp, &copy_stride);
+
+      /* NULL repeats read no CPU slot pixels. In particular, a movie
+       * import refused after admission still repeats the previous GPU
+       * image at its original dimensions. */
+      if (src && hw_slot < 0 && !thr->movie_next.pending && height > rows)
+      {
+         if (!thr->clamp_logged)
+         {
+            RARCH_WARN("[Video] Threaded video: core frame %ux%u exceeds "
+                  "the declared maximum, cropping to %u rows.\n",
+                  width, height, rows);
+            thr->clamp_logged = true;
+         }
+         height            = rows;
       }
 
-      thr->frame.updated = true;
-      thr->frame.width   = width;
-      thr->frame.height  = height;
-      thr->frame.count   = frame_count;
-      thr->frame.pitch   = copy_stride;
+      /* Into the driver's frame memory, rows at the pitch it reads in
+       * place (a copy pads them for free), where the slot has room */
+      row_bytes            = copy_stride;
+      if (     src && !zero_copy && !filter_bpp && hw_slot < 0
+            && thr->frame.pitch_align > 1
+            && thr->frame.mem[thr->frame.slot[slot].mem].id)
+      {
+         unsigned a      = thr->frame.pitch_align;
+         unsigned padded = (copy_stride + a - 1) / a * a;
+         if (padded && (size_t)height <= thr->frame.buffer_size / padded)
+            copy_stride  = padded;
+      }
+
+      if (zero_copy)
+      {
+         /* Already in place, at lent_off into the slot and with the
+          * pitch the core pushed (the one it was given, or its own).
+          * Rows past the slot are cropped as for a copied frame. */
+         thr->frame.zero_copy_count++;
+         if (pitch)
+            copy_stride = (unsigned)pitch;
+         /* Rows that fit between the offset and the end of the slot,
+          * without forming height * stride, which can wrap. */
+         if (copy_stride)
+         {
+            size_t room = (thr->frame.buffer_size - lent_off) / copy_stride;
+            if ((size_t)height > room)
+               height = (unsigned)room;
+         }
+         else
+            height = 0;
+      }
+      else if (src)
+      {
+         uint64_t c0 = timed ? (uint64_t)cpu_features_get_perf_counter() : 0;
+         if (pitch == copy_stride)
+            memcpy(dst, src, (size_t)height * copy_stride);
+         else
+         {
+            unsigned i;
+            for (i = 0; i < height; i++, src += pitch, dst += copy_stride)
+               memcpy(dst, src, row_bytes);
+         }
+         if (timed)
+            c_copy = (uint64_t)cpu_features_get_perf_counter() - c0;
+         copied = (size_t)height * copy_stride;
+      }
+
+      video_thread_slot_movie(thr, slot);
+      thr->frame.slot[slot].dims   = VIDEO_SCALE_PACK(width, height);
+      thr->frame.slot[slot].offset = zero_copy ? lent_off : 0;
+      thr->frame.slot[slot].count  = frame_count;
+      thr->frame.slot[slot].pushed_at = now;
+      thr->frame.slot[slot].input_at  = video_info ? video_info->input_poll_time : 0;
+      thr->frame.slot[slot].hw_slot = hw_slot;
+      /* Nothing was put in the slot: not a lent slot the core filled,
+       * not a copy, not a hardware frame. What the buffer holds is the
+       * frame from some earlier push, and must not be shown as this
+       * one. */
+      thr->frame.slot[slot].dupe    = !zero_copy && !src && hw_slot < 0;
+      /* Textures released since the last handoff ride with this frame,
+       * ahead of any the slot still carries from a frame it held that
+       * was replaced before the video thread drew it */
+      if (!mpsc_stack_empty(&thr->tex_retire))
+      {
+         video_thread_tex_retire_t *list =
+            (video_thread_tex_retire_t*)mpsc_stack_drain(&thr->tex_retire);
+         video_thread_tex_retire_t *tail =
+            (video_thread_tex_retire_t*)thr->frame.slot[slot].tex_retire;
+         if (tail)
+         {
+            video_thread_tex_retire_t *last = list;
+            while (last->node.next)
+               last = (video_thread_tex_retire_t*)last->node.next;
+            last->node.next = &tail->node;
+         }
+         thr->frame.slot[slot].tex_retire = list;
+      }
+      ((video_thread_private_t*)thr)->rec_slot[slot]     = ((video_thread_private_t*)thr)->rec;
+      thr->frame.slot[slot].pitch  = copy_stride;
+
+      /* Hand the caller's video_frame_info_t across with the frame data.
+       * It was built by video_driver_frame() on this thread; rebuilding
+       * it on the worker races the main thread's writes to
+       * video_driver_st and runloop_state. */
+      if (video_info)
+      {
+         thr->frame.slot[slot].video_info = *video_info;
+#ifdef HAVE_OZONE
+         if (video_info->menu.ozone_color_theme)
+            thr->frame.slot[slot].video_info.menu.ozone_color_theme =
+                  memcpy(thr->frame.slot[slot].menu_ozone_color_theme,
+                        video_info->menu.ozone_color_theme,
+                        sizeof(thr->frame.slot[slot].menu_ozone_color_theme));
+#endif
+         /* The text belongs to the main thread's buffer, which it
+          * rewrites next frame: this frame keeps its own copy. */
+         if (video_info->stat_text_len)
+         {
+            size_t _len = strlcpy(thr->frame.slot[slot].stat_text,
+                  video_info->stat_text,
+                  sizeof(thr->frame.slot[slot].stat_text));
+            if (_len >= sizeof(thr->frame.slot[slot].stat_text))
+               _len = sizeof(thr->frame.slot[slot].stat_text) - 1;
+            thr->frame.slot[slot].video_info.stat_text_len = _len;
+         }
+         else
+            thr->frame.slot[slot].stat_text[0]             = '\0';
+         thr->frame.slot[slot].video_info.stat_text        =
+            thr->frame.slot[slot].stat_text;
+#ifdef HAVE_VIDEO_WINDOWS
+         if (video_info->windows)
+         {
+            thr->frame.slot[slot].windows            = *video_info->windows;
+            thr->frame.slot[slot].video_info.windows =
+               &thr->frame.slot[slot].windows;
+         }
+#endif
+#ifdef HAVE_GFX_WIDGETS
+         /* The widget paths, for the same reason: this thread may write
+          * the settings they point at while the frame is drawn. Copied
+          * when they differ from what the slot holds, which after the
+          * first frame is never - they are paths, and the setting
+          * behind them changes when somebody changes it. */
+         video_thread_slot_widget_paths(&thr->frame.slot[slot],
+               video_info);
+#endif
+      }
 
       if (msg)
-         strlcpy(thr->frame.msg, msg, sizeof(thr->frame.msg));
+         strlcpy(thr->frame.slot[slot].msg, msg,
+               sizeof(thr->frame.slot[slot].msg));
       else
-         *thr->frame.msg = '\0';
+         *thr->frame.slot[slot].msg = '\0';
 
-      scond_signal(thr->cond_thread);
-
-#ifdef HAVE_MENU
-      if (thr->texture.enable)
+#ifdef HAVE_VIDEO_FILTER
+      thr->frame.slot[slot].filter_bpp = filter_bpp;
+      if (filter_bpp)
       {
-         do
-         {
-            scond_wait(thr->cond_cmd, thr->lock);
-         } while (thr->frame.updated);
+         thr->frame.slot[slot].filter         = thr->video_st->state_filter;
+         thr->frame.slot[slot].filter_buf     = thr->video_st->state_buffer;
+         thr->frame.slot[slot].filter_out_bpp = thr->video_st->state_out_bpp;
       }
 #endif
-      thr->hit_count++;
+      thr->frame.slot[slot].convert    = convert;
+#ifdef HAVE_GFX_WIDGETS
+      thr->frame.slot[slot].status_text_len = thr->status_text_len;
+      if (thr->status_text_len)
+         memcpy(thr->frame.slot[slot].status_text, thr->status_text,
+               thr->status_text_len + 1);
+      thr->status_text_len = 0;
+#endif
    }
-   else
-      thr->miss_count++;
 
-   slock_unlock(thr->lock);
+   /* Nothing was queued for a dropped dupe; the real frame it would
+    * have replaced is still pending. */
+   if (!dupe_dropped)
+      video_thread_ring_publish(thr);
+
+   if (timed)
+      video_thread_handoff_account(thr,
+            (uint64_t)cpu_features_get_perf_counter() - c_in - c_wait,
+            c_copy, c_wait, copied, hw_slot >= 0, zero_copy, waited,
+            dropped);
+
+#ifdef HAVE_MENU
+   if (retro_atomic_load_relaxed_int(&thr->texture.enable)
+         & VIDEO_THREAD_TEXTURE_ENABLE)
+   {
+      /* Unbounded wait that may run on the main thread; the worker can
+       * marshal main-thread-only work (e.g. Vulkan swapchain recreation
+       * on resize) via cocoa_main_thread_sync() before completing the
+       * frame, so the drain pumps the trampoline while waiting. The
+       * timed frame-pacing wait above needs no such treatment: it
+       * breaks after at most one frame period and the main runloop then
+       * drains common modes. */
+      video_thread_ring_drain(thr);
+   }
+#endif
+   if (!dropped)
+      thr->hit_count++;
+
+   video_thread_pace_hold(thr, now, video_info->driver_pacing_id != 0);
+
+   /* One GL context: the publish handed it to the video thread with
+    * the frame; taken back once that pass is done with it. */
+   if (ctx_held)
+      video_thread_hw_ctx_take(thr, false);
 
    thr->last_time = cpu_features_get_time_usec();
+   thr->run_start = thr->last_time;
+
+   if (timed)
+      video_thread_handoff_latch(thr,
+            (uint64_t)cpu_features_get_perf_counter() - c_now,
+            (uint64_t)(thr->last_time - t_now));
 
    return true;
 }
@@ -679,59 +4395,166 @@ static void video_thread_set_nonblock_state(void *data, bool state,
    thread_video_t *thr = (thread_video_t*)data;
 
    if (thr)
-      thr->nonblock = state;
+   {
+      thread_packet_t pkt;
+      /* nonblock also drives this side's paced wait in
+       * video_thread_frame(); the wrapped driver gets all three. */
+      thr->nonblock                    = state;
+      pkt.type                         = CMD_SET_NONBLOCK;
+      pkt.data.nonblock.nonblock       = state;
+      pkt.data.nonblock.adaptive_vsync = adaptive_vsync_enabled;
+      pkt.data.nonblock.swap_interval  = swap_interval;
+      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   }
 }
 
 static bool video_thread_init(thread_video_t *thr,
-      const video_info_t info,
-      input_driver_t **input, void **input_data)
+      const video_info_t info)
 {
    thread_packet_t pkt;
 
+   thr->video_st            = video_state_get_ptr();
+   video_thread_thr_capture = thr;
+#ifndef RETRO_ATOMIC_HAS_PTR
    if (!(thr->lock        = slock_new()))
       return false;
-   if (!(thr->alpha_lock  = slock_new()))
+#endif
+   retro_triple_buffer_init(&thr->texture.frames, &thr->texture.slot[0],
+         &thr->texture.slot[1], &thr->texture.slot[2]);
+   if (!retro_eventcount_init(&thr->reply_ec))
       return false;
-   if (!(thr->frame.lock  = slock_new()))
+   if (!retro_eventcount_init(&thr->user_ec))
       return false;
-   if (!(thr->cond_cmd    = scond_new()))
+   if (!retro_eventcount_init(&thr->frame.ring))
       return false;
-   if (!(thr->cond_thread = scond_new()))
+   if (!retro_eventcount_init(&thr->work))
       return false;
+   mpsc_stack_init(&thr->tex_retire);
 
    {
+      unsigned i;
       size_t max_size        = info.input_scale * RARCH_SCALE_BASE;
       max_size              *= max_size;
-      max_size              *= info.rgb32 ?
-         sizeof(uint32_t) : sizeof(uint16_t);
+      max_size              *= info.source_fp16 ? 8 :
+         (info.rgb32 ? sizeof(uint32_t) : sizeof(uint16_t));
 
-#ifdef _3DS
-      thr->frame.buffer      = linearMemAlign(max_size, 0x80);
-#else
-      thr->frame.buffer      = (uint8_t*)malloc(max_size);
-#endif
-      if (!thr->frame.buffer)
-         return false;
+      /* The main thread copies core frames in here and the video
+       * thread reads them back for upload; a cache-line start keeps
+       * both copies on aligned rows for the usual pitches. Two slots so
+       * the copy of one frame overlaps the upload of the other. */
+      for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+         retro_atomic_int_init(&thr->frame.mem[i].busy, 0);
+      for (i = 0; i < 2; i++)
+      {
+         if (!(thr->frame.slot[i].buffer = video_thread_host_alloc(max_size)))
+            return false;
+         thr->frame.mem[i].ptr     = thr->frame.slot[i].buffer;
+         thr->frame.mem[i].size    = max_size;
+         thr->frame.mem[i].cached  = true;
+         thr->frame.slot[i].mem    = (int)i;
+      }
 
-      memset(thr->frame.buffer, 0x80, max_size);
+      thr->frame.spare_mem   = -1;
+      thr->frame.buffer_size = max_size;
+      thr->frame.lent        = -1;
+      retro_atomic_int_init(&thr->frame.state, VIDEO_THREAD_RING_MAKE(0, 0, false));
    }
 
-   thr->input                = input;
-   thr->input_data           = input_data;
    thr->info                 = info;
-   thr->alive                = true;
-   thr->focus                = true;
-   thr->has_windowed         = true;
-   thr->suppress_screensaver = true;
+   /* PRESENTABLE is the default the video thread applies when the
+    * context has no answer, so the runloop is not told there is nothing
+    * to present to during the frames before the first one completes. */
+   retro_atomic_int_init(&thr->win_flags, VIDEO_THREAD_WIN_ALIVE
+         | VIDEO_THREAD_WIN_FOCUS | VIDEO_THREAD_WIN_PRESENTABLE
+         | VIDEO_THREAD_WIN_HAS_WINDOWED);
+   retro_atomic_int_init(&thr->worker_running, 1);
+   retro_atomic_int_init(&thr->frame.hw_handoff, 0);
+   retro_atomic_int_init(&thr->deferred_head,  0);
+   retro_atomic_int_init(&thr->deferred_tail,  0);
+   /* A ring that cannot be allocated is simply never used: every
+    * setter then sends the waiting way, as it did before. */
+   thr->deferred = (thread_packet_t*)calloc(VIDEO_THREAD_DEFERRED_MAX,
+         sizeof(*thr->deferred));
+   retro_atomic_int_init(&thr->scale_packed, 0);
+   mpsc_stack_init(&thr->async.in);
+   mpsc_stack_init(&thr->async.out);
+   retro_atomic_int_init(&thr->send_cmd, CMD_VIDEO_NONE);
+   retro_atomic_int_init(&thr->repeat_request, 0);
+   retro_atomic_int_init(&thr->repeat_group, 0);
+   retro_atomic_int_init(&thr->drain_pending, 0);
+   retro_atomic_int_init(&thr->movie_capable, 0);
+   video_thread_movie_state_init(&thr->movie_state);
+   retro_atomic_int_init(&thr->core_time_us, 0);
+   retro_atomic_int_init(&thr->display_pacing_pub, 0);
+   retro_atomic_int_init(&thr->content_period_us, 0);
+   retro_atomic_int_init(&thr->margin_extra_us, 0);
    thr->last_time            = cpu_features_get_time_usec();
 
-   if (!(thr->thread = sthread_create(video_thread_loop, thr)))
+   if (!(thr->thread = video_thread_host_run(thr)))
       return false;
 
    pkt.type                  = CMD_INIT;
 
    video_thread_send_and_wait_user_to_thread(thr, &pkt);
 
+   return pkt.data.b;
+}
+
+/* The deferred load's begin and step run where the driver's chain
+ * lives.  begin waits: it is short and the main thread needs its
+ * answer.  A step is posted and runs between frames with the load
+ * marked busy, so the main thread's tick returns at once and asks
+ * again next frame; one it means as a cancel waits, since the caller
+ * frees the driver, or starts another load, when it returns. */
+static bool video_thread_shader_load_begin(void *data,
+      shader_load_deferred_t *deferred)
+{
+   thread_packet_t pkt;
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (!thr || !thr->driver || !thr->driver->shader_load_begin
+         || !thr->driver->shader_load_step)
+      return false;
+
+   pkt.type   = CMD_SHADER_LOAD_BEGIN;
+   pkt.data.v = deferred;
+   video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   return pkt.data.b;
+}
+
+static bool video_thread_shader_load_step(void *data,
+      shader_load_deferred_t *deferred)
+{
+   thread_packet_t pkt;
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (!thr || !thr->driver || !thr->driver->shader_load_step)
+   {
+      deferred->state = SHADER_LOAD_FAILED;
+      return false;
+   }
+
+   pkt.type   = CMD_SHADER_LOAD_STEP;
+   pkt.data.v = deferred;
+
+   if (retro_atomic_load_acquire_int(&deferred->cancel))
+   {
+      /* after any step still queued, which ends the load itself */
+      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      return pkt.data.b;
+   }
+
+   /* the step before this one is still running, or ended the load */
+   if (retro_atomic_load_acquire_int(&deferred->busy))
+      return true;
+   if (deferred->state != SHADER_LOAD_COMPILING)
+      return false;
+
+   retro_atomic_store_release_int(&deferred->busy, 1);
+   if (video_thread_defer_packet(thr, &pkt))
+      return true;
+   /* no thread to post to: run it the waiting way, as set_shader does */
+   video_thread_send_and_wait_user_to_thread(thr, &pkt);
    return pkt.data.b;
 }
 
@@ -753,17 +4576,19 @@ static bool video_thread_set_shader(void *data,
    return pkt.data.b;
 }
 
-static void video_thread_set_viewport(void *data, unsigned width,
-      unsigned height, bool force_full, bool video_allow_rotate)
+static void video_thread_set_viewport(void *data, unsigned dims,
+      bool force_full, bool video_allow_rotate)
 {
    thread_video_t *thr = (thread_video_t*)data;
 
    if (thr && thr->driver_data && thr->driver && thr->driver->set_viewport)
    {
-      slock_lock(thr->lock);
-      thr->driver->set_viewport(thr->driver_data, width, height,
-         force_full, video_allow_rotate);
-      slock_unlock(thr->lock);
+      thread_packet_t pkt;
+      pkt.type                         = CMD_SET_VIEWPORT;
+      pkt.data.set_viewport.dims       = dims;
+      pkt.data.set_viewport.force_full = force_full;
+      pkt.data.set_viewport.allow_rotate = video_allow_rotate;
+      video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -792,14 +4617,28 @@ static void video_thread_viewport_info(void *data, struct video_viewport *vp)
 
    if (thr)
    {
-      slock_lock(thr->lock);
+      video_thread_read_vp(thr, vp);
 
-      *vp = thr->vp;
-
-      /* Explicitly mem-copied so we can use memcmp correctly later. */
-      memcpy(&thr->read_vp, &thr->vp, sizeof(thr->read_vp));
-
-      slock_unlock(thr->lock);
+      /* read_vp is what CMD_READ_VIEWPORT compares the driver's own
+       * viewport against on the video thread, so it has to follow what
+       * was last reported. It changes only when the viewport does - a
+       * resize - so an input driver asking every poll takes no lock.
+       * Every reporter writes the same published value, so a compare
+       * that races another's write converges on it either way. */
+      if (     (unsigned)retro_atomic_load_relaxed_int(
+                  &thr->read_vp[VIDEO_THREAD_VP_POS]) != vp->pos
+            || (unsigned)retro_atomic_load_relaxed_int(
+                  &thr->read_vp[VIDEO_THREAD_VP_WH]) != vp->dims
+            || (unsigned)retro_atomic_load_relaxed_int(
+                  &thr->read_vp[VIDEO_THREAD_VP_FULL_WH]) != vp->full_dims)
+      {
+         retro_atomic_store_release_int(&thr->read_vp[VIDEO_THREAD_VP_POS],
+               (int)vp->pos);
+         retro_atomic_store_release_int(&thr->read_vp[VIDEO_THREAD_VP_WH],
+               (int)vp->dims);
+         retro_atomic_store_release_int(&thr->read_vp[VIDEO_THREAD_VP_FULL_WH],
+               (int)vp->full_dims);
+      }
    }
 }
 
@@ -821,46 +4660,137 @@ static bool video_thread_read_viewport(void *data,
    return pkt.data.b;
 }
 
+static bool video_thread_read_viewport_hdr(void *data,
+      uint16_t *buffer, bool is_idle, struct rpng_hdr_metadata *metadata)
+{
+   thread_packet_t pkt;
+   thread_video_t *thr = (thread_video_t*)data;
+   if (!thr || !buffer)
+      return false;
+   pkt.type = CMD_READ_VIEWPORT_HDR;
+   pkt.data.hdr_viewport.buffer = buffer;
+   pkt.data.hdr_viewport.metadata = metadata;
+   thr->is_idle = is_idle;
+   video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   return pkt.data.b;
+}
+
 static void video_thread_free(void *data)
 {
    thread_video_t *thr = (thread_video_t*)data;
 
+   /* Cleared before any teardown: entry points that reach the
+    * wrapper through the capture stop taking this instance now. */
+   if (video_thread_thr_capture == thr)
+      video_thread_thr_capture = NULL;
+
    if (thr)
    {
+      video_thread_movie_discard(&thr->movie_next);
       if (thr->thread)
       {
          thread_packet_t pkt;
          pkt.type = CMD_FREE;
 
+         video_thread_thr_freeing = thr;
          video_thread_send_and_wait_user_to_thread(thr, &pkt);
+         video_thread_thr_freeing = NULL;
 
-         sthread_join(thr->thread);
+         /* the thread ends here, as it always did, unless something on
+          * it asked for it to be held for the next driver */
+         video_thread_host_done();
+         thr->thread = NULL;
       }
       else
       {
+         video_thread_movie_discard(&thr->frame.slot[0].movie);
+         video_thread_movie_discard(&thr->frame.slot[1].movie);
          /* If we don't have a thread,
             we must call the driver's free function ourselves. */
          if (thr->driver_data && thr->driver && thr->driver->free)
             thr->driver->free(thr->driver_data);
       }
+      video_thread_async_drop_all(thr);
 
-      free(thr->texture.frame);
-#ifdef _3DS
-      linearFree(thr->frame.buffer);
-#else
-      free(thr->frame.buffer);
-#endif
-      free(thr->alpha_mod);
+      /* After the join, not before it: the video thread reads this
+       * from inside driver frame callbacks, so clearing it while that
+       * thread still runs is a write racing those reads - and it
+       * briefly tells the rest of the frontend the wrapper is gone
+       * while its thread is still presenting. */
+      video_state_get_ptr()->thread_wrapper_active = false;
 
-      slock_free(thr->frame.lock);
-      slock_free(thr->alpha_lock);
+      /* Textures still waiting to be freed: the worker ran every
+       * retire list through the driver before freeing it (CMD_FREE),
+       * so only nodes posted since, if any, are left, and there is
+       * no driver to send them to. */
+      {
+         unsigned i;
+         video_thread_tex_retire_t *l;
+         for (i = 0; i < 2; i++)
+         {
+            l                             = (video_thread_tex_retire_t*)
+               thr->frame.slot[i].tex_retire;
+            thr->frame.slot[i].tex_retire = NULL;
+            while (l)
+            {
+               video_thread_tex_retire_t *next =
+                  (video_thread_tex_retire_t*)l->node.next;
+               free(l);
+               l = next;
+            }
+         }
+         l = (video_thread_tex_retire_t*)mpsc_stack_drain(&thr->tex_retire);
+         while (l)
+         {
+            video_thread_tex_retire_t *next =
+               (video_thread_tex_retire_t*)l->node.next;
+            free(l);
+            l = next;
+         }
+      }
+
+      /* The video thread is gone: every recording buffer can go */
+      video_thread_record_stop(thr);
+      video_thread_rec_free_list(((video_thread_private_t*)thr)->rec_retired);
+      ((video_thread_private_t*)thr)->rec_retired = NULL;
+
+      free(thr->deferred);
+      thr->deferred = NULL;
+
+      free(thr->texture.slot[0].frame);
+      free(thr->texture.slot[1].frame);
+      free(thr->texture.slot[2].frame);
+      /* Host frame buffers: the driver's went with it (CMD_FREE) */
+      {
+         unsigned i;
+         for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+            if (!thr->frame.mem[i].id)
+               video_thread_host_free(thr->frame.mem[i].ptr);
+      }
+      free((void*)thr->alpha_mod);
+      free(thr->alpha_applied);
+
+#ifndef RETRO_ATOMIC_HAS_PTR
       slock_free(thr->lock);
-      scond_free(thr->cond_cmd);
-      scond_free(thr->cond_thread);
+#endif
+      retro_eventcount_free(&thr->reply_ec);
+      retro_eventcount_free(&thr->user_ec);
+      retro_eventcount_free(&thr->frame.ring);
+      retro_eventcount_free(&thr->work);
 
       RARCH_LOG(
-         "Threaded video stats: Frames pushed: %u, Frames dropped: %u.\n",
-         thr->hit_count, thr->miss_count);
+         "Threaded video stats: Frames pushed: %u, Frames dropped: %u, Frames repeated: %llu, Zero-copy: %llu.\n",
+         thr->hit_count, thr->miss_count,
+         (unsigned long long)thr->frames_repeated,
+         (unsigned long long)thr->frame.zero_copy_count);
+
+      /* video_init_thread() pointed the video state at the vtable
+       * embedded in this struct. Point it back at the wrapped driver's
+       * static vtable before the struct goes away, so a later
+       * video_driver_free_internal() reading current_video sees a live
+       * driver, as it does without threading. */
+      if (video_state_get_ptr()->current_video == &thr->video_thread)
+         video_state_get_ptr()->current_video = (video_driver_t*)thr->driver;
 
       free(thr);
    }
@@ -877,7 +4807,10 @@ static void thread_overlay_enable(void *data, bool state)
       pkt.type   = CMD_OVERLAY_ENABLE;
       pkt.data.b = state;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -899,6 +4832,25 @@ static bool thread_overlay_load(void *data,
    return pkt.data.b;
 }
 
+static bool thread_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   thread_packet_t pkt;
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (!thr)
+      return false;
+
+   pkt.type                = CMD_OVERLAY_LOAD_TEXTURES;
+   pkt.data.image.data     = NULL;
+   pkt.data.image.textures = textures;
+   pkt.data.image.num      = num_textures;
+
+   video_thread_send_and_wait_user_to_thread(thr, &pkt);
+
+   return pkt.data.b;
+}
+
 static void thread_overlay_tex_geom(void *data,
       unsigned idx, float x, float y, float w, float h)
 {
@@ -914,7 +4866,10 @@ static void thread_overlay_tex_geom(void *data,
       pkt.data.rect.w     = w;
       pkt.data.rect.h     = h;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -933,7 +4888,10 @@ static void thread_overlay_vertex_geom(void *data,
       pkt.data.rect.w     = w;
       pkt.data.rect.h     = h;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -947,7 +4905,10 @@ static void thread_overlay_full_screen(void *data, bool enable)
       pkt.type   = CMD_OVERLAY_FULL_SCREEN;
       pkt.data.b = enable;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -958,16 +4919,19 @@ static void thread_overlay_set_alpha(void *data, unsigned idx, float mod)
 
    if (thr)
    {
-      slock_lock(thr->alpha_lock);
-      thr->alpha_mod[idx] = mod;
-      thr->alpha_update   = true;
-      slock_unlock(thr->alpha_lock);
+      if (idx < thr->alpha_mods)
+         retro_atomic_store_relaxed_int(&thr->alpha_mod[idx],
+               video_thread_float_bits(mod));
+      /* Release: the value store above is visible to the apply's
+       * acquire exchange. */
+      retro_atomic_store_release_int(&thr->alpha_update, 1);
    }
 }
 
 static const video_overlay_interface_t thread_overlay = {
    thread_overlay_enable,
    thread_overlay_load,
+   thread_overlay_load_textures,
    thread_overlay_tex_geom,
    thread_overlay_vertex_geom,
    thread_overlay_full_screen,
@@ -979,19 +4943,18 @@ static void video_thread_get_overlay_interface(void *data,
 {
    thread_video_t *thr = (thread_video_t*)data;
 
+   /* The video thread took the driver's table as it initialised it;
+    * this only says whether there is one. */
    if (thr && thr->driver_data &&
          thr->driver && thr->driver->overlay_interface)
-   {
-      thr->driver->overlay_interface(thr->driver_data, &thr->overlay);
       *iface = &thread_overlay;
-   }
    else
       *iface = NULL;
 }
 #endif
 
 static void thread_set_video_mode(void *data,
-      unsigned width, unsigned height, bool video_fullscreen)
+      unsigned dims, bool video_fullscreen)
 {
    thread_video_t *thr = (thread_video_t*)data;
 
@@ -999,8 +4962,7 @@ static void thread_set_video_mode(void *data,
    {
       thread_packet_t pkt;
       pkt.type                     = CMD_POKE_SET_VIDEO_MODE;
-      pkt.data.new_mode.width      = width;
-      pkt.data.new_mode.height     = height;
+      pkt.data.new_mode.dims       = dims;
       pkt.data.new_mode.fullscreen = video_fullscreen;
 
       video_thread_send_and_wait_user_to_thread(thr, &pkt);
@@ -1019,21 +4981,27 @@ static void thread_set_filtering(void *data,
       pkt.data.filtering.index  = idx;
       pkt.data.filtering.smooth = smooth;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
-static void thread_set_hdr_max_nits(void *data, float max_nits)
+static void thread_set_hdr_menu_nits(void *data, float menu_nits)
 {
    thread_video_t *thr = (thread_video_t*)data;
 
    if (thr)
    {
       thread_packet_t pkt;
-      pkt.type              = CMD_POKE_SET_HDR_MAX_NITS;
-      pkt.data.hdr.max_nits = max_nits;
+      pkt.type               = CMD_POKE_SET_HDR_MENU_NITS;
+      pkt.data.hdr.menu_nits = menu_nits;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -1047,25 +5015,14 @@ static void thread_set_hdr_paper_white_nits(void *data, float paper_white_nits)
       pkt.type                      = CMD_POKE_SET_HDR_PAPER_WHITE_NITS;
       pkt.data.hdr.paper_white_nits = paper_white_nits;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
-static void thread_set_hdr_contrast(void *data, float contrast)
-{
-   thread_video_t *thr = (thread_video_t*)data;
-
-   if (thr)
-   {
-      thread_packet_t pkt;
-      pkt.type              = CMD_POKE_SET_HDR_CONTRAST;
-      pkt.data.hdr.contrast = contrast;
-
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
-   }
-}
-
-static void thread_set_hdr_expand_gamut(void *data, bool expand_gamut)
+static void thread_set_hdr_expand_gamut(void *data, unsigned expand_gamut)
 {
    thread_video_t *thr = (thread_video_t*)data;
 
@@ -1075,19 +5032,57 @@ static void thread_set_hdr_expand_gamut(void *data, bool expand_gamut)
       pkt.type                  = CMD_POKE_SET_HDR_EXPAND_GAMUT;
       pkt.data.hdr.expand_gamut = expand_gamut;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
+static void thread_set_hdr_scanlines(void *data, bool hdr_scanlines)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (thr)
+   {
+      thread_packet_t pkt;
+      pkt.type                = CMD_POKE_SET_HDR_SCANLINES;
+      pkt.data.hdr.scanlines  = hdr_scanlines;
+
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   }
+}
+
+static void thread_set_hdr_subpixel_layout(void *data, unsigned hdr_subpixel_layout)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (thr)
+   {
+      thread_packet_t pkt;
+      pkt.type                        = CMD_POKE_SET_HDR_SUBPIXEL_LAYOUT;
+      pkt.data.hdr.subpixel_layout    = hdr_subpixel_layout;
+
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   }
+}
+
+
 static void thread_get_video_output_size(void *data,
-      unsigned *width, unsigned *height, char *desc, size_t desc_len)
+      unsigned *dims, char *desc, size_t desc_len)
 {
    thread_video_t *thr = (thread_video_t*)data;
 
    if (thr && thr->driver_data &&
          thr->poke && thr->poke->get_video_output_size)
       thr->poke->get_video_output_size(thr->driver_data,
-         width, height, desc, desc_len);
+         dims, desc, desc_len);
 }
 
 static void thread_get_video_output_prev(void *data)
@@ -1118,43 +5113,350 @@ static void thread_set_aspect_ratio(void *data, unsigned aspect_ratio_idx)
       pkt.type   = CMD_POKE_SET_ASPECT_RATIO;
       pkt.data.i = aspect_ratio_idx;
 
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   }
+}
+
+static void thread_set_view_count(void *data, unsigned count)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (thr)
+   {
+      thread_packet_t pkt;
+      pkt.type   = CMD_POKE_SET_VIEW_COUNT;
+      pkt.data.i = (int)count;
+
+      /* Waits: the driver parses its shader preset here, which reads
+       * settings the main thread must not be writing meanwhile. */
       video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
-static void thread_set_texture_frame(void *data, const void *frame,
-      bool rgb32, unsigned width, unsigned height, float alpha)
+/* The ring slots hold a frame of the new format and scale, grown here
+ * on the main thread with the worker idle and no slot lent. The slots
+ * take new host buffers and the old host buffers go; the driver's frame
+ * memory too small for the new size is let go on the video thread
+ * (CMD_POKE_SET_FRAME_FORMAT), which provisions the slots from it again.
+ * The spare is taken again the next time a loan needs it. */
+static bool video_thread_frame_slots_fit(thread_video_t *thr,
+      bool rgb32, unsigned input_scale)
 {
-   thread_video_t *thr = (thread_video_t*)data;
-   size_t required     = width * height *
+   unsigned i;
+   uint8_t *buf[2];
+   size_t size = (size_t)input_scale * RARCH_SCALE_BASE;
+   size       *= size;
+   size       *= thr->info.source_fp16 ? 8 :
       (rgb32 ? sizeof(uint32_t) : sizeof(uint16_t));
 
-   if (!thr)
-      return;
+   if (size <= thr->frame.buffer_size)
+      return true;
+   if (thr->frame.lent >= 0)
+      return false;
 
-   slock_lock(thr->frame.lock);
-
-   if (!thr->texture.frame || required > thr->texture.frame_cap)
+   buf[0] = video_thread_host_alloc(size);
+   buf[1] = buf[0] ? video_thread_host_alloc(size) : NULL;
+   if (!buf[1])
    {
-      void *tmp_frame = realloc(thr->texture.frame, required);
+      video_thread_host_free(buf[0]);
+      return false;
+   }
+   /* The cached frame may name a buffer about to go */
+   video_driver_cached_frame_retire();
+   for (i = 0; i < VIDEO_THREAD_FRAME_MEM; i++)
+      if (thr->frame.mem[i].ptr && !thr->frame.mem[i].id)
+      {
+         video_thread_host_free(thr->frame.mem[i].ptr);
+         thr->frame.mem[i].ptr  = NULL;
+         thr->frame.mem[i].size = 0;
+      }
+   thr->frame.spare_mem   = -1;
+   thr->frame.spare       = NULL;
+   thr->frame.slot[0].mem = -1;
+   thr->frame.slot[1].mem = -1;
+   for (i = 0; i < 2; i++)
+   {
+      int e = 0;
+      /* Two entries are free: the driver holds at most
+       * VIDEO_THREAD_FRAME_MEM_DRIVER */
+      while (thr->frame.mem[e].ptr)
+         e++;
+      thr->frame.mem[e].ptr     = buf[i];
+      thr->frame.mem[e].size    = size;
+      thr->frame.mem[e].cached  = true;
+      thr->frame.slot[i].mem    = e;
+      thr->frame.slot[i].buffer = buf[i];
+   }
+   thr->frame.buffer_size = size;
+   return true;
+}
 
+static bool thread_set_frame_format(void *data, bool rgb32,
+      unsigned input_scale)
+{
+   thread_packet_t pkt;
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (!thr || !thr->poke || !thr->poke->set_frame_format)
+      return false;
+
+   /* No frame in flight reads a slot or the driver's textures */
+   video_thread_ring_drain(thr);
+   if (!video_thread_frame_slots_fit(thr, rgb32, input_scale))
+      return false;
+
+   pkt.type                          = CMD_POKE_SET_FRAME_FORMAT;
+   pkt.data.frame_format.rgb32       = rgb32;
+   pkt.data.frame_format.input_scale = input_scale;
+   pkt.data.frame_format.ret         = false;
+   video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   if (!pkt.data.frame_format.ret)
+      return false;
+
+   thr->info.rgb32       = rgb32;
+   thr->info.input_scale = input_scale;
+   return true;
+}
+
+static void thread_hw_context_destroying(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (thr)
+   {
+      thread_packet_t pkt;
+      pkt.type = CMD_POKE_HW_CONTEXT_DESTROYING;
+
+      /* Waits: the core's context_destroy runs when this returns. */
+      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   }
+}
+
+/* Direct, as the runloop asks every iteration: the driver answers from
+ * what its headset thread publishes and from what only init and free
+ * change, which this thread waits out. */
+static float thread_get_headset_refresh(void *data, float *rates,
+      unsigned cap, unsigned *count)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (     thr && thr->driver_data
+         && thr->poke && thr->poke->get_headset_refresh)
+      return thr->poke->get_headset_refresh(thr->driver_data, rates, cap,
+            count);
+   return 0.0f;
+}
+
+static struct video_thread_menu_texture *thread_menu_texture_back(
+      thread_video_t *thr, bool rgb32, unsigned dims)
+{
+   struct video_thread_menu_texture *t;
+   size_t width        = VIDEO_SCALE_W(dims);
+   size_t height       = VIDEO_SCALE_H(dims);
+   size_t bpp          = rgb32 ? sizeof(uint32_t) : sizeof(uint16_t);
+   size_t required;
+
+   if (!thr || !width || !height || width > (size_t)-1 / height / bpp)
+      return NULL;
+   required = width * height * bpp;
+
+   /* The back slot is the main thread's alone until it is published. */
+   t = (struct video_thread_menu_texture*)
+      retro_triple_buffer_back(&thr->texture.frames);
+   if (!t->frame || required > t->frame_cap)
+   {
+      void *tmp_frame = realloc(t->frame, required);
       if (!tmp_frame)
-         goto end;
+         return NULL;
+      t->frame     = tmp_frame;
+      t->frame_cap = required;
+   }
+   return t;
+}
 
-      thr->texture.frame     = tmp_frame;
-      thr->texture.frame_cap = required;
+void *video_thread_get_menu_framebuffer(unsigned dims, bool rgb32,
+      size_t *pitch)
+{
+   struct video_thread_menu_texture *t;
+   thread_video_t *thr = video_thread_thr_capture;
+
+   if (!thr || !video_driver_thread_wrapper_active())
+      return NULL;
+   t = thread_menu_texture_back(thr, rgb32, dims);
+   if (t)
+   {
+      unsigned i;
+      size_t tight_pitch = (size_t)VIDEO_SCALE_W(dims)
+         * (rgb32 ? sizeof(uint32_t) : sizeof(uint16_t));
+      size_t height = VIDEO_SCALE_H(dims);
+      if (pitch)
+         *pitch = tight_pitch;
+      if (t->mem)
+      {
+         retro_atomic_store_release_int(&thr->texture.mem[t->mem - 1].state,
+               VIDEO_THREAD_MENU_READY);
+         t->mem = 0;
+      }
+      retro_atomic_store_release_int(&thr->texture.request_dims, (int)dims);
+      for (i = 0; i < VIDEO_THREAD_MENU_MEM; i++)
+      {
+         struct video_thread_menu_mem *m = &thr->texture.mem[i];
+         size_t row_pitch;
+         if (!retro_atomic_cas_int(&m->state,
+                  VIDEO_THREAD_MENU_READY, VIDEO_THREAD_MENU_CPU))
+            continue;
+         row_pitch = (tight_pitch + m->pitch_align - 1)
+            & ~((size_t)m->pitch_align - 1);
+         if (     row_pitch && row_pitch <= (size_t)-1 / height
+               && m->size >= row_pitch * height
+               && (pitch || row_pitch == tight_pitch))
+         {
+            if (pitch)
+               *pitch = row_pitch;
+            t->mem = i + 1;
+            t->dims = dims;
+            t->rgb32 = rgb32;
+            return m->ptr;
+         }
+         retro_atomic_store_release_int(&m->state, VIDEO_THREAD_MENU_READY);
+      }
+   }
+   return t ? t->frame : NULL;
+}
+
+static void thread_set_texture_frame(void *data, const void *frame,
+      bool rgb32, unsigned dims, float alpha)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   struct video_thread_menu_texture *t;
+
+   if (!frame || !(t = thread_menu_texture_back(thr, rgb32, dims)))
+      return;
+   if (t->mem)
+   {
+      struct video_thread_menu_mem *m = &thr->texture.mem[t->mem - 1];
+      if (frame != m->ptr || dims != t->dims || rgb32 != t->rgb32)
+      {
+         bool stale = frame == m->ptr;
+         retro_atomic_store_release_int(&m->state, VIDEO_THREAD_MENU_READY);
+         t->mem = 0;
+         if (stale)
+            return;
+      }
+   }
+   if (!t->mem && frame != t->frame)
+      memcpy(t->frame, frame, (size_t)VIDEO_SCALE_W(dims) *
+            VIDEO_SCALE_H(dims) * (rgb32 ? sizeof(uint32_t) : sizeof(uint16_t)));
+   t->rgb32 = rgb32;
+   t->dims  = dims;
+   t->alpha = alpha;
+   retro_triple_buffer_publish(&thr->texture.frames);
+}
+
+/* The core asks for a buffer to render the next frame into. Lend it a
+ * ring slot that neither side holds, or the spare when both slots are
+ * taken, so the frame lands where the video thread will read it and
+ * the push copies nothing. Declined when the geometry does not fit a
+ * slot, or when the spare cannot be allocated (the push then copies).
+ * The buffer may be the driver's frame memory, which the GPU reads
+ * where it lies; memory_flags says whether a core that reads its frame
+ * back - a wipe, a screenshot - reads it at cached speed. A core that
+ * never asks is unaffected. */
+static bool thread_get_current_software_framebuffer(void *data,
+      struct retro_framebuffer *fb)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   unsigned bpp, slot;
+   size_t   need;
+   int      mem;
+
+   if (!thr || !fb)
+      return false;
+
+   thr->handoff.asked++;
+   bpp  = thr->info.source_fp16 ? 8 :
+      (thr->info.rgb32 ? sizeof(uint32_t) : sizeof(uint16_t));
+   need = (size_t)fb->width * bpp * fb->height;
+   if (!fb->width || !fb->height || need > thr->frame.buffer_size)
+   {
+      thr->handoff.declined_size++;
+      return false;
    }
 
-   memcpy(thr->texture.frame, frame, required);
+   /* A slot that is neither queued nor being rendered stays free until
+    * this thread publishes it: the video thread only ever moves a slot
+    * from queued to rendered, so one read of the ring word suffices. */
+   {
+      int st           = video_thread_ring_load(thr);
+      unsigned tail    = VIDEO_THREAD_RING_TAIL_OF(st);
+      unsigned pending = VIDEO_THREAD_RING_PENDING_OF(st);
+      if (!pending)
+         slot = tail;
+      else if (pending == 1 && !VIDEO_THREAD_RING_BUSY_OF(st))
+         slot = tail ^ 1;
+      else
+         slot = VIDEO_THREAD_LEND_SPARE;
+   }
+   /* A buffer a frame in flight still reads is swapped for one that is
+    * free, never waited on */
+   if (!(slot == VIDEO_THREAD_LEND_SPARE
+            ? video_thread_spare_take(thr)
+            : video_thread_slot_writable(thr, slot)))
+   {
+      thr->handoff.declined_ring++;
+      return false;
+   }
+   thr->frame.lent        = (int)slot;
+   thr->handoff.lent++;
 
-   thr->texture.rgb32         = rgb32;
-   thr->texture.width         = width;
-   thr->texture.height        = height;
-   thr->texture.alpha         = alpha;
-   thr->texture.frame_updated = true;
+   mem              = (slot == VIDEO_THREAD_LEND_SPARE)
+      ? thr->frame.spare_mem : thr->frame.slot[slot].mem;
+   /* A core that reads its frame back gets memory it reads at cached
+    * speed, which driver frame memory need not be: a host buffer, the
+    * frame then copied as before. Kept when there is none. */
+   if (     (fb->access_flags & RETRO_MEMORY_ACCESS_READ)
+         && !thr->frame.mem[mem].cached)
+   {
+      int host = video_thread_mem_take_from(thr, VIDEO_THREAD_TAKE_HOST);
+      if (host >= 0)
+      {
+         mem = host;
+         if (slot == VIDEO_THREAD_LEND_SPARE)
+         {
+            thr->frame.spare_mem = host;
+            thr->frame.spare     = thr->frame.mem[host].ptr;
+         }
+         else
+         {
+            thr->frame.slot[slot].mem    = host;
+            thr->frame.slot[slot].buffer = thr->frame.mem[host].ptr;
+         }
+      }
+   }
+   fb->data         = thr->frame.mem[mem].ptr;
+   fb->pitch        = (size_t)fb->width * bpp;
+   fb->format       = thr->info.source_fp16
+      ? RETRO_PIXEL_FORMAT_SCRGB_RGBA16F : (thr->info.source_hdr10
+      ? RETRO_PIXEL_FORMAT_HDR10_2101010 : (thr->info.source_10bit
+      ? RETRO_PIXEL_FORMAT_XRGB2101010 : (thr->info.rgb32
+      ? RETRO_PIXEL_FORMAT_XRGB8888 : RETRO_PIXEL_FORMAT_RGB565)));
+   /* Driver frame memory may be write-combined: a core that reads its
+    * frame back is told so */
+   fb->memory_flags = thr->frame.mem[mem].cached
+      ? RETRO_MEMORY_TYPE_CACHED : 0;
+   return true;
+}
 
-end:
-   slock_unlock(thr->frame.lock);
+/* Proc addresses are properties of the driver's API, not of a thread. */
+static retro_proc_address_t thread_get_proc_address(void *data, const char *sym)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (thr && thr->poke && thr->poke->get_proc_address)
+      return thr->poke->get_proc_address(thr->driver_data, sym);
+   return NULL;
 }
 
 static void thread_set_texture_enable(void *data, bool state, bool full_screen)
@@ -1163,22 +5465,22 @@ static void thread_set_texture_enable(void *data, bool state, bool full_screen)
 
    if (thr)
    {
-      slock_lock(thr->frame.lock);
-      thr->texture.enable      = state;
-      thr->texture.full_screen = full_screen;
-      slock_unlock(thr->frame.lock);
+      retro_atomic_store_release_int(&thr->texture.enable,
+              (state       ? VIDEO_THREAD_TEXTURE_ENABLE      : 0)
+            | (full_screen ? VIDEO_THREAD_TEXTURE_FULL_SCREEN : 0));
    }
 }
 
 static void thread_set_osd_msg(void *data,
-      const char *msg, const struct font_params *params, void *font)
+      const char *msg, size_t msg_len,
+      const struct font_params *params, void *font)
 {
    thread_video_t *thr = (thread_video_t*)data;
 
    /* TODO : find a way to determine if the calling
     * thread is the driver thread or not. */
    if (thr && thr->driver_data && thr->poke && thr->poke->set_osd_msg)
-      thr->poke->set_osd_msg(thr->driver_data, msg, params, font);
+      thr->poke->set_osd_msg(thr->driver_data, msg, msg_len, params, font);
 }
 
 static void thread_show_mouse(void *data, bool state)
@@ -1191,7 +5493,10 @@ static void thread_show_mouse(void *data, bool state)
       pkt.type   = CMD_POKE_SHOW_MOUSE;
       pkt.data.b = state;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -1204,7 +5509,10 @@ static void thread_grab_mouse_toggle(void *data)
       thread_packet_t pkt;
       pkt.type = CMD_POKE_GRAB_MOUSE_TOGGLE;
 
-      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      /* Nothing comes back from this, so it does not wait for the
+       * video thread: queued, and run before the next frame. */
+      if (!video_thread_defer_packet(thr, &pkt))
+         video_thread_send_and_wait_user_to_thread(thr, &pkt);
    }
 }
 
@@ -1226,7 +5534,41 @@ static void thread_unload_texture(void *data,
    thread_video_t *thr = (thread_video_t*)data;
 
    if (thr && thr->driver_data && thr->poke && thr->poke->unload_texture)
-      thr->poke->unload_texture(thr->driver_data, threaded, id);
+   {
+      video_thread_tex_retire_t *node;
+
+      /* Releasing a GPU texture while the video thread is mid-frame can
+       * free something the in-flight frame still references -- the AI
+       * service overlay is drawn straight from
+       * dispgfx_widget_t::ai_service_overlay_texture after a plain
+       * ai_service_overlay_state test, with no handshake. So the
+       * texture waits for the frames that could name it: the next frame
+       * handed over carries it, and the video thread frees it once it
+       * has drawn that frame, by which time every earlier frame is
+       * drawn too. Neither thread waits.
+       *
+       * On this thread only, and only while the worker runs: from the
+       * worker, or with no wrapper running, the driver's own call is
+       * already on the right thread. */
+      if (     !threaded
+            || !thr->thread
+            || sthread_get_thread_id(thr->thread)
+               == sthread_get_current_thread_id()
+            || !(node = (video_thread_tex_retire_t*)malloc(sizeof(*node))))
+      {
+         if (thr->lend_used)
+            video_thread_lend_forget(thr, id);
+         thr->poke->unload_texture(thr->driver_data, threaded, id);
+         return;
+      }
+
+      node->id = id;
+#ifdef HAVE_VIDEO_FILTER
+      node->filter     = NULL;
+      node->filter_buf = NULL;
+#endif
+      mpsc_stack_push(&thr->tex_retire, &node->node);
+   }
 }
 
 static void thread_apply_state_changes(void *data)
@@ -1235,14 +5577,14 @@ static void thread_apply_state_changes(void *data)
 
    if (thr)
    {
-      slock_lock(thr->frame.lock);
-      thr->apply_state_changes = true;
-      slock_unlock(thr->frame.lock);
+      retro_atomic_store_release_int(&thr->apply_state_changes, 1);
    }
 }
 
-/* This is read-only state which should not
- * have any kind of race condition. */
+/* Fields other than the parameters' values change only inside
+ * set_shader's blocking window, and the values are atomic
+ * (video_shader_param_get()/_set()), so the frontend reads the
+ * driver's own. */
 static struct video_shader *thread_get_current_shader(void *data)
 {
    thread_video_t *thr = (thread_video_t*)data;
@@ -1263,18 +5605,161 @@ static uint32_t thread_get_flags(void *data)
    return 0;
 }
 
+static bool thread_supports_texture_format(void *video_data,
+      enum texture_gpu_format fmt)
+{
+   thread_video_t *thr = (thread_video_t*)video_data;
+   if (     thr
+         && thr->driver_data
+         && thr->poke
+         && thr->poke->supports_texture_format)
+      return thr->poke->supports_texture_format(thr->driver_data, fmt);
+   return false;
+}
+
+/* The handles stand for the driver's life, which the main thread
+ * starts and ends: read from here. */
+bool video_thread_movie_supported(void)
+{
+   thread_video_t *thr = video_thread_thr_capture;
+   return thr && retro_atomic_load_acquire_int(&thr->movie_capable)
+      && video_thread_movie_ready(&thr->movie_state);
+}
+
+static enum video_texture_update thread_import_movie_frame(void *data,
+      const video_frame_import_t *frame)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (!thr)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   if (!frame && !video_thread_is_self(thr))
+      return video_thread_movie_stage(&thr->movie_state, &thr->movie_next, NULL);
+   if (!retro_atomic_load_acquire_int(&thr->movie_capable))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   if (video_thread_is_self(thr))
+      return thr->driver_data && thr->poke && thr->poke->import_movie_frame
+         ? thr->poke->import_movie_frame(thr->driver_data, frame)
+         : VIDEO_TEXTURE_UPDATE_REFUSED;
+   return video_thread_movie_stage(&thr->movie_state, &thr->movie_next, frame);
+}
+
+static bool thread_get_device(void *video_data, video_device_info_t *info)
+{
+   thread_video_t *thr = (thread_video_t*)video_data;
+   if (thr && thr->driver_data && thr->poke && thr->poke->get_device)
+      return thr->poke->get_device(thr->driver_data, info);
+   return false;
+}
+
+/* Forward the compressed upload with 'threaded' passed through, exactly as
+ * thread_load_texture does. The underlying driver decides whether to marshal
+ * the GPU work onto the video thread; the descriptor stays alive because
+ * video_thread_texture_handle is synchronous. */
+static enum video_texture_update thread_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   thread_video_t *thr = (thread_video_t*)video_data;
+
+   if (thr && thr->driver_data && thr->poke && thr->poke->update_texture)
+      return thr->poke->update_texture(thr->driver_data, id, ti, threaded);
+   return VIDEO_TEXTURE_UPDATE_REFUSED;
+}
+
+static uintptr_t thread_load_texture_compressed(void *video_data,
+      const struct texture_compressed *tc, bool threaded,
+      enum texture_filter_type filter_type)
+{
+   thread_video_t *thr = (thread_video_t*)video_data;
+   if (     thr
+         && thr->driver_data
+         && thr->poke
+         && thr->poke->load_texture_compressed)
+      return thr->poke->load_texture_compressed(thr->driver_data,
+         tc, threaded, filter_type);
+   return 0;
+}
+
+static float thread_get_refresh_rate(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (!thr)
+      return 0.0f;
+   return video_thread_bits_float(
+         retro_atomic_load_acquire_int(&thr->refresh_rate_bits));
+}
+
+/* Asks the video thread to show the retained frame again as soon as it
+ * is idle. Returns whether there is a retained frame to show; the
+ * present itself happens on the video thread. */
+static unsigned thread_present_last(void *data)
+{
+   unsigned ret = 0;
+   thread_video_t *thr = (thread_video_t*)data;
+   if (!thr)
+      return 0;
+   /* The group the video thread published with its last present, 0
+    * while repeats are not armed */
+   ret = (unsigned)retro_atomic_load_acquire_int(&thr->repeat_group);
+   if (ret)
+   {
+      retro_atomic_store_release_int(&thr->repeat_request, 1);
+      retro_eventcount_notify(&thr->work);
+   }
+   return ret;
+}
+
+/* Driver Pacing's three, straight to the driver on this thread: the
+ * contract (gfx/video_driver.h) has the driver keep them safe beside
+ * its own frame on the video thread, and the frame's identity and
+ * interval ride in the slot's video_frame_info_t. */
+static unsigned thread_driver_pacing_set(void *data, unsigned mode)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (thr && thr->driver_data && thr->poke && thr->poke->driver_pacing_set)
+      return thr->poke->driver_pacing_set(thr->driver_data, mode);
+   return VIDEO_DRIVER_PACING_REASON_DRIVER;
+}
+
+static bool thread_driver_pacing_wait(void *data, uint64_t frame_id,
+      uint64_t next_id, unsigned max_wait_us)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (thr && thr->driver_data && thr->poke && thr->poke->driver_pacing_wait)
+      return thr->poke->driver_pacing_wait(thr->driver_data, frame_id,
+            next_id, max_wait_us);
+   return false;
+}
+
+static void thread_driver_pacing_mark(void *data, uint64_t frame_id,
+      unsigned marker)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (thr && thr->driver_data && thr->poke && thr->poke->driver_pacing_mark)
+      thr->poke->driver_pacing_mark(thr->driver_data, frame_id, marker);
+}
+
+/* Fixed by the driver at init, so read here directly */
+static unsigned thread_get_swap_interval_cap(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (     thr && thr->driver_data
+         && thr->poke && thr->poke->get_swap_interval_cap)
+      return thr->poke->get_swap_interval_cap(thr->driver_data);
+   return 0;
+}
+
 static const video_poke_interface_t thread_poke = {
    thread_get_flags,
    thread_load_texture,
    thread_unload_texture,
    thread_set_video_mode,
-   NULL, /* get_refresh_rate */
+   thread_get_refresh_rate,
    thread_set_filtering,
    thread_get_video_output_size,
    thread_get_video_output_prev,
    thread_get_video_output_next,
-   NULL, /* get_current_framebuffer */
-   NULL, /* get_proc_address */
+   video_thread_hw_get_current_framebuffer,
+   thread_get_proc_address,
    thread_set_aspect_ratio,
    thread_apply_state_changes,
    thread_set_texture_frame,
@@ -1283,13 +5768,70 @@ static const video_poke_interface_t thread_poke = {
    thread_show_mouse,
    thread_grab_mouse_toggle,
    thread_get_current_shader,
-   NULL, /* get_current_software_framebuffer */
-   NULL, /* get_hw_render_interface */
-   thread_set_hdr_max_nits,
+   thread_get_current_software_framebuffer,
+   video_thread_get_hw_render_interface,
+   thread_set_hdr_menu_nits,
    thread_set_hdr_paper_white_nits,
-   thread_set_hdr_contrast,
-   thread_set_hdr_expand_gamut
+   thread_set_hdr_expand_gamut,
+   thread_set_hdr_scanlines,
+   thread_set_hdr_subpixel_layout,
+   thread_supports_texture_format,
+   thread_load_texture_compressed,
+   thread_present_last,
+   NULL, /* get_last_present_time: consumed on the video thread */
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+   thread_update_texture,
+   thread_get_swap_interval_cap,
+   NULL, /* texture_lend */
+   NULL, /* texture_lend_ready */
+   NULL, /* get_last_present_wait: read on the video thread */
+   thread_set_view_count,
+   thread_hw_context_destroying,
+   thread_get_headset_refresh,
+   thread_set_frame_format,
+   NULL, /* frame_mem_alloc: the video thread's */
+   NULL, /* frame_mem_ready */
+   NULL, /* frame_mem_free */
+   thread_get_device,
+   NULL, /* import_texture: a node (VIDEO_THREAD_ASYNC_IMPORT) */
+   NULL, /* get_last_present_sync: read on the video thread */
+   NULL, /* record_read: read on the video thread */
+   thread_import_movie_frame,
+   NULL, /* get_menu_framebuffer */
+   NULL, /* menu_mem_alloc */
+   0,    /* menu_mem_pitch_align */
+   false, /* texture_lend_per_write */
+   thread_driver_pacing_set,
+   thread_driver_pacing_wait,
+   thread_driver_pacing_mark
 };
+
+/* Video thread, for video_thread_get_poke_interface(): installs the
+ * wrapped driver's poke table on the thread that reads it every pass. */
+typedef struct
+{
+   thread_video_t *thr;
+   const video_poke_interface_t *poke;
+} video_thread_set_poke_t;
+
+static uintptr_t video_thread_set_poke(void *data)
+{
+   video_thread_set_poke_t *set = (video_thread_set_poke_t*)data;
+   set->thr->poke               = set->poke;
+   video_thread_hw_prepare_context(set->thr);
+   retro_atomic_store_release_int(&set->thr->movie_capable,
+         set->poke && set->poke->import_movie_frame ? 1 : 0);
+   return 0;
+}
 
 static void video_thread_get_poke_interface(void *data,
       const video_poke_interface_t **iface)
@@ -1299,8 +5841,17 @@ static void video_thread_get_poke_interface(void *data,
    if (thr && thr->driver_data &&
          thr->driver && thr->driver->poke_interface)
    {
-      thr->driver->poke_interface(thr->driver_data, &thr->poke);
-      *iface = &thread_poke;
+      /* The main thread asks for this while the video thread is
+       * already running and reading thr->poke on every pass, so the
+       * pointer is installed on that thread, through a blocking
+       * command: the frame path then reads a field only it writes,
+       * and this thread's own reads follow the reply. */
+      video_thread_set_poke_t set;
+      set.thr  = thr;
+      set.poke = NULL;
+      thr->driver->poke_interface(thr->driver_data, &set.poke);
+      video_thread_run_blocking(video_thread_set_poke, &set);
+      *iface   = &thread_poke;
    }
    else
       *iface = NULL;
@@ -1319,6 +5870,38 @@ static bool video_thread_wrapper_gfx_widgets_enabled(void *data)
 }
 #endif
 
+#ifdef HAVE_OPENXR
+typedef struct
+{
+   thread_video_t *thr;
+   const video_vr_content_info_t *info;
+} video_thread_vr_call_t;
+
+static uintptr_t video_thread_set_vr_content_info_cb(void *data)
+{
+   video_thread_vr_call_t *call = (video_thread_vr_call_t*)data;
+   return call->thr->driver->set_vr_content_info(call->thr->driver_data,
+         call->info);
+}
+
+/* On the video thread: the stereo state it sets is the frame's. */
+static bool video_thread_set_vr_content_info(void *data,
+      const video_vr_content_info_t *info)
+{
+   video_thread_vr_call_t call;
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (     !thr || !thr->driver_data || !thr->driver
+         || !thr->driver->set_vr_content_info)
+      return false;
+   call.thr   = thr;
+   call.info  = info;
+   return video_thread_run_blocking(video_thread_set_vr_content_info_cb,
+         &call) != 0;
+}
+
+#endif
+
 static const video_driver_t video_thread = {
    video_thread_init_never_call, /* Should never be called directly. */
    video_thread_frame,
@@ -1334,14 +5917,24 @@ static const video_driver_t video_thread = {
    video_thread_set_rotation,
    video_thread_viewport_info,
    video_thread_read_viewport,
-   NULL, /* read_frame_raw */
 #ifdef HAVE_OVERLAY
    video_thread_get_overlay_interface,
 #endif
    video_thread_get_poke_interface,
    NULL, /* wrap_type_to_enum */
+   video_thread_shader_load_begin,
+   video_thread_shader_load_step,
 #ifdef HAVE_GFX_WIDGETS
-   video_thread_wrapper_gfx_widgets_enabled
+   video_thread_wrapper_gfx_widgets_enabled,
+#endif
+   /* Without this the runloop's invalidate stopped at the wrapper: the
+    * driver kept the core's image across a reset, and the ring kept
+    * handing it back across a close. */
+   video_thread_invalidate_hw_render_cache,
+   video_thread_read_viewport_hdr,
+   NULL, /* font_backend: CMD_INIT/CMD_FREE read the driver's */
+#ifdef HAVE_OPENXR
+   video_thread_set_vr_content_info,
 #endif
 };
 
@@ -1356,6 +5949,8 @@ static void video_thread_set_callbacks(thread_video_t *thr,
       /* Disable optional features if not present. */
       if (!drv->read_viewport)
          thr->video_thread.read_viewport     = NULL;
+      if (!drv->read_viewport_hdr)
+         thr->video_thread.read_viewport_hdr = NULL;
       if (!drv->set_viewport)
          thr->video_thread.set_viewport      = NULL;
       if (!drv->set_rotation)
@@ -1386,10 +5981,9 @@ static void video_thread_set_callbacks(thread_video_t *thr,
  * Returns: true (1) if successful, otherwise false (0).
  **/
 bool video_init_thread(const video_driver_t **out_driver, void **out_data,
-      input_driver_t **input, void **input_data,
       const video_driver_t *drv, const video_info_t info)
 {
-   thread_video_t *thr = (thread_video_t*)calloc(1, sizeof(*thr));
+   thread_video_t *thr = (thread_video_t*)calloc(1, sizeof(video_thread_private_t));
    if (!thr)
       return false;
 
@@ -1398,20 +5992,53 @@ bool video_init_thread(const video_driver_t **out_driver, void **out_data,
    thr->driver = drv;
    *out_driver = &thr->video_thread;
    *out_data   = thr;
-   return video_thread_init(thr, info, input, input_data);
+
+   /* Mark the wrapper active before running the underlying driver's
+    * init(): that init() runs on the worker thread and may query
+    * video_driver_get_ident() (e.g. via the context driver's get_flags
+    * for shader-backend detection).  current_video already points at the
+    * thread wrapper here, so without the flag set get_ident() would
+    * resolve to "Thread wrapper" instead of the wrapped driver ("glcore"),
+    * causing shader-backend detection to fail. */
+   video_state_get_ptr()->thread_wrapper_active = true;
+   if (!video_thread_init(thr, info))
+   {
+      /* video_thread is a member of thr, not a static vtable, so leaving
+       * it published hands the caller freed memory once thr goes.
+       * Restore drv and NULL the data, as the non-threaded failure path
+       * does.  Free via video_thread_free(): init can fail after the
+       * worker thread and the frame buffer already exist. */
+      video_thread_free(thr);
+      *out_driver = drv;
+      *out_data   = NULL;
+      return false;
+   }
+
+   return true;
 }
 
 bool video_thread_font_init(const void **font_driver, void **font_handle,
       void *data, const char *font_path, float video_font_size,
-      enum font_driver_render_api api, custom_font_command_method_t func,
+      const font_renderer_t *backend, custom_font_command_method_t func,
       bool is_threaded)
 {
    thread_packet_t pkt;
-   video_driver_state_t *video_st = video_state_get_ptr();
-   thread_video_t       *thr      = (thread_video_t*)video_st->data;
+   /* The capture is set while the wrapper is active and cleared at
+    * free, so a NULL here covers both "no wrapper" and the reinit
+    * window in which callers' threaded flags may already reflect a
+    * configuration the wrapper no longer matches. */
+   thread_video_t       *thr = video_thread_thr_capture;
 
    if (!thr)
       return false;
+
+   /* Already on the video thread - a font the worker rebuilds while
+    * it initialises the driver, or a command handler that reloads
+    * one. A command from the thread that answers commands would wait
+    * on itself; the backend runs here, where the context is. */
+   if (video_thread_is_self(thr))
+      return func(font_driver, font_handle, data, font_path,
+            video_font_size, backend, is_threaded);
 
    pkt.type                       = CMD_FONT_INIT;
    pkt.data.font_init.method      = func;
@@ -1421,32 +6048,330 @@ bool video_thread_font_init(const void **font_driver, void **font_handle,
    pkt.data.font_init.font_path   = font_path;
    pkt.data.font_init.font_size   = video_font_size;
    pkt.data.font_init.is_threaded = is_threaded;
-   pkt.data.font_init.api         = api;
+   pkt.data.font_init.backend         = backend;
 
    video_thread_send_and_wait_user_to_thread(thr, &pkt);
 
    return pkt.data.font_init.return_value;
 }
 
-unsigned video_thread_texture_handle(void *data, custom_command_method_t func)
+/* Runs func(data) on the video thread as a blocking round trip -
+ * the caller is parked until the reply, so borrowed pointers in
+ * data stay valid for the whole call and func executes inside the
+ * same safe window every wrapper command gets. Falls back to
+ * calling func directly when the wrapper is not active, when the
+ * worker has already handled CMD_FREE, or when this is already the
+ * video thread. */
+bool video_thread_run_queued(custom_command_method_t func, void *data)
 {
    thread_packet_t pkt;
-   video_driver_state_t *video_st = video_state_get_ptr();
-   thread_video_t       *thr      = (thread_video_t*)video_st->data;
+   thread_video_t *thr = video_thread_thr_capture;
 
    if (!thr)
-      return 0;
+      return false;
+   pkt.type                       = CMD_CUSTOM_COMMAND;
+   pkt.data.custom_command.method = func;
+   pkt.data.custom_command.data   = data;
+   return video_thread_defer_packet(thr, &pkt);
+}
+
+uintptr_t video_thread_run_blocking(custom_command_method_t func, void *data)
+{
+   thread_packet_t pkt;
+   /* The capture is set while the wrapper is active and cleared at
+    * free, so a NULL covers both "no wrapper" and the reinit window
+    * in which callers' threaded flags may already reflect a
+    * configuration the wrapper no longer matches.  Fall back to
+    * calling func directly (same contract as the "already on video
+    * thread" branch below). */
+   thread_video_t       *thr = video_thread_thr_capture;
+
+   if (!thr)
+      return func(data);
 
    /* if we're already on the video thread, just call the function, otherwise
     * we may deadlock with ourself waiting for the packet to be processed. */
-   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id() || !thr->alive)
+   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id())
       return func(data);
 
    pkt.type                       = CMD_CUSTOM_COMMAND;
    pkt.data.custom_command.method = func;
    pkt.data.custom_command.data   = data;
 
-   video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   /* The worker runs func() for as long as it takes commands - also
+    * while its window is closing, when the context it holds is still
+    * current to it and cannot be made current here. Only once it has
+    * handled CMD_FREE does func() run on this thread; tested with the
+    * poster slot held, which CMD_FREE is sent under too. */
+   video_thread_user_acquire(thr);
+   if (!video_thread_send_packet_if_running(thr, &pkt))
+   {
+      video_thread_user_release(thr);
+      return func(data);
+   }
+
+   video_thread_wait_reply(thr, &pkt);
+   video_thread_user_release(thr);
 
    return pkt.data.custom_command.return_value;
+}
+
+uintptr_t video_thread_texture_handle(void *data, custom_command_method_t func)
+{
+   return video_thread_run_blocking(func, data);
+}
+
+/* Waits until the video thread has finished processing any
+ * pending frame and is idle, waiting on its command condition
+ * variable.  After this returns, it is safe to free GPU-backed
+ * resources (textures, fonts) owned by the menu driver — no
+ * frame can be in-flight referencing them.
+ *
+ * Must be called from the main thread.  No-op if the video
+ * thread is not running or if called from the video thread
+ * itself (would deadlock). */
+bool video_thread_presentable(void)
+{
+   thread_video_t *thr;
+   video_driver_state_t *video_st = video_state_get_ptr();
+
+   /* video_st->data is the thread_video_t only while the wrapper is
+    * installed. It is taken raw here: video_driver_get_ptr() unwraps
+    * the wrapper and hands back the concrete driver's private data,
+    * which is not a thread_video_t and has no lock at that offset. */
+   if (!video_st->thread_wrapper_active)
+      return true;
+   if (!(thr = (thread_video_t*)video_st->data) || !thr->thread)
+      return true;
+
+   /* The video thread publishes this value at the end of each frame;
+    * it reads its own context directly. */
+   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id())
+      return video_context_driver_presentable_direct();
+
+   if (retro_atomic_load_acquire_int(&thr->win_flags)
+         & VIDEO_THREAD_WIN_PRESENTABLE)
+      return true;
+
+   /* Not presentable as of the last frame. The runloop waits a frame on
+    * that and asks again; the video thread is asked to look again in
+    * the meantime, so the next answer is the context's own and not the
+    * last frame's - a window that came back is seen whether or not a
+    * frame comes. Queued, never waited on, and only on this path: a
+    * presentable window costs the load above and nothing else. A full
+    * queue just leaves it to the next frame's answer. */
+   {
+      thread_packet_t pkt;
+      pkt.type = CMD_POLL_PRESENTABLE;
+      video_thread_defer_packet(thr, &pkt);
+   }
+   return false;
+}
+
+/* Presenter statistics for the overlay: repeats made this session, and
+ * whether their cadence is phase-locked to the display. From the
+ * published snapshot; false/0 without the wrapper. Returns whether
+ * repeats are armed. */
+bool video_thread_presenter_stats(uint64_t *repeats, bool *display_phase)
+{
+   video_thread_stat_snap_t snap;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+   *repeats       = 0;
+   *display_phase = false;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   if (!(thr = (thread_video_t*)video_st->data) || !thr->thread)
+      return false;
+   video_thread_read_stats(thr, &snap);
+   *repeats       = snap.repeats;
+   *display_phase = (snap.flags & VIDEO_THREAD_STAT_F_PHASE_DISPLAY) != 0;
+   return (snap.flags & VIDEO_THREAD_STAT_F_PRESENT_REPEAT) != 0;
+}
+
+bool video_thread_input_age_stats(retro_time_t *avg, retro_time_t *worst)
+{
+   video_thread_stat_snap_t snap;
+   thread_video_t *thr;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   *avg = *worst = 0;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   if (!(thr = (thread_video_t*)video_st->data) || !thr->thread)
+      return false;
+   video_thread_read_stats(thr, &snap);
+   *avg   = snap.input_age_avg;
+   *worst = snap.input_age_max;
+   return *avg > 0;
+}
+
+bool video_thread_latency_stats(retro_time_t *avg, retro_time_t *worst,
+      bool *from_display)
+{
+   video_thread_stat_snap_t snap;
+   thread_video_t *thr;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   *avg = *worst = 0;
+   *from_display = false;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   if (!(thr = (thread_video_t*)video_st->data) || !thr->thread)
+      return false;
+   video_thread_read_stats(thr, &snap);
+   *avg          = snap.latency_avg;
+   *worst        = snap.latency_max;
+   *from_display = (snap.flags & VIDEO_THREAD_STAT_F_LAT_DISPLAY) != 0;
+   return *avg > 0;
+}
+
+bool video_thread_present_sync_stats(retro_time_t *fence_wait,
+      retro_time_t *lock_wait)
+{
+   video_thread_stat_snap_t snap;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+   *fence_wait = 0;
+   *lock_wait  = 0;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   if (     !(thr = (thread_video_t*)video_st->data) || !thr->thread
+         || !thr->poke || !thr->poke->get_last_present_sync)
+      return false;
+   video_thread_read_stats(thr, &snap);
+   *fence_wait = snap.fence_wait;
+   *lock_wait  = snap.lock_wait;
+   return true;
+}
+
+bool video_thread_present_wait_stats(retro_time_t *wait)
+{
+   video_thread_stat_snap_t snap;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+   *wait = 0;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   if (     !(thr = (thread_video_t*)video_st->data) || !thr->thread
+         || !thr->poke || !thr->poke->get_last_present_wait)
+      return false;
+   video_thread_read_stats(thr, &snap);
+   *wait = snap.present_wait;
+   return true;
+}
+
+bool video_thread_pacing_stats(bool *display_pacing,
+      retro_time_t *core_time, retro_time_t *render_time)
+{
+   video_thread_stat_snap_t snap;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+   *display_pacing = false;
+   *core_time      = 0;
+   *render_time    = 0;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   if (!(thr = (thread_video_t*)video_st->data) || !thr->thread)
+      return false;
+   video_thread_read_stats(thr, &snap);
+   *display_pacing = (snap.flags & VIDEO_THREAD_STAT_F_DISPLAY_PACING) != 0;
+   *core_time      = snap.core_time;
+   *render_time    = snap.render_time;
+   return true;
+}
+
+bool video_thread_get_handoff_stats(video_thread_handoff_stats_t *out)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t *thr;
+   if (!video_st->thread_wrapper_active)
+      return false;
+   if (!(thr = (thread_video_t*)video_st->data))
+      return false;
+   *out        = thr->handoff.last;
+   out->pushed = thr->hit_count;
+   return true;
+}
+
+uint64_t video_thread_swap_count(void)
+{
+   video_thread_stat_snap_t snap;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+   if (!video_st->thread_wrapper_active)
+      return video_st->swap_count;
+   if (!(thr = (thread_video_t*)video_st->data) || !thr->thread)
+      return video_st->swap_count;
+   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id())
+      return video_st->swap_count;
+   video_thread_read_stats(thr, &snap);
+   return snap.swaps;
+}
+
+#ifdef HAVE_GFX_WIDGETS
+void video_thread_status_text(const char *s)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+
+   if (!video_st->thread_wrapper_active)
+      return;
+   if (!(thr = (thread_video_t*)video_st->data))
+      return;
+   thr->status_text_len = strlcpy(thr->status_text, s,
+         sizeof(thr->status_text));
+   if (thr->status_text_len >= sizeof(thr->status_text))
+      thr->status_text_len = sizeof(thr->status_text) - 1;
+}
+#endif
+
+static uintptr_t video_thread_invalidate_hw_cb(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (thr->driver && thr->driver->invalidate_hw_render_cache)
+      thr->driver->invalidate_hw_render_cache(thr->driver_data);
+   return 0;
+}
+
+void video_thread_invalidate_hw_render_cache(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (!thr || !thr->thread)
+      return;
+   /* From the video thread the frame in progress is the caller's own. */
+   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id())
+      return;
+   if (!video_thread_hw_holds_frame(thr))
+      return;
+
+   /* In this order: nothing queued or being drawn, then the driver
+    * waits out what it submitted and lets go of the image on the
+    * thread that owns its state, then the ring stops offering it. */
+   video_thread_ring_drain(thr);
+   video_thread_run_blocking(video_thread_invalidate_hw_cb, thr);
+   video_thread_hw_forget(thr);
+}
+
+void video_thread_wait_idle(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   thread_video_t       *thr;
+
+   /* Only safe to interpret video_st->data as a thread_video_t*
+    * when the threaded video wrapper is actually active.  With
+    * non-threaded video, video_st->data points to the raw
+    * driver's private state. */
+   if (!video_st->thread_wrapper_active)
+      return;
+
+   thr = (thread_video_t*)video_st->data;
+
+   if (!thr || !thr->thread)
+      return;
+
+   /* Avoid self-deadlock if called from the video thread. */
+   if (sthread_get_thread_id(thr->thread) == sthread_get_current_thread_id())
+      return;
+
+   video_thread_ring_drain(thr);
 }

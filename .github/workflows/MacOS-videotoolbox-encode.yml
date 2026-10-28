@@ -1,0 +1,193 @@
+name: CI VideoToolbox hardware encode
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/MacOS-videotoolbox-encode.yml'
+      - 'gfx/common/videotoolbox_encode*.h'
+      - 'libretro-common/formats/h265/rh265_sps_crop.c'
+      - 'libretro-common/include/formats/rh265_sps_crop.h'
+      - 'record/drivers/record_metal.*'
+      - 'record/record_driver.*'
+      - 'gfx/drivers/metal.m'
+      - 'Makefile.common'
+      - 'griffin/griffin*'
+      - 'record/record_gpu_capture_metal.*'
+      - 'record/record_gpu_session_metal.*'
+      - 'record/record_gpu_dispatch_metal.*'
+      - 'record/record_gpu_worker_vt*'
+      - 'record/record_audio_queue.*'
+      - 'record/record_avfoundation_worker*'
+      - 'record/record_avfoundation_session*'
+      - 'record/record_mux_avfoundation.*'
+      - 'record/shaders/capture_metal.*'
+      - 'record/shaders/generate_metal.py'
+      - 'samples/record/videotoolbox_encode/**'
+      - 'samples/record/metal_frontend/**'
+      - 'libretro-common/include/retro_atomic.h'
+  pull_request:
+    paths:
+      - '.github/workflows/MacOS-videotoolbox-encode.yml'
+      - 'gfx/common/videotoolbox_encode*.h'
+      - 'libretro-common/formats/h265/rh265_sps_crop.c'
+      - 'libretro-common/include/formats/rh265_sps_crop.h'
+      - 'record/drivers/record_metal.*'
+      - 'record/record_driver.*'
+      - 'gfx/drivers/metal.m'
+      - 'Makefile.common'
+      - 'griffin/griffin*'
+      - 'record/record_gpu_capture_metal.*'
+      - 'record/record_gpu_session_metal.*'
+      - 'record/record_gpu_dispatch_metal.*'
+      - 'record/record_gpu_worker_vt*'
+      - 'record/record_audio_queue.*'
+      - 'record/record_avfoundation_worker*'
+      - 'record/record_avfoundation_session*'
+      - 'record/record_mux_avfoundation.*'
+      - 'record/shaders/capture_metal.*'
+      - 'record/shaders/generate_metal.py'
+      - 'samples/record/videotoolbox_encode/**'
+      - 'samples/record/metal_frontend/**'
+      - 'libretro-common/include/retro_atomic.h'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  encode:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install independent test decoder
+        run: command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || brew install ffmpeg
+      - name: Native encoder and Metal device inventory
+        if: ${{ !cancelled() }}
+        run: ENCODER_DEVICE_ARTIFACT="$RUNNER_TEMP/metal-vt-devices.json" python3 samples/record/videotoolbox_encode/device_run.py
+      - name: Portable ownership and failure contracts
+        working-directory: samples/record/videotoolbox_encode
+        run: make check thread_test worker_thread_test audio_thread_test av_session_thread_test && ./thread_test && ./worker_thread_test && ./audio_thread_test && ./av_session_thread_test
+      - name: Native hardware encoder and independent pixels
+        run: |
+          rc=0
+          python3 samples/record/videotoolbox_encode/run.py --native || rc=$?
+          if [ "$rc" = 77 ]; then
+            echo "::warning::Some required hardware encode cases unavailable; native encode acceptance is incomplete"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Native Metal to VideoToolbox queue-worker pipeline
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          PIPELINE_ARTIFACT_DIR="$RUNNER_TEMP/metal-vt-evidence" python3 samples/record/videotoolbox_encode/pipeline_run.py || rc=$?
+          if [ "$rc" = 77 ]; then
+            echo "::warning::Native pipeline hardware unavailable; integrated recording acceptance is incomplete"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Independent native Metal capture pixels and ownership
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          python3 samples/record/videotoolbox_encode/capture_run.py || rc=$?
+          if [ "$rc" = 77 ]; then
+            echo "::warning::Metal capture device unavailable; native capture acceptance is incomplete"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Native compressed MP4 and AAC worker mux
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          PIPELINE_ARTIFACT_DIR="$RUNNER_TEMP/metal-vt-mux-evidence" python3 samples/record/videotoolbox_encode/pipeline_run.py --mux || rc=$?
+          if [ "$rc" = 77 ]; then
+            echo "::warning::Native mux hardware unavailable; A/V acceptance is incomplete"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Native owned recording session
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          PIPELINE_ARTIFACT_DIR="$RUNNER_TEMP/metal-vt-session-evidence" python3 samples/record/videotoolbox_encode/pipeline_run.py --session || rc=$?
+          if [ "$rc" = 77 ]; then
+            echo "::warning::Native owned session hardware unavailable; controller acceptance is incomplete"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Native renderer-device cold recording startup
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          PIPELINE_ARTIFACT_DIR="$RUNNER_TEMP/metal-vt-cold-evidence" python3 samples/record/videotoolbox_encode/pipeline_run.py --cold || rc=$?
+          if [ "$rc" = 77 ]; then
+            echo "::warning::Renderer-device encoder unavailable; cold startup acceptance is incomplete"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Native dedicated recording dispatcher
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          PIPELINE_ARTIFACT_DIR="$RUNNER_TEMP/metal-vt-dispatch-evidence" python3 samples/record/videotoolbox_encode/pipeline_run.py --dispatch || rc=$?
+          if [ "$rc" = 77 ]; then
+            echo "::warning::Dispatcher hardware unavailable; recording dispatch acceptance is incomplete"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Preserve native pipeline evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-vt-pipeline-evidence
+          path: |
+            ${{ runner.temp }}/metal-vt-evidence
+            ${{ runner.temp }}/metal-vt-mux-evidence
+            ${{ runner.temp }}/metal-vt-session-evidence
+            ${{ runner.temp }}/metal-vt-cold-evidence
+            ${{ runner.temp }}/metal-vt-dispatch-evidence
+            ${{ runner.temp }}/metal-vt-devices.json
+          if-no-files-found: warn
+
+  frontend-build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure native Metal recording frontend
+        run: |
+          set -eu
+          ./configure --enable-metal --enable-avf --enable-threads --enable-configfile --enable-webmplayer \
+            --disable-qt --disable-ffmpeg --disable-discord --disable-cheevos \
+            --disable-networking --disable-sdl2 --disable-sdl --disable-translate \
+            --disable-update_cores --disable-update_assets --disable-online_updater \
+            --disable-cdrom --disable-7zip --disable-ssl
+          for feature in HAVE_METAL HAVE_AVF HAVE_THREADS HAVE_CONFIGFILE HAVE_WEBMPLAYER; do
+            grep -Eq "^#define $feature 1" config.h
+          done
+      - name: Build and link real frontend with native recording enabled
+        run: |
+          set -eu
+          make -j"$(sysctl -n hw.ncpu)" MINVERFLAGS="-mmacosx-version-min=$(sw_vers -productVersion)"
+          test -x retroarch
+          nm retroarch | grep '_record_metal_gpu_capture'
+
+      - name: Independent real frontend GPU recording
+        run: |
+          set -eu
+          command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || brew install ffmpeg
+          cc -dynamiclib -std=gnu89 -Ilibretro-common/include samples/record/metal_frontend/core.c -o "$RUNNER_TEMP/metal-record-core.dylib" -lm
+          python3 samples/record/metal_frontend/run.py --retroarch ./retroarch --core "$RUNNER_TEMP/metal-record-core.dylib" --output-dir "$RUNNER_TEMP/metal-frontend-recordings"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: metal-frontend-recordings
+          path: ${{ runner.temp }}/metal-frontend-recordings
+          if-no-files-found: warn
+
+  frontend-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Source-clock capture and backpressure under sanitizers
+        run: make -C samples/record/metal_frontend check SANITIZER=address,undefined

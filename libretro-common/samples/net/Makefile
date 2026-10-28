@@ -1,3 +1,5 @@
+include ../sample_objdir.mk
+
 TARGETS  = http_test http_parse_test net_ifinfo
 
 LIBRETRO_COMM_DIR := ../..
@@ -20,7 +22,7 @@ endif
 endif
 
 ifeq ($(DEBUG),1)
-CFLAGS += -O0 -g
+CFLAGS += -O0 -g1
 else
 CFLAGS += -O2
 endif
@@ -31,11 +33,23 @@ HTTP_TEST_C = \
 				  $(LIBRETRO_COMM_DIR)/net/net_compat.c \
 				  $(LIBRETRO_COMM_DIR)/net/net_socket.c \
 				  $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+				  $(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
+				  $(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c \
 				  $(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+				  $(LIBRETRO_COMM_DIR)/encodings/encoding_base64.c \
+				  $(LIBRETRO_COMM_DIR)/features/features_cpu.c \
+				  $(LIBRETRO_COMM_DIR)/file/file_path.c \
+				  $(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+				  $(LIBRETRO_COMM_DIR)/lists/string_list.c \
+				  $(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+				  $(LIBRETRO_COMM_DIR)/string/rstrtod.c \
 				  $(LIBRETRO_COMM_DIR)/string/stdstring.c \
+				  $(LIBRETRO_COMM_DIR)/time/rtime.c \
+				  $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c \
+				  $(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
 				  net_http_test.c
 
-HTTP_TEST_OBJS := $(HTTP_TEST_C:.c=.o)
+HTTP_TEST_OBJS := $(call sample_objs,$(HTTP_TEST_C:.c=.o))
 
 HTTP_PARSE_TEST_C = \
 				  $(LIBRETRO_COMM_DIR)/net/net_http.c \
@@ -44,27 +58,54 @@ HTTP_PARSE_TEST_C = \
 				  $(LIBRETRO_COMM_DIR)/net/net_socket.c \
 				  $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
 				  $(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
+				  $(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c \
 				  $(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+				  $(LIBRETRO_COMM_DIR)/encodings/encoding_base64.c \
+				  $(LIBRETRO_COMM_DIR)/features/features_cpu.c \
+				  $(LIBRETRO_COMM_DIR)/file/file_path.c \
+				  $(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+				  $(LIBRETRO_COMM_DIR)/lists/string_list.c \
+				  $(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+				  $(LIBRETRO_COMM_DIR)/string/rstrtod.c \
 				  $(LIBRETRO_COMM_DIR)/string/stdstring.c \
+				  $(LIBRETRO_COMM_DIR)/time/rtime.c \
+				  $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c \
+				  $(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
 				  net_http_parse_test.c
 
-HTTP_PARSE_TEST_OBJS := $(HTTP_PARSE_TEST_C:.c=.o)
+HTTP_PARSE_TEST_OBJS := $(call sample_objs,$(HTTP_PARSE_TEST_C:.c=.o))
 
 NET_IFINFO_C = \
 					$(LIBRETRO_COMM_DIR)/net/net_ifinfo.c \
+					$(LIBRETRO_COMM_DIR)/net/net_compat.c \
+					$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
 					net_ifinfo_test.c
 
 ifeq ($(platform), win)
 CFLAGS += -liphlpapi -lws2_32
+
+# The samples workflow passes SANITIZER=address,undefined to every
+# sample dir.  Without this block the variable was accepted and
+# ignored, so these targets built unsanitized while the workflow
+# reported them as checked.
+ifneq ($(SANITIZER),)
+   CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
+   LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
-NET_IFINFO_OBJS := $(NET_IFINFO_C:.c=.o)
+endif
+
+NET_IFINFO_OBJS := $(call sample_objs,$(NET_IFINFO_C:.c=.o))
 
 .PHONY: all clean
 
 all: $(TARGETS)
 
 %.o: %.c
+	$(CC) $(INCFLAGS) $< -c $(CFLAGS) -o $@
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
 	$(CC) $(INCFLAGS) $< -c $(CFLAGS) -o $@
 
 http_parse_test: $(HTTP_PARSE_TEST_OBJS)
@@ -77,4 +118,5 @@ net_ifinfo: $(NET_IFINFO_OBJS)
 	$(CC) $(INCFLAGS) $(NET_IFINFO_OBJS) $(CFLAGS) -o $@
 
 clean:
+	rm -rf $(SAMPLE_OBJDIR)
 	rm -rf $(TARGETS) $(HTTP_TEST_OBJS) $(HTTP_PARSE_TEST_OBJS) $(NET_IFINFO_OBJS)

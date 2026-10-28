@@ -32,11 +32,16 @@
 #include <wiiu/pad_strings.h>
 #endif
 
+#ifdef HAVE_OPENXR
+#include "common/input_openxr.h"
+#endif
+
 #define DECL_BTN(btn, bind) "input_" #btn "_btn = " #bind "\n"
 #define DECL_BTN_EX(btn, bind, name) "input_" #btn "_btn = " #bind "\ninput_" #btn "_btn_label = \"" name "\"\n"
 #define DECL_AXIS(axis, bind) "input_" #axis "_axis = " #bind "\n"
 #define DECL_AXIS_EX(axis, bind, name) "input_" #axis "_axis = " #bind "\ninput_" #axis "_axis_label = \"" name "\"\n"
 #define DECL_MENU(btn) "input_menu_toggle_btn = " #btn "\n"
+#define DECL_MENU_EX(btn, name) "input_menu_toggle_btn = " #btn "\ninput_menu_toggle_btn_label = \"" name "\"\n"
 #define DECL_AUTOCONF_DEVICE(device, driver, binds) "input_device = \"" device "\"\ninput_driver = \"" driver "\"\n" binds
 #define DECL_AUTOCONF_PID(pid, vid, driver, binds) "input_product_id = " #pid "\ninput_vendor_id = " #vid "\ninput_driver = \"" driver "\"\n" binds
 
@@ -65,6 +70,82 @@ DECL_AXIS(r_x_plus,  +2) \
 DECL_AXIS(r_x_minus, -2) \
 DECL_AXIS(r_y_plus,  -3) \
 DECL_AXIS(r_y_minus, +3)
+
+#ifdef WEBOS
+/* Switch Pro on webOS — working physical remap. */
+#define SWITCH_PRO_SDL2_BINDS \
+DECL_BTN(a, 0) \
+DECL_BTN(b, 1) \
+DECL_BTN(x, 2) \
+DECL_BTN(y, 3) \
+DECL_BTN(select, 9) \
+DECL_BTN(start, 10) \
+DECL_BTN(up, h0up) \
+DECL_BTN(down, h0down) \
+DECL_BTN(left, h0left) \
+DECL_BTN(right, h0right) \
+DECL_BTN(l, 5) \
+DECL_BTN(r, 6) \
+DECL_BTN(l2, 7) \
+DECL_BTN(r2, 8) \
+DECL_BTN(l3, 12) \
+DECL_BTN(r3, 13) \
+DECL_AXIS(l_x_plus,  +0) \
+DECL_AXIS(l_x_minus, -0) \
+DECL_AXIS(l_y_plus,  +1) \
+DECL_AXIS(l_y_minus, -1) \
+DECL_AXIS(r_x_plus,  +2) \
+DECL_AXIS(r_x_minus, -2) \
+DECL_AXIS(r_y_plus,  -3) \
+DECL_AXIS(r_y_minus, +3) \
+DECL_MENU(11)
+#endif
+
+#define SDL3_DEFAULT_BINDS \
+DECL_BTN_EX(a,           1, "Right Face Button")   /* SDL_GAMEPAD_BUTTON_EAST           */ \
+DECL_BTN_EX(b,           0, "Bottom Face Button")  /* SDL_GAMEPAD_BUTTON_SOUTH          */ \
+DECL_BTN_EX(x,           3, "Top Face Button")     /* SDL_GAMEPAD_BUTTON_NORTH          */ \
+DECL_BTN_EX(y,           2, "Left Face Button")    /* SDL_GAMEPAD_BUTTON_WEST           */ \
+DECL_BTN_EX(select,      4, "Back")                /* SDL_GAMEPAD_BUTTON_BACK           */ \
+DECL_BTN_EX(start,       6, "Start")               /* SDL_GAMEPAD_BUTTON_START          */ \
+DECL_BTN_EX(up,         11, "D-Pad Up")            /* SDL_GAMEPAD_BUTTON_DPAD_UP        */ \
+DECL_BTN_EX(down,       12, "D-Pad Down")          /* SDL_GAMEPAD_BUTTON_DPAD_DOWN      */ \
+DECL_BTN_EX(left,       13, "D-Pad Left")          /* SDL_GAMEPAD_BUTTON_DPAD_LEFT      */ \
+DECL_BTN_EX(right,      14, "D-Pad Right")         /* SDL_GAMEPAD_BUTTON_DPAD_RIGHT     */ \
+DECL_BTN_EX(l,           9, "Left Shoulder")       /* SDL_GAMEPAD_BUTTON_LEFT_SHOULDER  */ \
+DECL_BTN_EX(r,          10, "Right Shoulder")      /* SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER */ \
+DECL_AXIS_EX(l2,        +4, "Left Trigger")        /* SDL_GAMEPAD_AXIS_LEFT_TRIGGER     */ \
+DECL_AXIS_EX(r2,        +5, "Right Trigger")       /* SDL_GAMEPAD_AXIS_RIGHT_TRIGGER    */ \
+DECL_BTN_EX(l3,          7, "Left Stick")          /* SDL_GAMEPAD_BUTTON_LEFT_STICK     */ \
+DECL_BTN_EX(r3,          8, "Right Stick")         /* SDL_GAMEPAD_BUTTON_RIGHT_STICK    */ \
+DECL_AXIS_EX(l_x_plus,  +0, "Left Thumbstick X+")  /* SDL_GAMEPAD_AXIS_LEFTX            */ \
+DECL_AXIS_EX(l_x_minus, -0, "Left Thumbstick X-")  /* SDL_GAMEPAD_AXIS_LEFTX            */ \
+DECL_AXIS_EX(l_y_plus,  +1, "Left Thumbstick Y+")  /* SDL_GAMEPAD_AXIS_LEFTY            */ \
+DECL_AXIS_EX(l_y_minus, -1, "Left Thumbstick Y-")  /* SDL_GAMEPAD_AXIS_LEFTY            */ \
+DECL_AXIS_EX(r_x_plus,  +2, "Right Thumbstick X+") /* SDL_GAMEPAD_AXIS_RIGHTX           */ \
+DECL_AXIS_EX(r_x_minus, -2, "Right Thumbstick X-") /* SDL_GAMEPAD_AXIS_RIGHTX           */ \
+DECL_AXIS_EX(r_y_plus,  -3, "Right Thumbstick Y+") /* SDL_GAMEPAD_AXIS_RIGHTY           */ \
+DECL_AXIS_EX(r_y_minus, +3, "Right Thumbstick Y-") /* SDL_GAMEPAD_AXIS_RIGHTY           */ \
+DECL_MENU_EX(5, "Guide")                           /* SDL_GAMEPAD_BUTTON_GUIDE          */
+
+/* A PS3 controller under SDL's own driver for it (SDL_JOYSTICK_HIDAPI_PS3)
+ * reports how hard ten of its buttons are pressed, on axes after the
+ * gamepad's six, in the order SDL lists the buttons: the four face
+ * buttons, the shoulders, the D-Pad. Each is bound beside its button:
+ * the button says pressed, the axis says how hard. Without that
+ * driver the pad has six axes and these read nothing. */
+#define SDL3_PS3_BINDS \
+SDL3_DEFAULT_BINDS \
+DECL_AXIS(b,     +6)  /* Cross    */ \
+DECL_AXIS(a,     +7)  /* Circle   */ \
+DECL_AXIS(y,     +8)  /* Square   */ \
+DECL_AXIS(x,     +9)  /* Triangle */ \
+DECL_AXIS(l,     +10) /* L1       */ \
+DECL_AXIS(r,     +11) /* R1       */ \
+DECL_AXIS(up,    +12) \
+DECL_AXIS(down,  +13) \
+DECL_AXIS(left,  +14) \
+DECL_AXIS(right, +15)
 
 #if defined(DINGUX) && defined(HAVE_SDL_DINGUX)
 #define DINGUX_SDL_DEFAULT_BINDS \
@@ -278,30 +359,6 @@ DECL_AXIS_EX(r_x_plus,  +2, "C Stick Right") \
 DECL_AXIS_EX(r_x_minus, -2, "C Stick Left") \
 DECL_AXIS_EX(r_y_plus,  +3, "C Stick Down") \
 DECL_AXIS_EX(r_y_minus, -3, "C Stick Up")
-
-#define DOSINPUT_DEFAULT_BINDS \
-DECL_BTN(a, 8) \
-DECL_BTN(b, 0) \
-DECL_BTN(x, 9) \
-DECL_BTN(y, 1) \
-DECL_BTN(start, 3) \
-DECL_BTN(select, 2) \
-DECL_BTN(up, 4) \
-DECL_BTN(down, 5) \
-DECL_BTN(left, 6) \
-DECL_BTN(right, 7) \
-DECL_BTN(l, 10) \
-DECL_BTN(r, 11) \
-DECL_BTN(l2, 12) \
-DECL_BTN(r2, 13) \
-DECL_AXIS(l_x_plus,  +0) \
-DECL_AXIS(l_x_minus, -0) \
-DECL_AXIS(l_y_plus,  +1) \
-DECL_AXIS(l_y_minus, -1) \
-DECL_AXIS(r_x_plus,  +2) \
-DECL_AXIS(r_x_minus, -2) \
-DECL_AXIS(r_y_plus,  -3) \
-DECL_AXIS(r_y_minus, +3)
 
 #ifdef WIIU
 
@@ -570,6 +627,24 @@ DECL_AXIS_EX(r_x_minus,  -2, "R-Stick Left") \
 DECL_AXIS_EX(r_y_plus,  +3, "R-Stick Down") \
 DECL_AXIS_EX(r_y_minus,   -3, "R-Stick Up")
 
+/* Frets as on the guitars with face buttons in their colours. */
+#define GXINPUT_GUITAR_DEFAULT_BINDS \
+DECL_BTN_EX(b, 13, "Green") \
+DECL_BTN_EX(a, 14, "Red") \
+DECL_BTN_EX(x, 15, "Yellow") \
+DECL_BTN_EX(y, 16, "Blue") \
+DECL_BTN_EX(l, 22, "Orange") \
+DECL_BTN_EX(start, 17, "+") \
+DECL_BTN_EX(select, 18, "-") \
+DECL_BTN_EX(menu_toggle, 34, "Home") \
+DECL_BTN_EX(up, 24, "Strum Up") \
+DECL_BTN_EX(down, 25, "Strum Down") \
+DECL_AXIS_EX(l_x_plus,  +0, "Stick Right") \
+DECL_AXIS_EX(l_x_minus, -0, "Stick Left") \
+DECL_AXIS_EX(l_y_plus,  +1, "Stick Down") \
+DECL_AXIS_EX(l_y_minus, -1, "Stick Up") \
+DECL_AXIS_EX(r_x_plus,  +2, "Whammy Bar")
+
 #define PS3INPUT_DEFAULT_BINDS \
 DECL_BTN(a, 8) \
 DECL_BTN(b, 0) \
@@ -703,6 +778,39 @@ DECL_AXIS(r_x_minus, -2) \
 DECL_AXIS(r_y_plus,  +3) \
 DECL_AXIS(r_y_minus, -3)
 
+#ifdef HAVE_OPENXR
+/* The headset's controllers (input_openxr.c): the RetroPad's ids as
+ * buttons, the sticks as axes 0 to 3 with Y down, L2 and R2 as axes 4
+ * and 5. */
+#define OPENXR_DEFAULT_BINDS \
+DECL_BTN(b, 0) \
+DECL_BTN(y, 1) \
+DECL_BTN(select, 2) \
+DECL_BTN(start, 3) \
+DECL_BTN(up, 4) \
+DECL_BTN(down, 5) \
+DECL_BTN(left, 6) \
+DECL_BTN(right, 7) \
+DECL_BTN(a, 8) \
+DECL_BTN(x, 9) \
+DECL_BTN(l, 10) \
+DECL_BTN(r, 11) \
+DECL_BTN(l2, 12) \
+DECL_BTN(r2, 13) \
+DECL_BTN(l3, 14) \
+DECL_BTN(r3, 15) \
+DECL_AXIS(l2, +4) \
+DECL_AXIS(r2, +5) \
+DECL_AXIS(l_x_plus,  +0) \
+DECL_AXIS(l_x_minus, -0) \
+DECL_AXIS(l_y_plus,  +1) \
+DECL_AXIS(l_y_minus, -1) \
+DECL_AXIS(r_x_plus,  +2) \
+DECL_AXIS(r_x_minus, -2) \
+DECL_AXIS(r_y_plus,  +3) \
+DECL_AXIS(r_y_minus, -3)
+#endif
+
 #define MFI_DEFAULT_BINDS \
 DECL_BTN(a, 8) \
 DECL_BTN(b, 0) \
@@ -729,8 +837,132 @@ DECL_AXIS(r_y_minus, +3) \
 DECL_AXIS(l2, +4) \
 DECL_AXIS(r2, +5)
 
+#ifdef HAVE_HID
+/* The hid joypad driver's 8BitDo pads, numbered as their reports number
+ * them (input/connect/connect_8bitdo.c), for the ones with no profile
+ * of their own */
+#define HID_8BITDO_BINDS \
+DECL_BTN(a, 0) \
+DECL_BTN(b, 1) \
+DECL_BTN(x, 3) \
+DECL_BTN(y, 4) \
+DECL_BTN(l, 6) \
+DECL_BTN(r, 7) \
+DECL_BTN(l2, 8) \
+DECL_BTN(r2, 9) \
+DECL_BTN(select, 10) \
+DECL_BTN(start, 11) \
+DECL_BTN(l3, 13) \
+DECL_BTN(r3, 14) \
+DECL_BTN(up, h0up) \
+DECL_BTN(down, h0down) \
+DECL_BTN(left, h0left) \
+DECL_BTN(right, h0right) \
+DECL_AXIS(l_x_plus,  +0) \
+DECL_AXIS(l_x_minus, -0) \
+DECL_AXIS(l_y_plus,  +1) \
+DECL_AXIS(l_y_minus, -1) \
+DECL_AXIS(r_x_plus,  +4) \
+DECL_AXIS(r_x_minus, -4) \
+DECL_AXIS(r_y_plus,  +5) \
+DECL_AXIS(r_y_minus, -5)
+
+/* The hid joypad driver's pads that give the RetroPad's own buttons -
+ * the DualSense's handler, for the pads that pass for one, and the
+ * GameCube adapters' in their PC mode */
+/* An Xbox pad on Windows' HID driver, as winusb reads it: A, B, X, Y,
+ * LB, RB, View, Menu, LS, RS; the triggers on 4 and 5 */
+#define HID_XBOX_BINDS \
+DECL_BTN(a, 1) \
+DECL_BTN(b, 0) \
+DECL_BTN(x, 3) \
+DECL_BTN(y, 2) \
+DECL_BTN(l, 4) \
+DECL_BTN(r, 5) \
+DECL_BTN(select, 6) \
+DECL_BTN(start, 7) \
+DECL_BTN(l3, 8) \
+DECL_BTN(r3, 9) \
+DECL_BTN(up, h0up) \
+DECL_BTN(down, h0down) \
+DECL_BTN(left, h0left) \
+DECL_BTN(right, h0right) \
+DECL_AXIS(l2, +4) \
+DECL_AXIS(r2, +5) \
+DECL_AXIS(l_x_plus,  +0) \
+DECL_AXIS(l_x_minus, -0) \
+DECL_AXIS(l_y_plus,  +1) \
+DECL_AXIS(l_y_minus, -1) \
+DECL_AXIS(r_x_plus,  +2) \
+DECL_AXIS(r_x_minus, -2) \
+DECL_AXIS(r_y_plus,  +3) \
+DECL_AXIS(r_y_minus, -3)
+
+#define HID_RETROPAD_BINDS \
+DECL_BTN(b, 0) \
+DECL_BTN(y, 1) \
+DECL_BTN(select, 2) \
+DECL_BTN(start, 3) \
+DECL_BTN(up, 4) \
+DECL_BTN(down, 5) \
+DECL_BTN(left, 6) \
+DECL_BTN(right, 7) \
+DECL_BTN(a, 8) \
+DECL_BTN(x, 9) \
+DECL_BTN(l, 10) \
+DECL_BTN(r, 11) \
+DECL_BTN(l2, 12) \
+DECL_BTN(r2, 13) \
+DECL_BTN(l3, 14) \
+DECL_BTN(r3, 15) \
+DECL_AXIS(l_x_plus,  +0) \
+DECL_AXIS(l_x_minus, -0) \
+DECL_AXIS(l_y_plus,  +1) \
+DECL_AXIS(l_y_minus, -1) \
+DECL_AXIS(r_x_plus,  +2) \
+DECL_AXIS(r_x_minus, -2) \
+DECL_AXIS(r_y_plus,  +3) \
+DECL_AXIS(r_y_minus, -3)
+
+/* An original Xbox pad (input/connect/connect_xid.c): the RetroPad's
+ * buttons, and each face button's and trigger's pressure as an axis */
+#define HID_XID_BINDS \
+HID_RETROPAD_BINDS \
+DECL_AXIS(b,  +4)  /* A     */ \
+DECL_AXIS(a,  +5)  /* B     */ \
+DECL_AXIS(y,  +6)  /* X     */ \
+DECL_AXIS(x,  +7)  /* Y     */ \
+DECL_AXIS(r,  +8)  /* Black */ \
+DECL_AXIS(l,  +9)  /* White */ \
+DECL_AXIS(l2, +10) \
+DECL_AXIS(r2, +11)
+
+/* the DualSense's handler gives its PS button as 16 */
+#define HID_DUALSENSE_BINDS \
+HID_RETROPAD_BINDS \
+DECL_MENU_EX(16, "PS")
+#endif
+
 const char* const input_builtin_autoconfs[] =
 {
+#ifdef HAVE_HID
+   DECL_AUTOCONF_DEVICE("8BitDo Pro 2", "hid", HID_8BITDO_BINDS),
+   DECL_AUTOCONF_DEVICE("8BitDo Pro 3", "hid", HID_8BITDO_BINDS),
+   DECL_AUTOCONF_DEVICE("8BitDo Ultimate 2 Wireless", "hid", HID_8BITDO_BINDS),
+   DECL_AUTOCONF_DEVICE("8BitDo Ultimate 2C Wireless", "hid", HID_8BITDO_BINDS),
+   DECL_AUTOCONF_DEVICE("8BitDo Ultimate 3", "hid", HID_8BITDO_BINDS),
+   DECL_AUTOCONF_DEVICE("DualSense Wireless Controller", "hid", HID_DUALSENSE_BINDS),
+   DECL_AUTOCONF_DEVICE("DualSense Edge Wireless Controller", "hid", HID_DUALSENSE_BINDS),
+#ifdef _WIN32
+   DECL_AUTOCONF_DEVICE("Original Xbox Controller", "hid", HID_XID_BINDS),
+   DECL_AUTOCONF_DEVICE("Controller (Xbox One For Windows)", "hid", HID_XBOX_BINDS),
+   DECL_AUTOCONF_DEVICE("Controller (Xbox 360 For Windows)", "hid", HID_XBOX_BINDS),
+   DECL_AUTOCONF_DEVICE("Controller (XBOX 360 For Windows)", "hid", HID_XBOX_BINDS),
+#endif
+   DECL_AUTOCONF_PID(0x1843, 0x0079, "hid", HID_RETROPAD_BINDS),
+   DECL_AUTOCONF_PID(0x1844, 0x0079, "hid", HID_RETROPAD_BINDS),
+   DECL_AUTOCONF_PID(0x1846, 0x0079, "hid", HID_RETROPAD_BINDS),
+#endif
 #if defined(_WIN32) && defined(_XBOX)
    DECL_AUTOCONF_DEVICE("XInput Controller (User 1)", "xdk", XINPUT_DEFAULT_BINDS),
    DECL_AUTOCONF_DEVICE("XInput Controller (User 2)", "xdk", XINPUT_DEFAULT_BINDS),
@@ -743,6 +975,17 @@ const char* const input_builtin_autoconfs[] =
 #endif
 #ifdef HAVE_SDL2
    DECL_AUTOCONF_DEVICE("Standard Gamepad", "sdl2", SDL2_DEFAULT_BINDS),
+#ifdef WEBOS
+   DECL_AUTOCONF_PID(0x2009, 0x057e, "sdl2", SWITCH_PRO_SDL2_BINDS),
+   DECL_AUTOCONF_PID(0x200e, 0x057e, "sdl2", SWITCH_PRO_SDL2_BINDS),
+   DECL_AUTOCONF_DEVICE("Nintendo Switch Pro Controller", "sdl2", SWITCH_PRO_SDL2_BINDS),
+#endif
+#endif
+#ifdef HAVE_SDL3
+   DECL_AUTOCONF_DEVICE("Gamepad", "sdl3", SDL3_DEFAULT_BINDS),
+   /* named by tasks/task_autodetect.c for a PS3 controller, and not a
+    * name a controller gives itself */
+   DECL_AUTOCONF_DEVICE("SDL3 PS3 Gamepad", "sdl3", SDL3_PS3_BINDS),
 #endif
 #if defined(DINGUX) && defined(HAVE_SDL_DINGUX)
    DECL_AUTOCONF_DEVICE("Dingux Gamepad", "sdl_dingux", DINGUX_SDL_DEFAULT_BINDS),
@@ -771,15 +1014,13 @@ const char* const input_builtin_autoconfs[] =
 #ifdef _3DS
    DECL_AUTOCONF_DEVICE("3DS Controller", "ctr", CTRINPUT_DEFAULT_BINDS),
 #endif
-#ifdef DJGPP
-   DECL_AUTOCONF_DEVICE("DOS Controller", "dos", DOSINPUT_DEFAULT_BINDS),
-#endif
 #ifdef GEKKO
    DECL_AUTOCONF_DEVICE("GameCube Controller", "gx", GXINPUT_GAMECUBE_DEFAULT_BINDS),
 #ifdef HW_RVL
    DECL_AUTOCONF_DEVICE("Wiimote Controller", "gx", GXINPUT_WIIMOTE_DEFAULT_BINDS),
    DECL_AUTOCONF_DEVICE("Nunchuk Controller", "gx", GXINPUT_NUNCHUK_DEFAULT_BINDS),
    DECL_AUTOCONF_DEVICE("Classic Controller", "gx", GXINPUT_CLASSIC_DEFAULT_BINDS),
+   DECL_AUTOCONF_DEVICE("Guitar Hero Guitar", "gx", GXINPUT_GUITAR_DEFAULT_BINDS),
 #endif
 #endif
 #ifdef WIIU
@@ -799,11 +1040,16 @@ const char* const input_builtin_autoconfs[] =
 #if defined(__SWITCH__) || defined(SWITCH)
    DECL_AUTOCONF_DEVICE("Switch Controller", "switch", SWITCH_DEFAULT_BINDS),
 #endif
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
    DECL_AUTOCONF_PID(1, 1, "rwebpad", EMSCRIPTEN_DEFAULT_BINDS),
 #endif
 #if HAVE_MFI
    DECL_AUTOCONF_DEVICE("mFi Controller", "mfi", MFI_DEFAULT_BINDS),
+#endif
+#ifdef HAVE_OPENXR
+   DECL_AUTOCONF_DEVICE(INPUT_OPENXR_JOYPAD_COMBINED, INPUT_OPENXR_JOYPAD, OPENXR_DEFAULT_BINDS),
+   DECL_AUTOCONF_DEVICE(INPUT_OPENXR_JOYPAD_LEFT, INPUT_OPENXR_JOYPAD, OPENXR_DEFAULT_BINDS),
+   DECL_AUTOCONF_DEVICE(INPUT_OPENXR_JOYPAD_RIGHT, INPUT_OPENXR_JOYPAD, OPENXR_DEFAULT_BINDS),
 #endif
    NULL
 };

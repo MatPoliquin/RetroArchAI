@@ -1,0 +1,1360 @@
+name: CI Linux samples/input
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  samples-input:
+    name: Build and run samples/input
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential libusb-1.0-0-dev libudev-dev libsdl2-dev libx11-dev libxtst-dev libxi-dev xvfb gcc-mingw-w64-x86-64 wine64 ccache
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Build and run joypad_bridge_checked (udev, linuxraw, SDL2 on the host; DirectInput, XInput under Wine)
+        shell: bash
+        working-directory: samples/input/joypad_bridge_checked
+        run: |
+          set -eu
+          # The joypad drivers the snapshot bridge serves, held to what
+          # it assumes of them: over random pads, binds and thresholds,
+          # what the bridge would read - buttons through get_buttons(),
+          # hats and axes through button() and axis(), the RetroPad
+          # mask through the common loop - is what the driver's own
+          # button(), axis() and state() say.
+          make clean && make -j$(nproc) all
+          timeout 120 make check
+          make clean
+
+      - name: gfx/ does not reach into input state
+        shell: bash
+        run: |
+          set -eu
+          # The video code used to take input_state_get_ptr() and work
+          # on the input driver's fields itself - freeing the driver
+          # and the joypads, handing out the addresses of its slots,
+          # reading and setting its flags. It goes through calls into
+          # input/ now (input_driver_free_with_video() and the rest).
+          # This keeps it that way: no file under gfx/ may name
+          # input_state_get_ptr.
+          if grep -rn "input_state_get_ptr" --include=*.c --include=*.h \
+                --include=*.m --include=*.cpp gfx/; then
+             echo "FAIL: gfx/ takes the input driver's state directly" >&2
+             exit 1
+          fi
+          echo "[pass] gfx/ does not name input_state_get_ptr"
+
+      - name: Video drivers do not start the input driver for their window
+        shell: bash
+        run: |
+          set -eu
+          # The Windows video drivers and contexts, and the X11 and KMS
+          # contexts, used to call input_driver_init_windows(), _x11()
+          # or _kms() from their own start-up. They say what kind of
+          # window they put up (input_driver_video_window()) and
+          # the frontend starts the input driver for it once the video
+          # driver is up (video_driver_init_input()). No file under
+          # gfx/ may call those three again.
+          if grep -rnE "input_driver_init_(windows|x11|kms)" --include=*.c \
+                --include=*.h --include=*.m --include=*.cpp gfx/; then
+             echo "FAIL: a video driver starts the input driver for its window itself" >&2
+             exit 1
+          fi
+          echo "[pass] gfx/ does not call input_driver_init_windows, _x11 or _kms"
+
+      - name: input/ does not reach into video state
+        shell: bash
+        run: |
+          set -eu
+          # The other direction of the step above. The input code used
+          # to take video_state_get_ptr() and work on the video
+          # driver's fields - the frame count, the core's geometry, the
+          # mouse cursor through the poke interface, the overlay
+          # interface and the driver's data. It goes through calls
+          # into gfx/ now (video_driver_show_mouse() and the rest).
+          # The Android input driver is the one file still to do: it
+          # creates and destroys the window surface on the app's
+          # lifecycle events, and is allowed here by name until that
+          # is moved.
+          if grep -rn "video_state_get_ptr" --include=*.c --include=*.h \
+                --include=*.m --include=*.cpp input/ \
+                | grep -v "^input/drivers/android_input.c:"; then
+             echo "FAIL: input/ takes the video driver's state directly" >&2
+             exit 1
+          fi
+          echo "[pass] input/ does not name video_state_get_ptr (android_input.c excepted)"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: X11 input poll sends no requests (Xvfb, ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/input/x11_input_poll
+        run: |
+          set -eu
+          # The X input driver's poll runs every frame. Keys, and with
+          # XInput 2 the pointer, come from events on the driver's own
+          # connection, drained at the poll, so it sends no request on
+          # either connection; a query on the shared one waits behind
+          # whatever the video thread presents through it. XTEST drives
+          # the keyboard (held before init, auto-repeat, focus changes,
+          # another client's keyboard grab) and the pointer (a press
+          # without motion, buttons 1, 3 and 8, the wheel, a drag out of
+          # the window, a new driver over a held button, and grabbed
+          # motion across a warp the server holds back behind a server
+          # grab - where any wait on the server would hang the test).
+          Xvfb :96 -screen 0 1024x768x24 > /tmp/xvfb96.log 2>&1 &
+          XVFB_PID=$!
+          sleep 1
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          DISPLAY=:96 ASAN_OPTIONS=detect_leaks=1 \
+             UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./x11_input_poll_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          DISPLAY=:96 TSAN_OPTIONS=halt_on_error=1 timeout 120 ./x11_input_poll_test
+          make clean
+          kill $XVFB_PID
+          echo "[pass] x11_input_poll_test (ASan, TSan)"
+
+      - name: Build and run illuminance_sensor_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/illuminance_sensor
+        run: |
+          set -eu
+          # The Linux IIO illuminance sensor poller, against a fake
+          # sysfs tree under /tmp. Pins that the poll thread waits on a
+          # condition between readings rather than sleeping: a raised
+          # rate applies at once, and close returns without waiting out
+          # the period.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x illuminance_sensor_test
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 60 \
+             ./illuminance_sensor_test
+          echo "[pass] illuminance_sensor_test (ASan)"
+
+      - name: Build and run illuminance_sensor_test (TSan)
+        shell: bash
+        working-directory: samples/input/illuminance_sensor
+        run: |
+          set -eu
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 ./illuminance_sensor_test
+          echo "[pass] illuminance_sensor_test (TSan)"
+
+      - name: Build and run libusb_hid_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/libusb_hid
+        run: |
+          set -eu
+          # The libusb HID driver against a fake libusb: reads and
+          # commands run on asynchronous transfers completed by the poll
+          # thread, with no thread per pad. Pins that a command goes out
+          # at once even while the pad sends nothing, that commands stay
+          # in order one at a time, that unplugging frees the adapter,
+          # and that freeing the driver returns at once with a send
+          # still pending, releasing every transfer and handle.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x libusb_hid_test
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 60 \
+             ./libusb_hid_test
+          echo "[pass] libusb_hid_test (ASan)"
+
+      - name: Build and run libusb_hid_test (TSan)
+        shell: bash
+        working-directory: samples/input/libusb_hid
+        run: |
+          set -eu
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 ./libusb_hid_test
+          echo "[pass] libusb_hid_test (TSan)"
+
+      - name: Build and run winusb_hid_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winusb_hid
+        run: |
+          set -eu
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+
+      - name: Build and run connection_gate_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/input/connection_gate
+        run: |
+          set -eu
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 60 ./connection_gate_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 ./connection_gate_test
+          make clean
+
+      - name: Build and run hidraw_hid_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/hidraw_hid
+        run: |
+          set -eu
+          # The hidraw HID driver with the real pad handlers, against
+          # stand-ins for /dev and /sys: only handled pads are opened, a
+          # DualShock 3 is started through hidraw, the newest report
+          # waiting is the pad's state, and a pad that goes is
+          # disconnected and its node closed.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x hidraw_hid_test
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 60 \
+             ./hidraw_hid_test
+          echo "[pass] hidraw_hid_test (ASan)"
+
+      - name: Build and run wii_handshake_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/wii_handshake
+        run: |
+          set -eu
+          # The Wiimote extension handshake in connect_wii.c, fed
+          # reports directly. Pins that each init write waits for the
+          # remote's acknowledgement instead of a sleep on the packet
+          # thread, that a missing acknowledgement is only overtaken by
+          # a packet after the old 100 ms, and that no packet blocks.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x wii_handshake_test
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./wii_handshake_test
+          echo "[pass] wii_handshake_test (ASan)"
+
+      - name: Build and run android_lifecycle_flush_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/input/android_lifecycle_flush
+        run: |
+          set -eu
+          # The Android background flush handshake, a UI thread against
+          # an app thread. Pins that onPause() and onStop() return only
+          # once SRAM, core options and the config are on disk - a
+          # swiped-away task is killed as soon as they have returned -
+          # that the save is written once per trip to the background,
+          # and that the startup pump acknowledges without saving.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_lifecycle_flush_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 60 ./android_lifecycle_flush_test
+          make clean
+          echo "[pass] android_lifecycle_flush_test (ASan, TSan)"
+
+      - name: Build and run android_pad_removed_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/input/android_pad_removed
+        run: |
+          set -eu
+          # A controller Android has removed, from the listener that
+          # hears of it to the port it comes back to. Pins that no
+          # removal is lost or delivered twice with three threads
+          # posting into the mailbox while the input thread polls, that
+          # a full box refuses and keeps what it holds, and that a
+          # returning pad gets its old port back - of two identical
+          # pads, the one that left. Emptying a removed slot's name, as
+          # the first version of the change did, is put back and
+          # asserted to be caught: it moved a pad to the next free port
+          # on every reconnect.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./android_pad_removed_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./android_pad_removed_test
+          make clean
+          echo "[pass] android_pad_removed_test (ASan, TSan)"
+
+      - name: Build and run android_block_timeout_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/android_block_timeout
+        run: |
+          set -eu
+          # The input block timeout on Android, without waiting: the
+          # poll never waits in the foreground; a pad's presses whose
+          # newest came within the timeout of the poll wait one poll for
+          # the rest of the press, older ones are shown at once, none
+          # waits longer, and a press let go before it was shown is
+          # shown for one poll.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_block_timeout_test
+          make clean
+          echo "[pass] android_block_timeout_test (ASan)"
+
+      - name: Build and run android_kbd_keys_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/android_kbd_keys
+        run: |
+          set -eu
+          # Key events from the Android system keyboard, through the
+          # native input queue to the text field that owns the menu
+          # line. Pins that a Backspace the soft keyboard sends as a
+          # key event is handed back to the field instead of being
+          # consumed natively - consumed, the field kept the
+          # characters and the next snapshot put them back on the line.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_kbd_keys_test
+          make clean
+          echo "[pass] android_kbd_keys_test (ASan)"
+
+      - name: Build and run android_cec_remote_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/android_cec_remote
+        run: |
+          set -eu
+          # A television's remote over HDMI-CEC. Android delivers its
+          # keys with no device behind them (id -1, source HDMI), and
+          # the driver took the event for a new gamepad: the remote
+          # became an unconfigured pad called "Virtual" on the next
+          # free port (issue #19249). Pins that such an event registers
+          # no pad and lands on the keyboard row, that only the HDMI
+          # source is taken for a remote, that a controller - one
+          # reporting id -1 included - still gets its pad, and that the
+          # SHIELD keeps its own CEC mapping. Ignoring the source, as
+          # the driver did, is put back and asserted to be caught.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_cec_remote_test
+          make clean
+          echo "[pass] android_cec_remote_test (ASan)"
+
+      - name: Build and run android_key_state_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/android_key_state
+        run: |
+          set -eu
+          # Key presses and releases, through the code that writes them
+          # into the Android driver's key state. For nine days a press
+          # of Back set X on the keyboard row and nothing cleared it; X
+          # is RetroPad A by default, and the frontend drops all
+          # controller input after a menu toggle until every button is
+          # up, so the menu went deaf to the controller while touch
+          # kept working (issue #19436). Pins that whatever a press
+          # sets its release clears - every keycode, every source,
+          # every row, and any interleaving - that keycodes outside the
+          # rows are dropped, that Center stays keycode 23 on a pad row
+          # (issue #18819), and that a pad removed while holding Back
+          # leaves nothing behind. The missing clear is put back and
+          # asserted to be caught.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_key_state_test
+          make clean
+          echo "[pass] android_key_state_test (ASan)"
+
+      - name: Build and run android_poll_changes_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/android_poll_changes
+        run: |
+          set -eu
+          # What one Android input poll applies. The input queue is
+          # read on a thread of its own, so a poll is handed every
+          # event since the last, and a key, a finger or a mouse
+          # button can go down and back up in between. Pins that such a
+          # press is shown for one poll, that the order is kept, that
+          # a repeat never holds anything back, and that rows,
+          # devices, fingers, buttons and hats are told apart. A drain that
+          # applies everything it has is put back and asserted to be
+          # caught.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_poll_changes_test
+          make clean
+          echo "[pass] android_poll_changes_test (ASan)"
+
+      - name: Build and run android_input_ring_test (ASan + UBSan, TSan, mingw-w64)
+        shell: bash
+        working-directory: samples/input/android_input_ring
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The Android input reader's ring: each event a record of the
+          # size it needs, written where the poll applies it. Pins that
+          # the poll reads the reader's bytes in place, that no record
+          # crosses the ring's end over many laps, that a stick's moves
+          # merge only while unpublished, and that on two threads every
+          # record arrives once, whole and in order.
+          make clean && make all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./android_input_ring_test
+          make clean && make all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 300 ./android_input_ring_test
+          make clean && make CC=x86_64-w64-mingw32-gcc
+          WINEDEBUG=-all timeout 180 wine ./android_input_ring_test.exe
+          make clean
+          echo "[pass] android_input_ring_test (ASan, TSan, Wine)"
+
+      - name: Build and run output_store_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/input/output_store
+        run: |
+          set -eu
+          # What a core asks of a rumble motor or an LED, between the
+          # core's call and the frontend's write to the device. Those
+          # calls used to be driver writes on the core's own stack, as
+          # many a frame as the core made; they now post into a store
+          # that the frame loop takes once the core has run. Pins that
+          # a post writes nothing, that an output set many times in a
+          # frame is written once with the last value, that one set to
+          # the value it already had is still written, that a drop
+          # forgets, and - with three threads posting while the frame
+          # loop takes - that every output ends on the last value
+          # posted to it. A take that sees the posts and writes
+          # nothing, the shape of a stop that never reaches the motor,
+          # is put back and asserted to be caught.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./output_store_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./output_store_test
+          make clean
+          echo "[pass] output_store_test (ASan, TSan)"
+
+      - name: Build and run window_driver_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/window_driver
+        run: |
+          set -eu
+          # Which input driver a window gets
+          # (input/input_driver_choice.c): the choice the video
+          # contexts used to have written out each for itself, with
+          # the drivers' names in it. Runs every branch of the X11
+          # window choice and the no-window-system choice with
+          # stand-in drivers that start or fail to: which driver comes
+          # out, which were tried and in what order, that the joypad
+          # driver's name is passed through, and that the two results
+          # are both set or both NULL. The Windows choice is the same
+          # test built with mingw and run under Wine, in the gfx
+          # samples workflow; it also has the case of a driver left
+          # running across a video driver restart, which is handed
+          # back with none started.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./window_driver_test
+          # the same built with SDL 1.2 in SDL 3's place, for the SDL
+          # 1.2 window's choice: a build has one or the other
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./window_driver_test_sdl1
+          make clean
+          echo "[pass] window_driver_test (ASan)"
+
+      - name: Build and run bind_trigger_axis_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/bind_trigger_axis
+        run: |
+          set -eu
+          # Binding L2 or R2 by pressing it: a trigger that is a button
+          # and an axis at once is bound to its axis, which is analog.
+          # Which axis that is, is told from where each axis rests and
+          # whether it has left it (menu/menu_bind_trigger.h): the
+          # trigger's own, not a stick held over, not noise, not the
+          # other trigger.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./bind_trigger_axis_test
+          make clean
+          echo "[pass] bind_trigger_axis_test (ASan)"
+
+      - name: Build and run hotkey_menu_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -C samples/input/hotkey_menu clean check SANITIZER=address,undefined
+          make -C samples/input/hotkey_menu clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/input/hotkey_menu clean
+
+      - name: Build and run pointer_second_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # A core's pointer read where the input driver has a second
+          # list (Android's second display): its fingers go after the
+          # overlay's, after none while the overlay blocks the pointer,
+          # else after the driver's main list; a driver with no second
+          # list answers with its main list alone. The test runs
+          # input_state_device() extracted from input_driver.c.
+          make -C samples/input/pointer_second clean check SANITIZER=address,undefined
+          make -C samples/input/pointer_second clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/input/pointer_second clean
+
+      - name: Build and run android_focus_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # RetroArch's focus on Android from its two windows, the
+          # Activity's and the second display's, through the sequences
+          # the AYN Thor's focus modes and a one-focus system produce.
+          make -C samples/input/android_focus clean check SANITIZER=address,undefined
+          make -C samples/input/android_focus clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/input/android_focus clean
+
+      - name: Build and run android_second_surface_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The second display's surface going: surfaceDestroyed never
+          # waits for the renderer, and the next poll lets it go.
+          make -C samples/frontend/android_second_surface clean check SANITIZER=address,undefined
+          make -C samples/frontend/android_second_surface clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/frontend/android_second_surface clean
+
+      - name: Build and run key_lane_test (plain, ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/input/key_lane
+        run: |
+          set -eu
+          # Keyboard events reported off the frontend's thread wait in
+          # a lock-free queue for the poll (input/input_key_lane.h).
+          # The test includes that header and drives it: a writer
+          # stopped right after claiming a slot with the queue full
+          # behind it and a release that did not fit (the key must not
+          # be left held); a kept release never undoing a newer press;
+          # the counters across their wrap (UBSan); four writers at
+          # once, every event exactly once and in order (TSan).
+          make clean && make -j$(nproc) all
+          timeout 60 ./key_lane_test
+          make clean SANITIZER=undefined,address && make -j$(nproc) all SANITIZER=undefined,address
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./key_lane_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./key_lane_test
+          make clean
+          echo "[pass] key_lane_test"
+
+      - name: Build and run keymaps_lut_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/keymaps_lut
+        run: |
+          set -eu
+          # The keysym reverse table input/input_keymaps.c builds, with
+          # memory and with its allocation failed: every mapped code
+          # translates the same either way, through the forward table
+          # when there is no reverse one.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./keymaps_lut_test
+          make clean
+          echo "[pass] keymaps_lut_test"
+
+      - name: Build and run pointer_frame_test (plain, ASan, UBSan)
+        shell: bash
+        working-directory: samples/input/pointer_frame
+        run: |
+          set -eu
+          # What the frontend keeps of the mice and touches an input
+          # driver publishes at its poll (input/input_pointer_frame.h),
+          # and its answers for the mouse, the pointer and the
+          # lightgun's aim. The test includes that header with a
+          # viewport and a translation that count how often they are
+          # asked: one fetch a poll and one translation a device,
+          # however many values are read; a wheel notch the same for
+          # every reader of the frame; real touches and the mouse
+          # standing for them.
+          make clean && make -j$(nproc) all
+          timeout 60 ./pointer_frame_test
+          make clean SANITIZER=address && make -j$(nproc) all SANITIZER=address
+          timeout 60 ./pointer_frame_test
+          make clean SANITIZER=undefined && make -j$(nproc) all SANITIZER=undefined
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./pointer_frame_test
+          make clean
+          echo "[pass] pointer_frame_test"
+
+      - name: Build and run device_registry_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/device_registry
+        run: |
+          set -eu
+          # Which controllers there are, and which of them has been
+          # here before. A joypad driver knows a controller by its
+          # slot; the registry gives each one a device id that it keeps
+          # when it leaves and returns, and a handle that is good for
+          # one stay. Pins that a returning controller has its id and
+          # a new handle, that a handle stops resolving when the
+          # controller leaves, is reported again or loses its slot,
+          # that identical pads are told apart by where they are
+          # plugged in, then by slot, then by who left last, that a
+          # driver starting over costs nobody their id, that a full
+          # table gives up only a controller that has left, and -
+          # through 200000 arrivals and departures - that no two
+          # present controllers share a slot or an id. And that a
+          # driver which starts over and reports the controllers it
+          # had, in any order and any slots, has each put back on its
+          # port - but only then: one missing, a new one, or one
+          # leaving again, and nothing is moved. A handle that
+          # outlives its stay, the way a kept slot number does, is put
+          # back and asserted to be caught.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 120 ./device_registry_test
+          make clean
+          echo "[pass] device_registry_test (ASan)"
+
+      - name: Build and run input_group_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/input_group
+        run: |
+          set -eu
+          # Device groups: a controller that reaches the OS as several
+          # input devices, read as one pad. Pins that the Android
+          # driver's rule table takes the devices its old chain of
+          # special cases took, in the same order; that either join
+          # order gives one pad; that a member leaving keeps it and the
+          # lead leaving hands the slot on; that two groups stand at
+          # once; and that a button that only joins is nothing alone.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./input_group_test
+          make clean
+          echo "[pass] input_group_test (ASan)"
+
+      - name: Build and run linux_pad_members_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/linux_pad_members
+        run: |
+          set -eu
+          # A pad's other nodes under its HID device - motion sensors,
+          # touchpad, hidraw - and the role the udev driver gives each:
+          # tagged nodes first, untagged ones tried for the sensors in
+          # order (a Wii Remote's), the touchpad never as the sensors,
+          # the pad's own node never, the hidraw node only for a pad
+          # that reads its reports.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./linux_pad_members_test
+          make clean
+          echo "[pass] linux_pad_members_test (ASan)"
+
+      - name: Build and run ignore_devices_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/ignore_devices
+        run: |
+          set -eu
+          # SDL_GAMECONTROLLER_IGNORE_DEVICES as the joypad drivers read
+          # it: the controllers Steam Input stands in for, left to it so
+          # that a pad is not read twice. The list as Steam writes it,
+          # and as SDL reads it - spaces, case, no 0x, a malformed entry
+          # passed over.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./ignore_devices_test
+          make clean
+          echo "[pass] ignore_devices_test (ASan)"
+
+      - name: Build and run overlay_contact_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/overlay_contact
+        run: |
+          set -eu
+          # A finger's contact on an overlay D-pad or face-button area:
+          # each tip of the ellipse the touchscreen reports presses the
+          # way it lies, sized per axis, with a dead zone at the middle;
+          # with no size, the way the centre lies.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 60 ./overlay_contact_test
+          make clean
+          echo "[pass] overlay_contact_test (ASan)"
+
+      - name: Build and run win_pad_ident_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/win_pad_ident
+        run: |
+          set -eu
+          # Which of Windows' views reads a controller, held to a table
+          # of real ones - Xbox pads on USB, Bluetooth and Bluetooth LE,
+          # paths in either case, DualShock 4 and DualSense on cable and
+          # Bluetooth at once, WinUSB pads, Steam Input's - under every
+          # Windows joypad driver: one port each.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./win_pad_ident_test
+          make clean
+          echo "[pass] win_pad_ident_test (ASan)"
+
+      - name: Build and run device_pool_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/device_pool
+        run: |
+          set -eu
+          # The device numbers shared between the joypad driver and the
+          # sources beside it: the driver's pads keep their slots'
+          # numbers, pads beside it are given free ones from the top
+          # down and their own again when they come back, and a driver
+          # pad arriving on a number one of them holds moves that pad.
+          # Thousands of mixed arrivals and departures never give a
+          # number twice.
+          make clean all SANITIZER=address,undefined
+          timeout 120 ./device_pool_test
+          make clean
+          echo "[pass] device_pool_test (ASan)"
+
+      - name: Build and run android_stylus_map_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/android_stylus_map
+        run: |
+          set -eu
+          # An Android pen, through the mapping that turns its events
+          # into pointer and mouse state. Pins that a pen is one touch:
+          # the tip pressing is pointer 0 pressed and the barrel button
+          # is the right mouse button, where the first version raised
+          # the pointer count to 2 and 3 and read as a two- and
+          # three-finger touch (turbo and reload to the driver's own
+          # lightgun mapping). Also that a hover does not release a
+          # finger, that the barrel button is let go with the pen, and
+          # that the two click settings decide what a press is. The old
+          # pointer counts are put back and asserted to be caught.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_stylus_map_test
+          make clean
+          echo "[pass] android_stylus_map_test (ASan)"
+
+      - name: Build and run linux_not_joystick_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/linux_not_joystick
+        run: |
+          set -eu
+          # Devices Linux tags as joysticks that are not controllers.
+          # Pins issue #19674: a Microsoft 2.4GHz Transceiver, the
+          # receiver of a wireless keyboard and mouse, took port 1
+          # through its "System Control" node and left the real
+          # controller on port 2. Checks that receiver, the same node
+          # on unknown devices and the listed ids are dropped, and that
+          # real controllers - a pad named "Wireless", a pedal set with
+          # no buttons - are kept.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./linux_not_joystick_test
+          make clean
+          echo "[pass] linux_not_joystick_test (ASan)"
+
+      - name: Build and run overlay_textures_test (plain, ASan + UBSan, threaded)
+        shell: bash
+        working-directory: samples/input/overlay_textures
+        run: |
+          set -eu
+          # input/input_overlay_textures.c as it is, against a stub
+          # driver that reads every pixel it is handed. Pins every
+          # route a page takes to the driver: as textures (each page
+          # gets its own images' textures, a switch uploads nothing,
+          # the pixels go once the driver has them and the sizes
+          # stay), and as pixels through load() for a driver that
+          # declines the textures, has no such path, or fails an
+          # upload - live pixels on every page. 86fbf34e01 freed the
+          # pixels before the page lists were matched by them, so
+          # with threaded video off the fallback showed freed memory;
+          # under ASan that is a use-after-free here.
+          make clean && make -j$(nproc) all
+          timeout 60 ./overlay_textures_test
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./overlay_textures_test
+          # THREADS=1: the threaded wrapper as a stub whose video
+          # thread runs when the test says so, so both outcomes of
+          # the race between the uploads and the poll are lanes. The
+          # quick thread is 86fbf34e01's bug again under threaded
+          # video; the slow one must find the pack's pixels alive.
+          make clean THREADS=1 SANITIZER=address,undefined && make -j$(nproc) all THREADS=1 SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./overlay_textures_test
+          make clean
+          echo "[pass] overlay_textures_test (plain, ASan, threaded ASan)"
+
+      - name: Check WinRaw mouse button publication
+        working-directory: samples/input/winraw_mouse_buttons
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./winraw_mouse_buttons_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 ./winraw_mouse_buttons_test
+          make clean CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -lpthread" && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -lpthread"
+          WINEDEBUG=-all wine ./winraw_mouse_buttons_test.exe
+          make clean
+
+      - name: Check converted pad handlers against the copying ones
+        working-directory: samples/input/connect_parity
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./connect_parity_test
+          make clean CC=x86_64-w64-mingw32-gcc LDFLAGS=-static && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          WINEDEBUG=-all wine ./connect_parity_test.exe
+          make clean
+
+      - name: Check the sensor snapshot hand-over
+        working-directory: samples/input/sensor_snap
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./sensor_snap_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 ./sensor_snap_test
+          make clean CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -lpthread" && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -lpthread"
+          WINEDEBUG=-all wine ./sensor_snap_test.exe
+          make clean
+
+      - name: Check WinRaw mouse position-source draining
+        working-directory: samples/input/winraw_mouse_pending
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean all check
+          make clean
+          make SANITIZER=address,undefined check
+          make clean
+          make SANITIZER=thread check
+          make clean
+          make CC=x86_64-w64-mingw32-gcc all
+          WINEDEBUG=-all timeout 60 wine ./winraw_mouse_pending_test.exe
+          make clean
+
+      - name: Build and run winraw_abs_pos_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_abs_pos
+        run: |
+          set -eu
+          # input/drivers/winraw_input.c, cross-built with mingw-w64 and
+          # run under Wine: an absolute pointer report's position is
+          # kept as one word, and every read must give back a position
+          # a report carried, including a report that lands during poll.
+          # mingw-w64 and Wine come from "Install dependencies", whose
+          # download is bounded and retried; an unbounded install here
+          # stalled silently until the job timeout. Stop wineserver on
+          # exit so it cannot hold the step's output open.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_abs_pos_test (wine)"
+
+      - name: Build and run winraw_poll_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_poll
+        run: |
+          set -eu
+          # input/drivers/winraw_input.c with its keyboard and mouse
+          # read in bulk by the poll. The real driver under Wine on a
+          # virtual display, with the focused window made and pumped by
+          # a second thread as the video thread does, and the driver
+          # started from that thread: init makes no window and the first poll does, on the polling
+          # thread; six keys injected with SendInput() while nothing
+          # pumps are read by one bulk read, none as a message, none
+          # left in the queue, and come out of the poll as six key
+          # events in order with the modifier held at the time; six
+          # reports the pump meets first are one from its message and
+          # five in one bulk read, in order; with nothing waiting a
+          # poll makes one read and a pump none; a pump that asks for
+          # the messages below WM_INPUT and above it, as the
+          # frontend's does on that thread, dispatches the ordinary
+          # ones and leaves the reports for one bulk read; free takes
+          # the window down, twenty restarts each do the same; and
+          # with the window, the pump and the poll all on one thread,
+          # as without threaded video, the reports are read in bulk
+          # the same.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_poll_test (wine)"
+
+      - name: Build and run winraw_mouse_hotplug_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_mouse_hotplug
+        run: |
+          set -eu
+          # The raw input driver picked up a mouse plugged in while
+          # running, and a change of the Windows-key setting, only by
+          # being started again. Read by the poll it does both when
+          # they come up. The real driver under Wine, with the list of
+          # raw input devices it asks for replaced by one the test
+          # controls: a report from a mouse not in the list has the
+          # list made again at the end of that poll, the new mouse's
+          # next report moves it, and the mice already there keep
+          # their position, buttons and device type; a handle that is
+          # no listed mouse is asked about once, a report with no
+          # handle never; not more than one refresh a second; and the
+          # Windows-key setting is registered by the poll after it
+          # changes.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_mouse_hotplug_test (wine)"
+
+      - name: Build and run sony_pad_output_test
+        shell: bash
+        working-directory: samples/input/sony_pad_output
+        run: |
+          set -eu
+          # The rumble reports of the DualShock 4 and the DualSense
+          # (input/common/sony_pad_output.h, which the raw input joypad
+          # driver writes to those pads): each has the id, length and
+          # layout its pad expects, sets no flag but the rumble ones,
+          # and over Bluetooth ends in the CRC the pad checks.
+          make clean && make -j$(nproc) all
+          timeout 60 make check
+          make clean
+          echo "[pass] sony_pad_output_test"
+
+      - name: Build and run hid_report_desc_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/hid_report_desc
+        run: |
+          set -eu
+          # A gamepad's reports read from its HID report descriptor
+          # (input/common/hid_report_desc.h, which hidraw reads pads
+          # with no handler through): axes numbered as on the Mac, a
+          # hat, buttons by usage, reports with IDs, and nothing read
+          # past a cut descriptor or a short report.
+          make clean && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 60 make check
+          make clean
+          echo "[pass] hid_report_desc_test"
+
+      - name: Build and run winraw_joypad_rumble_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_joypad_rumble
+        run: |
+          set -eu
+          # The raw input joypad driver had no rumble. For a DualShock
+          # 4 or a DualSense it opens the controller for writing and
+          # writes the rumble report from a thread of its own. The
+          # real driver under Wine, with files standing in for the
+          # controllers: the two Sony pads are opened and another
+          # make is not; set_rumble() writes nothing itself and the
+          # thread writes the pad's own report, at the length Windows
+          # wants; a run of changes ends with the last written; an
+          # unplugged pad is stilled and closed by the thread without
+          # the driver waiting, fifty quick plug-ins leave no device
+          # open, and stopping the driver stills the rest. Nothing is
+          # under a lock: strengths and devices pass through
+          # retro_atomic. An Xbox pad is rumbled through XInput, which
+          # is faked here: one such pad and one pad of XInput's are
+          # the same pad; of two, none is rumbled while nothing tells
+          # them apart, one is as soon as a button is held on it, and
+          # the other is then the one left. With "XInput for Xbox
+          # Controllers" on, XInput's pad is listed and read in the
+          # XInput driver's layout, triggers on separate axes.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_joypad_rumble_test (wine)"
+
+      - name: Build and run winraw_joypad_sixaxis_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_joypad_sixaxis
+        run: |
+          set -eu
+          # A DualShock 3 on Sony's sixaxis.sys, or DsHidMini standing
+          # in for it, sends no input reports: the raw input joypad
+          # driver's thread asks for its feature report every few ms
+          # and the poll takes the newest, laid out as the pad's own
+          # HID description. Its motors and light go as that driver's
+          # commands. One on Windows' own HID driver is asked once and
+          # left alone; one whose reports come is no longer asked.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_joypad_sixaxis_test (wine)"
+
+      - name: Build and run sony_pad_motion_test
+        shell: bash
+        working-directory: samples/input/sony_pad_motion
+        run: |
+          set -eu
+          # The motion sensors of a DualShock 4 or a DualSense, read
+          # out of the pad's input report where its HID description
+          # says nothing (input/common/sony_pad_motion.h): the six
+          # values come from where each pad's report has them; a short
+          # Bluetooth report and another report id are refused; flat
+          # and still is one g on libretro's Z, and a turn is radians
+          # a second on the axes the SDL driver gives.
+          make clean && make -j$(nproc) all
+          timeout 60 make check
+          make clean
+          echo "[pass] sony_pad_motion_test"
+
+      - name: Build and run winraw_joypad_motion_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_joypad_motion
+        run: |
+          set -eu
+          # The raw input joypad driver gives a core those sensors.
+          # The real driver under Wine, with reports handed to its
+          # parser: a request is taken for a Sony pad and refused for
+          # another make and for an empty port; nothing is given
+          # before a report has had the sensors, and only the sensor
+          # asked for; a pad nothing was asked of has none read; a pad
+          # unplugged and plugged in again goes on giving what was
+          # asked.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_joypad_motion_test (wine)"
+
+      - name: Build and run net_retropad_repeat_test (Linux and Windows)
+        shell: bash
+        working-directory: samples/input/net_retropad_repeat
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The Remote RetroPad core sends a control's state when it
+          # changes, by UDP. The real core is driven by a frontend of
+          # a few callbacks and its messages read back over loopback:
+          # a change is sent again 5, 15 and 30 frames on, and then no
+          # more; nothing is sent while nothing changes.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 120 ./net_retropad_repeat_test
+          make clean
+          make CC=x86_64-w64-mingw32-gcc
+          WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
+          WINEDEBUG=-all timeout 180 "$WINE" ./net_retropad_repeat_test.exe
+          make clean
+          echo "[pass] net_retropad_repeat_test (ASan, and mingw-w64 under Wine)"
+
+      - name: Build and run output_writer_test (host sanitizers and mingw + Wine)
+        shell: bash
+        working-directory: samples/input/output_writer
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 30 make check
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          timeout 30 ./output_writer_test
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc
+          WINE="$(command -v wine || command -v wine64 || echo /usr/lib/wine/wine64)"
+          WINEDEBUG=-all timeout 60 "$WINE" ./output_writer_test.exe
+          WINEDEBUG=-all timeout 60 "$WINE" ./output_writer_test_nothreads.exe
+          make clean
+      - name: Build and run udev_rumble_test (ASan + UBSan, then TSan)
+        shell: bash
+        working-directory: samples/input/udev_rumble
+        run: |
+          set -eu
+          # The udev joypad driver writes rumble from a thread of its
+          # own. The real driver is given a pad whose descriptor is a
+          # pipe and an upload that takes 60 ms: the call returns at
+          # once, the latest strength is the one written, a pad that
+          # goes is let go of, and stopping the driver ends the
+          # writer. Built with threads and without.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 120 ./udev_rumble_test
+          timeout 120 ./udev_rumble_test_nothreads
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          timeout 120 ./udev_rumble_test
+          make clean
+          echo "[pass] udev_rumble_test"
+      - name: Build and run dingux_rumble_test (ASan + UBSan, then TSan)
+        shell: bash
+        working-directory: samples/input/dingux_rumble
+        run: |
+          set -eu
+          # The Dingux joypad driver's vibration motor, through evdev
+          # and the output writer: the first node that plays a sine is
+          # taken, the strengths and gain are written as they change and
+          # not again, a motor slow to take an upload does not hold the
+          # call, and stopping the driver lets the motor go.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 120 ./dingux_rumble_test
+          timeout 120 ./dingux_rumble_test_nothreads
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          timeout 120 ./dingux_rumble_test
+          make clean
+          echo "[pass] dingux_rumble_test"
+      - name: Build and run udev_player_lights_test (ASan + UBSan, then TSan)
+        shell: bash
+        working-directory: samples/input/udev_player_lights
+        run: |
+          set -eu
+          # The udev joypad driver lights each pad's player through its
+          # LED class devices, found under the pad in a directory laid
+          # out as /sys is: a DualSense's five and not its light bar, a
+          # DualShock 4's light bar by colour, a DualShock 3's, an Xbox
+          # 360 pad's ring and not a receiver's four; out when no port
+          # reads it, unless it was never lit. Written by the rumble
+          # writer's thread, and without threads by the caller.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 timeout 60 ./udev_player_lights_test
+          ASAN_OPTIONS=detect_leaks=1 timeout 60 ./udev_player_lights_test_nothreads
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          timeout 60 ./udev_player_lights_test
+          make clean
+          echo "[pass] udev_player_lights_test"
+      - name: Build and run udev_ds3_pressure_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/udev_ds3_pressure
+        run: |
+          set -eu
+          # A DualShock 3's button pressures, read by the udev joypad
+          # driver from the pad's hidraw node into the axes after its
+          # own: the newest input report waiting sets them, reports of
+          # other IDs are read over, and a node that goes is closed
+          # with the pressures back at rest.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 timeout 60 ./udev_ds3_pressure_test
+          make clean
+
+      - name: Build and run udev_devices_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/udev_devices
+        run: |
+          set -eu
+          # The udev input driver's listing of keyboards and mice, its
+          # numbering of them and what a port reads went in compiled
+          # only: it needs devices under /dev/input, which a runner
+          # has none of. What the driver knows of a device is a
+          # structure in memory, so the real driver is handed a desk
+          # of them: a keyboard that is three event devices, a mouse
+          # that is two, a power button and a second keyboard. Two
+          # keyboards are listed; the mouse is mouse 1 and the
+          # keyboard's pointer part is not a mouse; each is told to
+          # the frontend by its ids; a port reads its own keyboard's
+          # keys and not the other's, and the mouse it is told to.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./udev_devices_test
+          make clean
+          echo "[pass] udev_devices_test (ASan)"
+
+      - name: Build and run device_pins_test
+        shell: bash
+        working-directory: samples/input/device_pins
+        run: |
+          set -eu
+          # A port keeps its keyboard by what the keyboard is, not by
+          # its place in a list that changes when keyboards are
+          # plugged in or out (input/common/input_device_pins.h): two
+          # pinned ports each read their own in whatever order the
+          # keyboards are listed; with one unplugged the other is
+          # still its own port's and the port left without reads none;
+          # a single port whose keyboard is away reads every keyboard;
+          # two keyboards of one model are two pins. And the same for
+          # mice, which have no "every mouse": a pinned port whose
+          # mouse is away reads none while another port has its own,
+          # and the mouse its number names otherwise.
+          make clean && make -j$(nproc) all
+          timeout 60 make check
+          make clean
+          echo "[pass] device_pins_test"
+
+      - name: Build and run keyboard_devices_test
+        shell: bash
+        working-directory: samples/input/keyboard_devices
+        run: |
+          set -eu
+          # Which of the devices a system reports are the keyboards on
+          # the desk (input/common/input_keyboard_devices.h, which the
+          # udev input driver lists its keyboards by): a keyboard in
+          # three parts is one keyboard; the power button, a headset
+          # and a mouse whose buttons send keys are none; two of one
+          # model are two; a keyboard with a pointer built in is one.
+          make clean && make -j$(nproc) all
+          timeout 60 make check
+          make clean
+          echo "[pass] keyboard_devices_test"
+
+      - name: Build and run xinput_rumble_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/xinput_rumble
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The XInput joypad driver writes rumble from a thread of its
+          # own. The real driver is given an XInputSetState that takes
+          # 60 ms: the call returns at once, the latest strength is the
+          # one written, and with the writer stopped the caller writes
+          # as it used to.
+          make clean && make -j$(nproc) all
+          WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
+          WINEDEBUG=-all timeout 180 "$WINE" ./xinput_rumble_test.exe
+          make clean
+          echo "[pass] xinput_rumble_test (wine)"
+
+      - name: Build and run winraw_keyboards_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_keyboards
+        run: |
+          set -eu
+          # The raw input driver reads every keyboard as one; it also
+          # keeps the list of them and names them for the menu's
+          # Input Information. The real driver under Wine, with the
+          # list of raw input devices it asks for replaced by one the
+          # test controls: the keyboards and only those are listed,
+          # oldest first; a key from one not in the list has the list
+          # made again at the end of that poll, an injected key never,
+          # not more than once a second; a keyboard that was unplugged
+          # is out of the list at the poll after Windows says devices
+          # changed; and all of them still feed the one key state.
+          # And a port can be given one of them (Keyboard Index): two
+          # ports with a keyboard each read the same bound key each
+          # from its own, as a bind, in the bind mask and as the
+          # port's keyboard; hotkeys and the open menu answer to every
+          # keyboard; a port given a keyboard that is not there reads
+          # them all; a key held on two keyboards stays down until
+          # both let go; and a key held on a keyboard when it is
+          # unplugged is let go with a key-up. And what is listed is
+          # the keyboards on the desk, not raw input's: the raw
+          # keyboards that are parts of one device are one keyboard,
+          # the terminal server's is left out, and so is a mouse
+          # whose buttons send keys.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_keyboards_test (wine)"
+
+      - name: Build and run winraw_joypad_poll_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_joypad_poll
+        run: |
+          set -eu
+          # input/drivers_joypad/winraw_joypad.c with its controllers
+          # read by the poll. The real driver under Wine, started from
+          # a second thread as it is from the video thread: init makes
+          # no window and the first poll
+          # does, on the polling thread, marking it as one whose pump
+          # leaves raw input alone, with one bulk read a poll; a device
+          # change waiting for the window is taken by the poll;
+          # destroy from another thread - what a controller plugged in
+          # causes - has the window gone once its own thread pumps; a
+          # restart and a poll make a new one.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_joypad_poll_test (wine)"
+
+      - name: Build and run winraw_joypad_newest_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_joypad_newest
+        run: |
+          set -eu
+          # winraw_joypad parses only the newest report of each report
+          # ID per controller out of a bulk read, not every report. The
+          # driver, with its HID calls routed to a fake controller that
+          # splits its state across report IDs: twenty thousand random
+          # bursts of reports - any IDs and values, several reports in
+          # a record, reports too big to hold, more IDs than are held -
+          # go to one controller through the holding path and to a
+          # second one report at a time, and after every burst the two
+          # must read the same buttons, axes and hats.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_joypad_newest_test (wine)"
+
+      - name: Build and run winraw_joypad_same_model_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_joypad_same_model
+        run: |
+          set -eu
+          # winraw_joypad took a second controller of the same model
+          # for the first one reconnecting, and evicted the first. The
+          # driver with its HID calls routed to fake controllers that
+          # share one vendor and product ID: three plugged in at once
+          # are three slots; one reconnecting, on its port or another,
+          # with its new handle announced before the old one is
+          # removed, gets its own slot back and leaves the others
+          # alone; a reconnect whose old handle still answers is known
+          # by its device path; with no path, a live handle is another
+          # controller and a dead one is this one back.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_joypad_same_model_test (wine)"
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

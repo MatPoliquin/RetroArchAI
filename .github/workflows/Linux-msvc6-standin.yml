@@ -1,0 +1,147 @@
+name: CI Visual C++ 6 project (stand-in compiler)
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  msvc6-standin:
+    name: The Visual C++ 6 project's sources, defines and libraries, on mingw held to old C
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: --no-install-recommends gcc-mingw-w64-i686 g++-mingw-w64-i686 gcc-mingw-w64-x86-64 wine64 pulseaudio xvfb
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Check the VC8 dialog optimizer workaround
+        run: python3 tools/msvc2005_dialog_check.py
+
+      - name: Compile and link what pkg/msvc/msvc-6 builds
+        shell: bash
+        run: |
+          set -eu
+          # Visual C++ 6 cannot be fetched here, so nothing built its
+          # project. This reads the project file - sources, defines,
+          # libraries - and builds the same with a 32-bit mingw
+          # compiler under old-C rules, at Windows NT 4.0's API, and
+          # links it. See the script for what that does and does not
+          # catch.
+          tools/msvc6_standin_check.sh
+
+      - name: The DXGI bridge as Visual C++ 2005 and 2010 build it
+        shell: bash
+        run: |
+          set -eu
+          # Their SDKs have no dxgi1_5.h or d3d12.h; the griffin builds
+          # for them still compile and link the bridge.
+          tools/dxgi_bridge_old_sdk_check.sh
+
+      - name: Run the waveout audio driver on a wave output device (Wine)
+        working-directory: samples/audio/waveout
+        shell: bash
+        run: |
+          set -eu
+          # The audio driver the Visual C++ 6 project uses: the
+          # multimedia library's wave output, which is all a Windows
+          # with no DirectX has. Run for real against a device - a
+          # silent one, from a sound server started here - and held to
+          # what the audio interface says of a driver. With no device
+          # the test only skips, which checks nothing: that is a
+          # failure here.
+          trap 'wineserver -k >/dev/null 2>&1 || true; pulseaudio --kill >/dev/null 2>&1 || true' EXIT
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=ci >/dev/null
+          pactl set-default-sink ci
+          WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check WINE="$WINE" | tee waveout.log
+          grep -q "PASS waveout_test" waveout.log
+          make clean
+          rm -f waveout.log
+
+      - name: Run the plain Win32 input driver against a window (Wine)
+        working-directory: samples/input/win32_input
+        shell: bash
+        run: |
+          set -eu
+          # The input driver the Visual C++ 6 project uses: keys from
+          # the window's messages, the mouse from where the cursor is.
+          # Run against a real window: its key map, keys down and up,
+          # nothing down with another window in front, the mouse's
+          # place and motion. A part it had to skip - no window, or one
+          # that would not come to the front - checks nothing, and is a
+          # failure here.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check WINE="$WINE" | tee win32_input.log
+          grep -q "PASS win32_input_test" win32_input.log
+          if grep -q "^\[skip\]" win32_input.log; then
+            echo "a part of the test was skipped"
+            exit 1
+          fi
+          make clean
+          rm -f win32_input.log
+
+      - name: Run the winmm joypad driver against stand-in joystick calls (Wine)
+        working-directory: samples/input/winmm_joypad
+        shell: bash
+        run: |
+          set -eu
+          # The joypad driver the Visual C++ 6 project uses: the
+          # multimedia library's joystick calls. No controller can be
+          # scripted here, so the calls and the clock are the test's:
+          # axes across the controller's own ranges, thirty-two
+          # buttons, the hat's eight ways, the RetroPad mask, a
+          # controller pulled out and plugged in, and the controllers
+          # that are not there not asked at every poll.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check WINE="$WINE" | tee winmm_joypad.log
+          grep -q "PASS winmm_joypad_test" winmm_joypad.log
+          make clean
+          rm -f winmm_joypad.log

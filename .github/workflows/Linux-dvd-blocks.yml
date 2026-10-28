@@ -1,0 +1,88 @@
+name: CI optical DVD blocks
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'tasks/task_content_disc.c'
+      - 'libretro-common/cdrom/**'
+      - 'libretro-common/vfs/**'
+      - 'libretro-common/include/cdrom/**'
+      - 'libretro-common/include/vfs/**'
+      - 'libretro-common/samples/file/vfs_cdrom/**'
+      - '.github/workflows/Linux-dvd-blocks.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'tasks/task_content_disc.c'
+      - 'libretro-common/cdrom/**'
+      - 'libretro-common/vfs/**'
+      - 'libretro-common/include/cdrom/**'
+      - 'libretro-common/include/vfs/**'
+      - 'libretro-common/samples/file/vfs_cdrom/**'
+      - '.github/workflows/Linux-dvd-blocks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  blocks:
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential gcc-mingw-w64-x86-64 wine64
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Linux commands and VFS
+        working-directory: libretro-common/samples/file/vfs_cdrom
+        run: |
+          set -eu
+          make -j2 dvd_blocks_test SANITIZER=address,undefined SAMPLE_OBJDIR=obj-dvd-asan
+          ./dvd_blocks_test
+          make -j2 disc_dump_test SANITIZER=address,undefined SAMPLE_OBJDIR=obj-dvd-asan
+          ./disc_dump_test
+          make -j2 vfs_close_test SANITIZER=address,undefined SAMPLE_OBJDIR=obj-dvd-asan
+          ./vfs_close_test
+          make -j2 macos_command_test SANITIZER=address,undefined SAMPLE_OBJDIR=obj-dvd-asan
+          ./macos_command_test
+          make -j2 SANITIZER=address,undefined SAMPLE_OBJDIR=obj-dvd-asan
+          ./cdrom_cuesheet_overflow_test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      - name: Windows commands and VFS
+        working-directory: libretro-common/samples/file/vfs_cdrom
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -j2 dvd_blocks_test.exe CC=x86_64-w64-mingw32-gcc OS=Windows_NT EXE=.exe SAMPLE_OBJDIR=obj-dvd-win
+          WINEDEBUG=-all wine ./dvd_blocks_test.exe
+          make -j2 disc_dump_test.exe CC=x86_64-w64-mingw32-gcc OS=Windows_NT EXE=.exe SAMPLE_OBJDIR=obj-dvd-win
+          WINEDEBUG=-all wine ./disc_dump_test.exe
+          make -j2 vfs_close_test.exe CC=x86_64-w64-mingw32-gcc OS=Windows_NT EXE=.exe SAMPLE_OBJDIR=obj-dvd-win
+          WINEDEBUG=-all wine ./vfs_close_test.exe
+          make -j2 macos_command_test.exe CC=x86_64-w64-mingw32-gcc OS=Windows_NT EXE=.exe SAMPLE_OBJDIR=obj-dvd-win
+          WINEDEBUG=-all wine ./macos_command_test.exe

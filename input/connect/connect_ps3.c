@@ -22,6 +22,7 @@
 #include "joypad_connection.h"
 #include "../input_defines.h"
 #include "../../verbosity.h"
+#include "../common/pad_motion.h"
 
 #define DS3_ACTIVATION_REPORT_ID 0xf4
 
@@ -33,11 +34,16 @@ typedef struct ds3_instance
    hid_driver_t *driver;
    void *handle;
    int slot;
+   int player;     /* told: from 1, -1 for none; 0 not yet */
    bool led_set;
-   uint32_t buttons;
-   int16_t analog_state[3][2];
-   uint16_t motors[2];
-   uint8_t data[64];
+   bool motors_due;
+   bool shanwan;        /* ShanWan's: no output report at init */
+   uint8_t motion_want; /* pad_motion.h's bits: the accelerometer alone */
+   uint16_t accel[3];   /* as the report has them, 511 at rest */
+   /* the RetroPad's buttons and PS as 16; the sticks as 0 to 3, the
+    * pressures 4 to 15 */
+   input_pad_view_t view;
+   uint8_t motors[2]; /* strong, weak: what the core asked last */
 } ds3_instance_t;
 
 struct __attribute__((__packed__)) sixaxis_led
@@ -92,54 +98,46 @@ static int ds3_set_operational(ds3_instance_t *instance)
    static const union sixaxis_activation_report_f4 ds3_activation_packet = {
       { 0xf4, 0x42, 0x0c, 0x00, 0x00 }
    };
-   int ret;
+   int ret_f2, ret_f4;
    uint8_t usb_packet[64] = { 0x00 };
 
    if (     !instance->driver->set_report
          || !instance->driver->get_report)
    {
-      RARCH_ERR("This HID implementation does not support the Sony Sixaxis controller:\n");
+      RARCH_ERR("[Sixaxis] This HID implementation does not support the Sony Sixaxis controller:\n");
       if (!instance->driver->set_report)
-         RARCH_ERR("- set_report implementation is missing\n");
+         RARCH_ERR("[Sixaxis] set_report implementation is missing.\n");
       if (!instance->driver->get_report)
-         RARCH_ERR("- get_report implementation is missing\n");
+         RARCH_ERR("[Sixaxis] get_report implementation is missing.\n");
       return -1;
    }
 
-   ret = instance->driver->set_report(instance->handle,
-         HID_REPORT_FEATURE,
-         ds3_activation_packet.data.report_id,
-         (uint8_t*)ds3_activation_packet.buf,
-         sizeof(ds3_activation_packet.buf));
-   if (ret < 0)
-   {
-      RARCH_LOG("Failed to send activation packet\n");
-      return ret;
-   }
-
-   ret = instance->driver->get_report(
+   /* On USB the pad starts when 0xF2 is read; over Bluetooth, when
+    * 0xF4 is set. A pad on USB refuses 0xF4, so either one is enough. */
+   ret_f2 = instance->driver->get_report(
          instance->handle,
          HID_REPORT_FEATURE,
          0xf2,
          (uint8_t*)&usb_packet,
          SIXAXIS_REPORT_0xF2_SIZE);
-   if (ret < 0)
+   ret_f4 = instance->driver->set_report(instance->handle,
+         HID_REPORT_FEATURE,
+         ds3_activation_packet.data.report_id,
+         (uint8_t*)ds3_activation_packet.buf,
+         sizeof(ds3_activation_packet.buf));
+   if (ret_f2 < 0 && ret_f4 < 0)
    {
-      RARCH_LOG("Failed to read feature report 0xf2\n");
-      return ret;
+      RARCH_LOG("[Sixaxis] Neither 0xf2 could be read nor 0xf4 set.\n");
+      return -1;
    }
 
-   ret = instance->driver->get_report(
+   if (instance->driver->get_report(
          instance->handle,
          HID_REPORT_FEATURE,
          0xf5,
          (uint8_t*)&usb_packet,
-         SIXAXIS_REPORT_0xF5_SIZE);
-   if (ret < 0)
-   {
-      RARCH_LOG("Failed to read feature report 0xf5\n");
-      return ret;
-   }
+         SIXAXIS_REPORT_0xF5_SIZE) < 0)
+      RARCH_DBG("[Sixaxis] Feature report 0xf5 could not be read.\n");
 
    return 0;
 }
@@ -197,14 +195,21 @@ static int ds3_send_output_report(ds3_instance_t *instance)
 
    /* Initialize the report with default values */
    memcpy(&report, &default_report, sizeof(struct sixaxis_output_report));
-   report.leds_bitmap = ds3_get_leds(instance->slot + 1);
+   /* the small motor is only on or off */
+   report.rumble.right_motor_on   = instance->motors[1] ? 1 : 0;
+   report.rumble.left_motor_force = instance->motors[0];
+   report.leds_bitmap = instance->player < 0 ? 0
+      : ds3_get_leds(instance->player ? (unsigned)instance->player
+            : (unsigned)instance->slot + 1);
 
    return instance->driver->set_report(instance->handle, HID_REPORT_OUTPUT, report.report_id, packet, sizeof(report));
 }
 
-static void ds3_update_pad_state(ds3_instance_t *instance)
+static void ds3_update_pad_state(ds3_instance_t *instance,
+      const uint8_t *report)
 {
    uint32_t i, pressed_keys;
+   uint32_t buttons = 0;
 
    static const uint32_t button_mapping[17] =
    {
@@ -227,38 +232,80 @@ static void ds3_update_pad_state(ds3_instance_t *instance)
       16 /* PS button */
    };
 
-   instance->buttons     = 0;
-
    pressed_keys          = 
-          instance->data[2]
-      |  (instance->data[3]         << 8)
-      | ((instance->data[4] & 0x01) << 16);
+          report[2]
+      |  (report[3]         << 8)
+      | ((report[4] & 0x01) << 16);
 
    for (i = 0; i < 17; i++)
-      instance->buttons |= (pressed_keys & (1 << i)) ?
+      buttons |= (pressed_keys & (1 << i)) ?
          (1 << button_mapping[i]) : 0;
+   pad_view_set_buttons(&instance->view, buttons, false);
 }
 
-static void ds3_update_analog_state(ds3_instance_t *instance)
+static void ds3_update_analog_state(ds3_instance_t *instance,
+      const uint8_t *report)
 {
    int pad_axis;
 
+   /* The pad's 0 is left and up, as libretro's negative is: no axis is
+    * turned round. */
    for (pad_axis = 0; pad_axis < 4; pad_axis++)
-   {
-      unsigned axis                       = (pad_axis % 2) ? 0 : 1;
-      unsigned stick                      = pad_axis / 2;
-      int16_t interpolated                = instance->data[6 + pad_axis];
-
-      /* libretro requires "up" to be negative, so we invert the y axis */
-      interpolated                        = axis
-         ? ((interpolated - 128) *  256)
-         : ((interpolated - 128) * -256);
-      instance->analog_state[stick][axis] = interpolated;
-   }
+      instance->view.axes[pad_axis] =
+         (int16_t)(report[6 + pad_axis] * 257 - 32768);
 }
 
 
-static void *ds3_init(void *handle, uint32_t slot, hid_driver_t *driver)
+/* A ShanWan PS2-to-PS3 converter's 7-byte report, as SDL reads it:
+ * the right stick, the left, the hat and triangle, circle, cross and
+ * square, then L1, R1, L2, R2, select, start, L3 and R3. Its buttons
+ * have no pressure: a press is all of it. */
+static void ds3_mini_report(ds3_instance_t *instance, const uint8_t *r)
+{
+   static const uint8_t hat[16] = {
+      1, 1 | 8, 8, 8 | 2, 2, 2 | 4, 4, 4 | 1,
+      0, 0, 0, 0, 0, 0, 0, 0 };
+   static const uint32_t face[4] = {
+      RETRO_DEVICE_ID_JOYPAD_X, RETRO_DEVICE_ID_JOYPAD_A,
+      RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_Y };
+   static const uint32_t rest[8] = {
+      RETRO_DEVICE_ID_JOYPAD_L,      RETRO_DEVICE_ID_JOYPAD_R,
+      RETRO_DEVICE_ID_JOYPAD_L2,     RETRO_DEVICE_ID_JOYPAD_R2,
+      RETRO_DEVICE_ID_JOYPAD_SELECT, RETRO_DEVICE_ID_JOYPAD_START,
+      RETRO_DEVICE_ID_JOYPAD_L3,     RETRO_DEVICE_ID_JOYPAD_R3 };
+   /* the pressure axes' buttons, in ds3_pressure_byte's order */
+   static const uint32_t pressed[12] = {
+      RETRO_DEVICE_ID_JOYPAD_L2, RETRO_DEVICE_ID_JOYPAD_R2,
+      RETRO_DEVICE_ID_JOYPAD_B,  RETRO_DEVICE_ID_JOYPAD_A,
+      RETRO_DEVICE_ID_JOYPAD_Y,  RETRO_DEVICE_ID_JOYPAD_X,
+      RETRO_DEVICE_ID_JOYPAD_L,  RETRO_DEVICE_ID_JOYPAD_R,
+      RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_ID_JOYPAD_DOWN,
+      RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_RIGHT };
+   uint32_t b = 0;
+   unsigned i, h = hat[r[4] & 0x0f];
+
+   if (h & 1) b |= 1u << RETRO_DEVICE_ID_JOYPAD_UP;
+   if (h & 2) b |= 1u << RETRO_DEVICE_ID_JOYPAD_DOWN;
+   if (h & 4) b |= 1u << RETRO_DEVICE_ID_JOYPAD_LEFT;
+   if (h & 8) b |= 1u << RETRO_DEVICE_ID_JOYPAD_RIGHT;
+   for (i = 0; i < 4; i++)
+      if (r[4] & (0x10 << i))
+         b |= 1u << face[i];
+   for (i = 0; i < 8; i++)
+      if (r[5] & (1 << i))
+         b |= 1u << rest[i];
+   pad_view_set_buttons(&instance->view, b, false);
+
+   instance->view.axes[0] = (int16_t)(r[2] * 257 - 32768);
+   instance->view.axes[1] = (int16_t)(r[3] * 257 - 32768);
+   instance->view.axes[2] = (int16_t)(r[0] * 257 - 32768);
+   instance->view.axes[3] = (int16_t)(r[1] * 257 - 32768);
+   for (i = 0; i < 12; i++)
+      instance->view.axes[4 + i] = (b & (1u << pressed[i])) ? 0x7fff : 0;
+}
+
+static void *ds3_start(void *handle, uint32_t slot, hid_driver_t *driver,
+      bool shanwan)
 {
    ds3_instance_t *instance = (ds3_instance_t *)
       calloc(1, sizeof(ds3_instance_t));
@@ -268,19 +315,21 @@ static void *ds3_init(void *handle, uint32_t slot, hid_driver_t *driver)
    instance->handle     = handle;
    instance->driver     = driver;
    instance->slot       = slot;
+   instance->shanwan    = shanwan;
 
    if (instance->driver->set_protocol)
       instance->driver->set_protocol(instance->handle, 1);
 
-   if (ds3_send_output_report(instance) < 0)
+   /* not to ShanWan's: as SDL found, it can rumble them non-stop */
+   if (!shanwan && ds3_send_output_report(instance) < 0)
    {
-      RARCH_LOG("Failed to send output report\n");
+      RARCH_LOG("[Sixaxis] Failed to send output report.\n");
       goto error;
    }
 
    if (ds3_set_operational(instance) < 0)
    {
-      RARCH_LOG("Failed to set operational mode\n");
+      RARCH_LOG("[Sixaxis] Failed to set operational mode.\n");
       goto error;
    }
 
@@ -290,11 +339,29 @@ error:
    return NULL;
 }
 
+static void *ds3_init(void *handle, uint32_t slot, hid_driver_t *driver)
+{
+   return ds3_start(handle, slot, driver, false);
+}
+
+static void *ds3_shanwan_init(void *handle, uint32_t slot,
+      hid_driver_t *driver)
+{
+   return ds3_start(handle, slot, driver, true);
+}
+
 static void ds3_deinit(void *device_data)
 {
    if (device_data)
       free(device_data);
 }
+
+/* The input report's bytes with the pressure of L2 and R2, then
+ * cross, circle, square, triangle, L1, R1, up, down, left and right:
+ * axes 4 to 15, as SDL gives them. */
+static const uint8_t ds3_pressure_byte[12] = {
+   18, 19, 24, 23, 25, 22, 20, 21, 14, 16, 17, 15
+};
 
 static void ds3_packet_handler(void *device_data,
       uint8_t *packet, uint16_t size)
@@ -304,61 +371,115 @@ static void ds3_packet_handler(void *device_data,
    if (!device)
       return;
 
-   if (!device->led_set)
+   /* lights and motors go in one report, from here: a core changing
+    * its rumble every frame costs one report a packet at most */
+   if (!device->led_set || device->motors_due)
    {
       ds3_send_output_report(device);
-      device->led_set = true;
+      device->led_set    = true;
+      device->motors_due = false;
    }
 
-   if (size > sizeof(device->data))
+   /* the input report, whole; nothing else is the pad's state. It is
+    * the backend's, read where it lies: what the getters answer from
+    * is taken out of it here, not the report kept. */
+   if (size == 7)
    {
-      RARCH_ERR("[ds3]: Expecting packet to be %ld but was %d\n",
-            (long)sizeof(device->data), size);
+      ds3_mini_report(device, packet);
       return;
    }
+   /* 0xFF where its buttons begin: not a state, as SDL found */
+   if (size < 49 || packet[0] != 0x01 || packet[1] == 0xff)
+      return;
 
-   memcpy(device->data, packet, size);
-   ds3_update_pad_state(device);
-   ds3_update_analog_state(device);
+   ds3_update_pad_state(device, packet);
+   ds3_update_analog_state(device, packet);
+   {
+      unsigned i;
+      for (i = 0; i < 12; i++)
+      {
+         unsigned b = packet[ds3_pressure_byte[i]];
+         device->view.axes[4 + i] = (int16_t)((b << 7) | (b >> 1));
+      }
+      /* the accelerometer, big-endian, X then Y then Z from 41 */
+      for (i = 0; i < 3; i++)
+         device->accel[i] = (uint16_t)((packet[41 + 2 * i] << 8)
+               | packet[42 + 2 * i]);
+   }
+}
+
+/* The accelerometer, as SDL reads it: 113 counts a g about 511, on
+ * SDL's axes; the pad's one-axis gyroscope is not given. */
+static bool ds3_set_sensor(void *device_data, enum retro_sensor_action action)
+{
+   ds3_instance_t *device = (ds3_instance_t *)device_data;
+   if (     !device
+         || action == RETRO_SENSOR_GYROSCOPE_ENABLE
+         || !pad_motion_want(&device->motion_want, action))
+      return false;
+   return true;
+}
+
+static bool ds3_sensor(void *device_data, unsigned id, float *value)
+{
+   ds3_instance_t *device = (ds3_instance_t *)device_data;
+   float accel[3];
+   if (!device || !device->accel[0])
+      return false;
+   accel[0] =  ((float)device->accel[0] - 511.0f) / 113.0f;
+   accel[1] = -((float)device->accel[2] - 511.0f) / 113.0f;
+   accel[2] = -((float)device->accel[1] - 511.0f) / 113.0f;
+   return pad_motion_value(accel, NULL, device->motion_want, id, value);
 }
 
 static void ds3_set_rumble(void *device_data,
       enum retro_rumble_effect effect, uint16_t strength)
 {
-   /* TODO/FIXME - implement */
+   ds3_instance_t *device = (ds3_instance_t *)device_data;
+   unsigned idx           = (effect == RETRO_RUMBLE_STRONG) ? 0 : 1;
+   uint8_t motor          = (uint8_t)(strength >> 8);
+
+   if (device && device->motors[idx] != motor)
+   {
+      device->motors[idx] = motor;
+      device->motors_due  = true;
+   }
+}
+
+/* Its lights go with the next report the pad sends. */
+static void ds3_set_player(void *device_data, unsigned player)
+{
+   ds3_instance_t *device = (ds3_instance_t *)device_data;
+   if (device)
+   {
+      device->player  = player ? (int)player : -1;
+      device->led_set = false;
+   }
 }
 
 static void ds3_get_buttons(void *device_data, input_bits_t *state)
 {
    ds3_instance_t *device = (ds3_instance_t *)device_data;
    if (device)
-   {
-      /* copy 32 bits : needed for PS button? */
-      BITS_COPY32_PTR(state, device->buttons);
-   }
+      *state = device->view.buttons;
    else
       BIT256_CLEAR_ALL_PTR(state);
 }
 
 static int16_t ds3_get_axis(void *device_data, unsigned axis)
 {
-   union joyaxis
-   {
-      uint32_t encoded;
-      int16_t axis[2];
-   } joyaxis;
-   axis_data axis_data    = {0};
    ds3_instance_t *device = (ds3_instance_t *)device_data;
-
-   joyaxis.encoded        = axis;
-   gamepad_read_axis_data(axis, &axis_data);
-
-   if (!device || axis_data.axis >= 4)
+   int16_t val;
+   if (!device)
       return 0;
-
-   if (joyaxis.axis[0] < 0 || joyaxis.axis[1] < 0)
-      return gamepad_get_axis_value(device->analog_state, &axis_data);
-   return gamepad_get_axis_value_raw(device->analog_state, &axis_data, false);
+   if (axis < INPUT_PAD_VIEW_AXES)
+      return device->view.axes[axis];
+   /* a stick's direction, bound: what wiiu_hid's state() asks */
+   if (AXIS_NEG_GET(axis) < 4)
+      return ((val = device->view.axes[AXIS_NEG_GET(axis)]) < 0) ? val : 0;
+   if (AXIS_POS_GET(axis) < 4)
+      return ((val = device->view.axes[AXIS_POS_GET(axis)]) > 0) ? val : 0;
+   return 0;
 }
 
 static const char *ds3_get_name(void *device_data)
@@ -372,7 +493,12 @@ static int32_t ds3_button(void *device_data, uint16_t joykey)
 
    if (!device || joykey > 31)
       return 0;
-   return device->buttons & (1 << joykey);
+   return BIT256_GET(device->view.buttons, joykey) ? 1 : 0;
+}
+
+static const input_pad_view_t *ds3_view(void *device_data)
+{
+   return &((ds3_instance_t *)device_data)->view;
 }
 
 pad_connection_interface_t pad_connection_ps3 = {
@@ -384,5 +510,37 @@ pad_connection_interface_t pad_connection_ps3 = {
    ds3_get_axis,
    ds3_get_name,
    ds3_button,
-   false,
+   false, /* multi_pad */
+   0,     /* max_pad */
+   NULL,  /* pad_init */
+   NULL,  /* pad_deinit */
+   NULL,  /* status */
+   NULL,  /* joypad */
+   ds3_set_player,
+   ds3_view,
+   NULL,  /* idle */
+   ds3_set_sensor,
+   ds3_sensor
+};
+
+pad_connection_interface_t pad_connection_ps3_shanwan = {
+   ds3_shanwan_init,
+   ds3_deinit,
+   ds3_packet_handler,
+   ds3_set_rumble,
+   ds3_get_buttons,
+   ds3_get_axis,
+   ds3_get_name,
+   ds3_button,
+   false, /* multi_pad */
+   0,     /* max_pad */
+   NULL,  /* pad_init */
+   NULL,  /* pad_deinit */
+   NULL,  /* status */
+   NULL,  /* joypad */
+   ds3_set_player,
+   ds3_view,
+   NULL,  /* idle */
+   ds3_set_sensor,
+   ds3_sensor
 };

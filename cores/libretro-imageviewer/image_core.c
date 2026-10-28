@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include <boolean.h>
 #include <lists/dir_list.h>
@@ -11,7 +12,7 @@
 
 #include <streams/file_stream.h>
 
-#if defined(HAVE_RPNG) || defined(HAVE_RJPEG) || defined(HAVE_RTGA) || defined(HAVE_RBMP)
+#if defined(HAVE_RPNG) || defined(HAVE_RJPEG) || defined(HAVE_RTGA) || defined(HAVE_RBMP) || defined(HAVE_RWEBP) || defined(HAVE_RDDS)
 #define PREFER_NON_STB_IMAGE
 #endif
 
@@ -26,12 +27,7 @@
 #define STBI_NO_PNM
 #endif
 #define STBI_SUPPORT_ZLIB
-
-#ifdef RARCH_INTERNAL
-#include "../../deps/stb/stb_image.h"
-#else
-#include <stb_image.h>
-#endif
+#include "stb_image.h"
 #else
 #include <formats/image.h>
 #endif
@@ -40,6 +36,8 @@
 
 #ifdef RARCH_INTERNAL
 #include "internal_cores.h"
+#include "../../gfx/video_driver.h"
+#include "../../gfx/gfx_surface.h"
 #define IMAGE_CORE_PREFIX(s) libretro_imageviewer_##s
 #else
 #define IMAGE_CORE_PREFIX(s) s
@@ -89,7 +87,15 @@ static const char image_formats[] =
 "|tga"
 #endif
 
-#if !defined(HAVE_RJPEG) && !defined(HAVE_RPNG) && !defined(HAVE_RBMP) && !defined(HAVE_RTGA)
+#ifdef HAVE_RWEBP
+"|webp"
+#endif
+
+#ifdef HAVE_RDDS
+"|dds"
+#endif
+
+#if !defined(HAVE_RJPEG) && !defined(HAVE_RPNG) && !defined(HAVE_RBMP) && !defined(HAVE_RTGA) && !defined(HAVE_RWEBP) && !defined(HAVE_RDDS)
 #error "can't build this core with no image formats"
 #endif
 ;
@@ -101,8 +107,8 @@ static const char* IMAGE_CORE_PREFIX(valid_extensions) = image_formats + 1;
 
 void IMAGE_CORE_PREFIX(retro_get_system_info)(struct retro_system_info *info)
 {
-   info->library_name     = "image display";
-   info->library_version  = "v0.1";
+   info->library_name     = "Image Viewer";
+   info->library_version  = "";
    info->need_fullpath    = true;
    info->block_extract    = false;
    info->valid_extensions = IMAGE_CORE_PREFIX(valid_extensions);
@@ -208,33 +214,76 @@ void IMAGE_CORE_PREFIX(retro_cheat_set)(unsigned a, bool b, const char * c) { }
 static bool imageviewer_load(const char *path, int image_index)
 {
 #ifdef STB_IMAGE_IMPLEMENTATION
-   int comp;
+   int comp, info_width, info_height;
+   int64_t file_size, decoded_height;
    RFILE* f;
    size_t len;
    void* buf;
 #endif
 #ifdef RARCH_INTERNAL
-   extern bool video_driver_supports_rgba(void);
+   extern uint32_t video_driver_get_disp_flags(void);
 #endif
 
    imageviewer_free_image();
 
 #ifdef STB_IMAGE_IMPLEMENTATION
    f = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
-   len = filestream_get_size(f);
+   if (!f)
+      return false;
+
+   file_size = filestream_get_size(f);
+   if (file_size <= 0 || file_size > INT_MAX)
+   {
+      filestream_close(f);
+      return false;
+   }
+   len = (size_t)file_size;
    buf = malloc(len);
-   filestream_read(f, buf, len);
+   if (!buf || filestream_read(f, buf, file_size) != file_size)
+   {
+      free(buf);
+      filestream_close(f);
+      return false;
+   }
    filestream_close(f);
 
+   /* The bundled stb_image uses signed int for pixel offsets and
+    * performs several allocation products at that width. Preflight the
+    * dimensions before decoding so those products cannot wrap. A
+    * negative height is valid for a top-down BMP. */
+   if (!stbi_info_from_memory(buf, (int)len,
+            &info_width, &info_height, &comp))
+   {
+      free(buf);
+      return false;
+   }
+   decoded_height = info_height;
+   if (decoded_height < 0)
+      decoded_height = -decoded_height;
+   if (info_width <= 0 || decoded_height <= 0
+         || (int64_t)info_width * decoded_height > INT_MAX / 4)
+   {
+      free(buf);
+      return false;
+   }
+
    image_buffer           = (uint32_t*)stbi_load_from_memory(
-         buf, len,
+         buf, (int)len,
          &image_width, &image_height,
          &comp, 4);
    free(buf);
 #else
 #ifdef RARCH_INTERNAL
-   image_texture.supports_rgba = video_driver_supports_rgba();
+   {
+      gfx_surface_requirements_t req;
+      if (gfx_surface_query_requirements(0, &req))
+         image_texture.supports_rgba = req.rgba;
+   }
 #endif
+   /* An ask, answered by the load: this core hands the frontend
+    * XRGB8888, so it never asks for 10-bit, whatever the last image
+    * answered. */
+   image_texture.pix10 = false;
    if (!image_texture_load(&image_texture, path))
       return false;
    image_buffer = (uint32_t*)image_texture.pixels;
@@ -267,13 +316,18 @@ bool IMAGE_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
    {
       if (IMAGE_CORE_PREFIX(log_cb))
          IMAGE_CORE_PREFIX(log_cb)(RETRO_LOG_INFO, "XRGB8888 is not supported.\n");
-      return false;
+      goto error;
    }
 
    if (!imageviewer_load(info->path, 0))
-      return false;
+      goto error;
 
    return true;
+
+error:
+   string_list_free(image_file_list);
+   image_file_list = NULL;
+   return false;
 }
 
 bool IMAGE_CORE_PREFIX(retro_load_game_special)(unsigned a,
@@ -286,6 +340,8 @@ size_t IMAGE_CORE_PREFIX(retro_get_memory_size)(unsigned id) { return 0; }
 void IMAGE_CORE_PREFIX(retro_unload_game)(void)
 {
    imageviewer_free_image();
+   string_list_free(image_file_list);
+   image_file_list = NULL;
    image_width  = 0;
    image_height = 0;
 }

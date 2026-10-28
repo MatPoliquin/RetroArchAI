@@ -1,11 +1,11 @@
 #ifndef _RETROARCH_TYPES_H
 #define _RETROARCH_TYPES_H
 
-#include <setjmp.h>
 #include <boolean.h>
 #include <retro_inline.h>
 #include <retro_common_api.h>
 #include <retro_miscellaneous.h>
+#include "tasks/task_notify.h"
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -39,6 +39,7 @@ enum rarch_core_type
    CORE_TYPE_PLAIN = 0,
    CORE_TYPE_DUMMY,
    CORE_TYPE_FFMPEG,
+   CORE_TYPE_WEBM,
    CORE_TYPE_MPV,
    CORE_TYPE_IMAGEVIEWER,
    CORE_TYPE_NETRETROPAD,
@@ -64,6 +65,8 @@ enum rarch_ctl_state
    RARCH_CTL_UNSET_UPS_PREF,
    RARCH_CTL_UNSET_IPS_PREF,
    RARCH_CTL_UNSET_XDELTA_PREF,
+
+   RARCH_CTL_UNSET_LAUNCHED_FROM_CLI,
 
 #ifdef HAVE_CONFIGFILE
    /* Block config read */
@@ -150,7 +153,7 @@ enum content_state_flags
    CONTENT_ST_FLAG_IS_INITED                  = (1 << 0),
    CONTENT_ST_FLAG_CORE_DOES_NOT_NEED_CONTENT = (1 << 1),
    CONTENT_ST_FLAG_PENDING_SUBSYSTEM_INIT     = (1 << 2),
-   CONTENT_ST_FLAG_PENDING_ROM_CRC            = (1 << 3)
+   CONTENT_ST_FLAG_DEFERRED_LOAD_PENDING      = (1 << 4)
 };
 
 typedef struct rarch_memory_descriptor
@@ -184,7 +187,6 @@ typedef struct rarch_system_info
    } ports;
    unsigned rotation;
    unsigned core_requested_rotation;
-   unsigned performance_level;
    char valid_extensions[256];
    bool load_no_content;
    bool supports_vfs;
@@ -250,56 +252,6 @@ struct rarch_main_wrap
    uint8_t flags;
 };
 
-/* All run-time- / command line flag-related globals go here. */
-enum global_flags
-{
-   GLOB_FLG_ERR_ON_INIT          = (1 << 0),
-   GLOB_FLG_LAUNCHED_FROM_CLI    = (1 << 1),
-   GLOB_FLG_CLI_LOAD_MENU_ON_ERR = (1 << 2)
-};
-
-typedef struct global
-{
-   jmp_buf error_sjlj_context; /* 4-byte alignment, put it right before long */
-
-   /* Settings and/or global state that is specific to
-    * a console-style implementation. */
-   struct
-   {
-      struct
-      {
-         struct
-         {
-            uint32_t *list;
-            unsigned count;
-            struct
-            {
-               unsigned idx;
-               unsigned id;
-            } current;
-            struct
-            {
-               unsigned idx;
-               unsigned id;
-            } initial;
-            bool check;
-         } resolutions;
-         unsigned      gamma_correction;
-         unsigned int  flicker_filter_index;
-         unsigned char soft_filter_index;
-         bool pal_enable;
-         bool pal60_enable;
-      } screen;
-
-      bool flickerfilter_enable;
-      bool softfilter_enable;
-
-   } console;
-
-   char error_string[NAME_MAX_LENGTH];
-   uint8_t flags;
-} global_t;
-
 typedef struct content_file_override
 {
    char *ext;
@@ -341,12 +293,26 @@ typedef struct content_state
    int pending_subsystem_rom_num;
    int pending_subsystem_id;
    unsigned pending_subsystem_rom_id;
-   uint32_t rom_crc;
    uint8_t flags;
+
+   /* Bytes prefetched ahead of the load by the content prefetch
+    * task, keyed by exact content path.  Consumed (ownership taken)
+    * by the load's read step when the path matches; leftovers are
+    * freed with the content state.  A small fixed table: a load is
+    * one content file, or a handful for subsystems. */
+   struct
+   {
+      char    *path;
+      uint8_t *data;
+      size_t   size;
+   } prefetch[8];
+   size_t prefetch_count;
+
+   /* told once the content load in progress, or the next, is through */
+   task_notify_t load_notify;
 
    char companion_ui_crc32[32];
    char pending_subsystem_ident[NAME_MAX_LENGTH];
-   char pending_rom_crc_path[PATH_MAX_LENGTH];
    char companion_ui_db_name[PATH_MAX_LENGTH];
 } content_state_t;
 

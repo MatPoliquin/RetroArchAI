@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include <boolean.h>
 
 #ifndef _XBOX
 #include <windows.h>
@@ -27,8 +28,6 @@
 
 #include <dsound.h>
 
-#include <boolean.h>
-
 #include <retro_inline.h>
 #include <retro_miscellaneous.h>
 #include <retro_timers.h>
@@ -36,10 +35,39 @@
 #include <rthreads/rthreads.h>
 #endif
 #include <lists/string_list.h>
-#include <queues/fifo_queue.h>
+
+/* The WAVEFORMATEXTENSIBLE subtypes, by value. They live in ksmedia.h,
+ * which the 2005 SDK does not reach at _WIN32_WINNT=0x0400 - that
+ * build fails on them as undeclared identifiers - and where a newer
+ * SDK does declare them it declares them without an instance to link,
+ * which is why audio/common/mmdevice_common_inline.h spells them out
+ * for WASAPI as well. Their values are fixed by the WAVE format:
+ * 00000001 for integer PCM and 00000003 for float, both in the
+ * 0000-0010-8000-00AA00389B71 family. */
+static const GUID ra_dsound_subtype_pcm =
+   { 0x00000001, 0x0000, 0x0010,
+     { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
+static const GUID ra_dsound_subtype_float =
+   { 0x00000003, 0x0000, 0x0010,
+     { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
+#include <retro_atomic.h>
+#include <retro_spsc.h>
+#include <rthreads/retro_eventcount.h>
 #include <string/stdstring.h>
 
+#if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0600 /*_WIN32_WINNT_VISTA */)
+#ifndef HAVE_MMDEVICE
+#define HAVE_MMDEVICE
+#endif
+#endif
+
+#ifdef HAVE_MMDEVICE
+#include "../common/mmdevice_common.h"
+#include "../common/mmdevice_common_inline.h"
+#endif
+
 #include "../audio_driver.h"
+#include "../../configuration.h"
 #include "../../verbosity.h"
 
 #ifdef _XBOX
@@ -50,41 +78,84 @@
 
 #if defined(_MSC_VER) && !defined(_XBOX)
 #pragma comment(lib, "dsound")
-#pragma comment(lib, "dxguid")
 #endif
+
+/* The unit the mixer thread locks and fills: 256 bytes for stereo, as
+ * it always was, made a multiple of the frame for a wider layout so
+ * that no lock and no ring boundary splits a frame (the ring's size
+ * is a multiple of it, and DirectSound wants it a multiple of the
+ * block align). */
+#define CHUNK_BASE 256
+#define CHUNK_SIZE (ds->chunk)
+#define DSOUND_TIMEOUT 256
 
 typedef struct dsound
 {
+   /* Read-mostly after init.  Both threads load ds and dsb on every
+    * iteration of their respective loops. */
    LPDIRECTSOUND ds;
    LPDIRECTSOUNDBUFFER dsb;
 
-   fifo_buffer_t *buffer;
-   CRITICAL_SECTION crit;
-
-   HANDLE      event;
+   /* Lock-free SPSC between dsound_write (producer, emulator thread)
+    * and dsound_thread (consumer).  Embedded by value so its lifetime
+    * tracks dsound_t; initialised in dsound_init, released in
+    * dsound_free after the worker has been joined. */
+   retro_spsc_t ring;
+   /* The writer's park, notified by dsound_thread after each block it
+    * moves and once when it clears thread_alive. An eventcount rather
+    * than the auto-reset event it replaces: the notify is gated, so
+    * the steady state - writer keeping ahead, never waiting - costs
+    * the pump no syscall per chunk, where SetEvent always was one. */
+   retro_eventcount_t park;
+   /* The pump's park, the other way round: notified by dsound_write
+    * after each block it queues, and by dsound_stop_thread. The pump
+    * waits here, for a time worked out from how far the play cursor
+    * has to move, instead of retrying every millisecond. Gated like
+    * park, so a writer with nobody waiting pays no syscall. */
+   retro_eventcount_t feed;
+   /* Bytes the device plays per second, for turning a distance on the
+    * play cursor into a wait. */
+   unsigned bytes_per_sec;
 #ifdef HAVE_THREADS
    sthread_t *thread;
 #else
    HANDLE thread;
 #endif
-
+#ifdef HAVE_MMDEVICE
+#ifdef HAVE_THREADS
+   sthread_t *imm_thread;
+#else
+   HANDLE imm_thread;
+#endif
+#endif
+   size_t fifo_bufsize;
    unsigned buffer_size;
+   unsigned chunk;       /* bytes per lock: CHUNK_BASE made a multiple of the frame */
+   unsigned frame_size;  /* bytes per frame at the opened format */
+   uint32_t layout;      /* the frontend's mask the buffer was opened with */
 
    bool nonblock;
    bool is_paused;
-   volatile bool thread_alive;
+   bool use_float;
+   /* Written by both the main thread (start/stop) and the mixer thread
+    * (which clears it when the buffer can no longer be locked), and
+    * read by both. volatile carries no ordering under MSVC
+    * /volatile:iso, which is what ARM64 builds get, so state it like
+    * the ring buffer beside it already does. */
+   retro_atomic_int_t thread_alive;
+
+   /* The play cursor unwrapped, in frames, for the sink rate estimate:
+    * the mixer thread reads the cursor every pass, well within a
+    * buffer's length, and adds each advance here. Kept in a 32-bit
+    * atomic so the reader on another thread sees whole values; at
+    * 48 kHz it holds twelve hours, and the estimate treats a wrap as a
+    * restart. */
+   retro_atomic_int_t frames_played;
+   /* Blocks the mixer thread had room for and nothing to put in, so
+    * the device played the silence written into them instead. */
+   retro_atomic_size_t underruns;
+   DWORD              last_read_ptr;
 } dsound_t;
-
-/* Forward declarations */
-static void *dsound_list_new(void *u);
-
-static INLINE unsigned write_avail(unsigned read_ptr,
-      unsigned write_ptr, unsigned buffer_size)
-{
-   return (read_ptr + buffer_size - write_ptr) % buffer_size;
-}
-
-#define CHUNK_SIZE 256
 
 struct audio_lock
 {
@@ -94,39 +165,137 @@ struct audio_lock
    DWORD size2;
 };
 
-static bool grab_region(dsound_t *ds, uint32_t write_ptr,
+#ifdef HAVE_MMDEVICE
+static void dsound_imm_stop_thread(dsound_t *ds)
+{
+   if (!ds->imm_thread)
+      return;
+
+   PostThreadMessage(IMMNotificationThreadId, WM_QUIT, 0, 0);
+
+#ifdef HAVE_THREADS
+   sthread_join(ds->imm_thread);
+#else
+   WaitForSingleObject(ds->imm_thread, DSOUND_TIMEOUT);
+   CloseHandle(ds->imm_thread);
+#endif
+
+   IMMNotificationThreadId = 0;
+   ds->imm_thread = NULL;
+}
+
+static bool dsound_imm_start_thread(dsound_t *ds)
+{
+   if (!ds->imm_thread)
+   {
+#ifdef HAVE_THREADS
+      ds->imm_thread = sthread_create(mmdevice_thread,
+            (void*)&audio_state_get_ptr()->reinit_request);
+#else
+      ds->imm_thread = CreateThread(NULL, 0, mmdevice_thread,
+            (void*)&audio_state_get_ptr()->reinit_request, 0, NULL);
+#endif
+      if (!ds->imm_thread)
+         return false;
+   }
+   return true;
+}
+#endif
+
+static BOOL CALLBACK dsound_enumerate_cb(LPGUID guid,
+      LPCSTR desc, LPCSTR module, LPVOID context)
+{
+   union string_list_elem_attr attr;
+   struct string_list *list = (struct string_list*)context;
+
+   attr.i = 0;
+
+   string_list_append(list, desc, attr);
+
+   if (guid)
+   {
+      LPGUID guid_copy = (LPGUID)malloc(sizeof(GUID) * 1);
+
+      if (guid_copy)
+      {
+         int i;
+
+         guid_copy->Data1 = guid->Data1;
+         guid_copy->Data2 = guid->Data2;
+         guid_copy->Data3 = guid->Data3;
+         for (i = 0; i < 8; i++)
+            guid_copy->Data4[i] = guid->Data4[i];
+
+         list->elems[list->size - 1].userdata = guid_copy;
+      }
+   }
+
+   return TRUE;
+}
+
+static void *dsound_device_list_new(void *u)
+{
+   struct string_list *sl = string_list_new();
+
+   if (!sl)
+      return NULL;
+
+#ifndef _XBOX
+#ifdef UNICODE
+   DirectSoundEnumerate((LPDSENUMCALLBACKW)dsound_enumerate_cb, sl);
+#else
+   DirectSoundEnumerate((LPDSENUMCALLBACKA)dsound_enumerate_cb, sl);
+#endif
+#endif
+
+   return sl;
+}
+
+/* Both pointers are already reduced modulo buffer_size, so the sum is
+ * strictly below 2 * buffer_size and a conditional subtract is exact.
+ * The equal case yields buffer_size, which folds to 0 - same as the
+ * modulo it replaces. */
+static INLINE unsigned _dsound_write_avail(unsigned read_ptr,
+      unsigned write_ptr, unsigned buffer_size)
+{
+   unsigned avail = read_ptr + buffer_size - write_ptr;
+   if (avail >= buffer_size)
+      avail -= buffer_size;
+   return avail;
+}
+
+static bool dsound_grab_region(dsound_t *ds, uint32_t write_ptr,
       struct audio_lock *region, HRESULT res)
 {
    if (res == DSERR_BUFFERLOST)
    {
 #ifdef DEBUG
-      RARCH_WARN("[DirectSound error]: %s\n", "DSERR_BUFFERLOST");
+      RARCH_WARN("[DirectSound] %s.\n", "DSERR_BUFFERLOST");
 #endif
-      if ((res = IDirectSoundBuffer_Restore(ds->dsb)) != DS_OK)
-         return false;
-      if ((res = IDirectSoundBuffer_Lock(ds->dsb, write_ptr, CHUNK_SIZE,
-                  &region->chunk1, &region->size1, &region->chunk2, &region->size2, 0)) != DS_OK)
-         return false;
-      return true;
+      if ((IDirectSoundBuffer_Restore(ds->dsb)) == DS_OK)
+         if ((IDirectSoundBuffer_Lock(ds->dsb, write_ptr, CHUNK_SIZE,
+                     &region->chunk1, &region->size1, &region->chunk2, &region->size2, 0)) == DS_OK)
+            return true;
    }
-
 #ifdef DEBUG
-   switch (res)
+   else
    {
-      case DSERR_INVALIDCALL:
-         RARCH_WARN("[DirectSound error]: %s\n", "DSERR_INVALIDCALL");
-         break;
-      case DSERR_INVALIDPARAM:
-         RARCH_WARN("[DirectSound error]: %s\n", "DSERR_INVALIDPARAM");
-         break;
-      case DSERR_PRIOLEVELNEEDED:
-         RARCH_WARN("[DirectSound error]: %s\n", "DSERR_PRIOLEVELNEEDED");
-         break;
-      default:
-         break;
+      switch (res)
+      {
+         case DSERR_INVALIDCALL:
+            RARCH_WARN("[DirectSound] %s.\n", "DSERR_INVALIDCALL");
+            break;
+         case DSERR_INVALIDPARAM:
+            RARCH_WARN("[DirectSound] %s.\n", "DSERR_INVALIDPARAM");
+            break;
+         case DSERR_PRIOLEVELNEEDED:
+            RARCH_WARN("[DirectSound] %s.\n", "DSERR_PRIOLEVELNEEDED");
+            break;
+         default:
+            break;
+      }
    }
 #endif
-
    return false;
 }
 
@@ -141,10 +310,12 @@ static DWORD CALLBACK dsound_thread(PVOID data)
 
    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-   IDirectSoundBuffer_GetCurrentPosition(ds->dsb, NULL, &write_ptr);
-   write_ptr = (write_ptr + ds->buffer_size / 2) % ds->buffer_size;
+   IDirectSoundBuffer_GetCurrentPosition(ds->dsb, &ds->last_read_ptr, &write_ptr);
+   write_ptr += ds->buffer_size / 2;
+   if (write_ptr >= ds->buffer_size)
+      write_ptr -= ds->buffer_size;
 
-   while (ds->thread_alive)
+   while (retro_atomic_load_acquire_int(&ds->thread_alive))
    {
       HRESULT res;
       bool is_pull = false;
@@ -152,32 +323,60 @@ static DWORD CALLBACK dsound_thread(PVOID data)
       DWORD read_ptr, avail, fifo_avail;
 
       IDirectSoundBuffer_GetCurrentPosition(ds->dsb, &read_ptr, NULL);
-      avail = write_avail(read_ptr, write_ptr, ds->buffer_size);
+      avail = _dsound_write_avail(read_ptr, write_ptr, ds->buffer_size);
 
-      EnterCriticalSection(&ds->crit);
-      fifo_avail = FIFO_READ_AVAIL(ds->buffer);
-      LeaveCriticalSection(&ds->crit);
+      /* The cursor's advance since the last pass, unwrapped: the
+       * device's consumption, silence included. */
+      {
+         DWORD adv = read_ptr + ds->buffer_size - ds->last_read_ptr;
+         if (adv >= ds->buffer_size)
+            adv -= ds->buffer_size;
+         ds->last_read_ptr = read_ptr;
+         retro_atomic_fetch_add_int(&ds->frames_played,
+               (int)(adv / ds->frame_size));
+      }
+
+      /* Consumer-side query; only this thread advances the read
+       * cursor, so the value cannot shrink under us between here and
+       * the drain below. */
+      fifo_avail = (DWORD)retro_spsc_read_avail(&ds->ring);
 
       if (avail < CHUNK_SIZE || ((fifo_avail < CHUNK_SIZE) && (avail < ds->buffer_size / 2)))
       {
-         /* No space to write, or we don't have data in our fifo,
-          * but we can wait some time before it underruns ... */
+         /* No space to write, or no data queued with time left before
+          * the device underruns. Either way the next thing this pass
+          * can do waits on the play cursor moving a known distance:
+          * to free a chunk, or to the point where silence has to go
+          * in. Wait that long - worked out from the rate, rather than
+          * position notifications, which are not reliable on every
+          * driver - or until the writer queues a block or the thread
+          * is stopped, whichever comes first. The old loop slept a
+          * millisecond at a time and looked again. */
+         DWORD   need    = (avail < CHUNK_SIZE)
+            ? CHUNK_SIZE - avail
+            : ds->buffer_size / 2 - avail;
+         int64_t wait_us = ((int64_t)need * 1000000) / ds->bytes_per_sec;
+         int     key     = retro_eventcount_prepare_wait(&ds->feed);
 
-         /* We could opt for using the notification interface,
-          * but it is not guaranteed to work, so use high
-          * priority sleeping patterns.
-          */
-         retro_sleep(1);
+         /* Re-checked inside the window, so a block queued or a stop
+          * issued since the test above cannot be missed. */
+         if (      !retro_atomic_load_acquire_int(&ds->thread_alive)
+               || (   avail >= CHUNK_SIZE
+                   && retro_spsc_read_avail(&ds->ring) >= CHUNK_SIZE))
+            retro_eventcount_cancel_wait(&ds->feed);
+         else
+            retro_eventcount_commit_wait_timeout(&ds->feed, key,
+                  wait_us > 0 ? wait_us : 1);
          continue;
       }
 
       if ((res = IDirectSoundBuffer_Lock(ds->dsb, write_ptr, CHUNK_SIZE,
                   &region.chunk1, &region.size1, &region.chunk2, &region.size2, 0)) != DS_OK)
       {
-         if (!grab_region(ds, write_ptr, &region, res))
+         if (!dsound_grab_region(ds, write_ptr, &region, res))
          {
-            ds->thread_alive = false;
-            SetEvent(ds->event);
+            retro_atomic_store_release_int(&ds->thread_alive, 0);
+            retro_eventcount_notify(&ds->park);
             break;
          }
       }
@@ -188,31 +387,53 @@ static DWORD CALLBACK dsound_thread(PVOID data)
           * fill block with silence. */
          memset(region.chunk1, 0, region.size1);
          memset(region.chunk2, 0, region.size2);
+         retro_atomic_fetch_add_size(&ds->underruns, 1);
       }
       else
       {
-         /* All is good. Pull from it and notify FIFO. */
+         /* All is good. Pull from it and notify the producer. */
+         size_t got1 = 0;
+         size_t got2 = 0;
 
-         EnterCriticalSection(&ds->crit);
          if (region.chunk1)
-            fifo_read(ds->buffer, region.chunk1, region.size1);
+            got1 = retro_spsc_read(&ds->ring, region.chunk1, region.size1);
          if (region.chunk2)
-            fifo_read(ds->buffer, region.chunk2, region.size2);
-         LeaveCriticalSection(&ds->crit);
+            got2 = retro_spsc_read(&ds->ring, region.chunk2, region.size2);
+
+         /* fifo_avail >= CHUNK_SIZE == size1 + size2 was established
+          * above and only this thread consumes, so a short read is not
+          * reachable.  Silence any remainder anyway rather than commit
+          * whatever the DirectSound buffer happened to hold - the old
+          * fifo_read had no length feedback at all, so this class of
+          * bug could not even be detected. */
+         if (region.chunk1 && got1 < region.size1)
+            memset((uint8_t*)region.chunk1 + got1, 0, region.size1 - got1);
+         if (region.chunk2 && got2 < region.size2)
+            memset((uint8_t*)region.chunk2 + got2, 0, region.size2 - got2);
 
          is_pull = true;
       }
 
       IDirectSoundBuffer_Unlock(ds->dsb, region.chunk1,
             region.size1, region.chunk2, region.size2);
-      write_ptr = (write_ptr + region.size1 + region.size2)
-         % ds->buffer_size;
+      /* write_ptr < buffer_size and the locked region is CHUNK_SIZE,
+       * which buffer_size is both a multiple of and at least four
+       * times, so one conditional subtract is enough. */
+      write_ptr += region.size1 + region.size2;
+      if (write_ptr >= ds->buffer_size)
+         write_ptr -= ds->buffer_size;
 
       if (is_pull)
-         SetEvent(ds->event);
+         retro_eventcount_notify(&ds->park);
    }
 
-   ExitThread(0);
+   /* Return normally: under HAVE_THREADS this function runs inside the
+    * sthread wrapper, which frees its thunk allocation after the
+    * function returns - ExitThread here skipped that epilogue and
+    * leaked the thunk on every driver teardown. */
+#ifndef HAVE_THREADS
+   return 0;
+#endif
 }
 
 static void dsound_stop_thread(dsound_t *ds)
@@ -220,12 +441,14 @@ static void dsound_stop_thread(dsound_t *ds)
    if (!ds->thread)
       return;
 
-   ds->thread_alive = false;
+   retro_atomic_store_release_int(&ds->thread_alive, 0);
+   /* Out of a wait on the play cursor, which can be most of a buffer. */
+   retro_eventcount_notify(&ds->feed);
 
 #ifdef HAVE_THREADS
    sthread_join(ds->thread);
 #else
-   WaitForSingleObject(ds->thread, INFINITE);
+   WaitForSingleObject(ds->thread, DSOUND_TIMEOUT);
    CloseHandle(ds->thread);
 #endif
 
@@ -236,12 +459,11 @@ static bool dsound_start_thread(dsound_t *ds)
 {
    if (!ds->thread)
    {
-      ds->thread_alive = true;
-
+      retro_atomic_store_release_int(&ds->thread_alive, 1);
 #ifdef HAVE_THREADS
-      ds->thread       = sthread_create(dsound_thread, ds);
+      ds->thread = sthread_create(dsound_thread, ds);
 #else
-      ds->thread       = CreateThread(NULL, 0, dsound_thread, ds, 0, NULL);
+      ds->thread = CreateThread(NULL, 0, dsound_thread, ds, 0, NULL);
 #endif
       if (!ds->thread)
          return false;
@@ -272,18 +494,10 @@ static void dsound_free(void *data)
    if (!ds)
       return;
 
-   if (ds->thread)
-   {
-      ds->thread_alive = false;
-#ifdef HAVE_THREADS
-      sthread_join(ds->thread);
-#else
-      WaitForSingleObject(ds->thread, INFINITE);
-      CloseHandle(ds->thread);
+#ifdef HAVE_MMDEVICE
+   dsound_imm_stop_thread(ds);
 #endif
-   }
-
-   DeleteCriticalSection(&ds->crit);
+   dsound_stop_thread(ds);
 
    if (ds->dsb)
    {
@@ -294,87 +508,151 @@ static void dsound_free(void *data)
    if (ds->ds)
       IDirectSound_Release(ds->ds);
 
-   if (ds->event)
-      CloseHandle(ds->event);
+   retro_eventcount_free(&ds->park);
+   retro_eventcount_free(&ds->feed);
 
-   if (ds->buffer)
-      fifo_free(ds->buffer);
+   /* Safe here and only here: dsound_stop_thread has joined the
+    * consumer, so the ring has no live reader. */
+   retro_spsc_free(&ds->ring);
 
    free(ds);
 }
 
-static BOOL CALLBACK enumerate_cb(LPGUID guid,
-      LPCSTR desc, LPCSTR module, LPVOID context)
+/* Stereo is the plain format it always was; a wider layout is a
+ * WAVEFORMATEXTENSIBLE with the frontend's mask as the channel mask,
+ * the same bits DirectSound uses (the same as WASAPI's), so each
+ * channel goes to its speaker rather than the driver's guess for
+ * the count. */
+static void dsound_set_format(WAVEFORMATEXTENSIBLE *wfx,
+      bool float_fmt, unsigned channels, uint32_t layout, unsigned rate)
 {
-   union string_list_elem_attr attr;
-   struct string_list *list = (struct string_list*)context;
+   WAVEFORMATEX *wf      = &wfx->Format;
+   WORD wBitsPerSample   = float_fmt ? 32 : 16;
+   WORD nBlockAlign      = (channels * wBitsPerSample) / 8;
+   DWORD nAvgBytesPerSec = rate * nBlockAlign;
 
-   attr.i = 0;
-
-   string_list_append(list, desc, attr);
-
-   if (guid)
+   memset(wfx, 0, sizeof(*wfx));
+   wf->nChannels         = channels;
+   wf->nSamplesPerSec    = rate;
+   wf->nAvgBytesPerSec   = nAvgBytesPerSec;
+   wf->nBlockAlign       = nBlockAlign;
+   wf->wBitsPerSample    = wBitsPerSample;
+   if (channels > 2)
    {
-      LPGUID guid_copy = (LPGUID)malloc(sizeof(GUID) * 1);
-
-      if (guid_copy)
-      {
-         unsigned i;
-
-         guid_copy->Data1 = guid->Data1;
-         guid_copy->Data2 = guid->Data2;
-         guid_copy->Data3 = guid->Data3;
-         for (i = 0; i < 8; i++)
-            guid_copy->Data4[i] = guid->Data4[i];
-
-         list->elems[list->size - 1].userdata = guid_copy;
-      }
+      wf->wFormatTag              = WAVE_FORMAT_EXTENSIBLE;
+      wf->cbSize                  = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+      wfx->Samples.wValidBitsPerSample = wBitsPerSample;
+      wfx->dwChannelMask          = (DWORD)layout;
+      wfx->SubFormat              = float_fmt
+            ? ra_dsound_subtype_float : ra_dsound_subtype_pcm;
    }
-
-   return TRUE;
+   else
+   {
+      wf->wFormatTag     = float_fmt ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+      wf->cbSize         = 0;
+   }
 }
 
-static void dsound_set_wavefmt(WAVEFORMATEX *wfx,
-      unsigned channels, unsigned samplerate)
+static const char *dsound_wave_format_name(const WAVEFORMATEX *format)
 {
-   wfx->wFormatTag        = WAVE_FORMAT_PCM;
-   wfx->nBlockAlign       = channels * sizeof(int16_t);
-   wfx->wBitsPerSample    = 16;
+   switch (format->wFormatTag)
+   {
+      case WAVE_FORMAT_PCM:
+         return "WAVE_FORMAT_PCM";
+      case WAVE_FORMAT_IEEE_FLOAT:
+         return "WAVE_FORMAT_IEEE_FLOAT";
+      case WAVE_FORMAT_EXTENSIBLE:
+      {
+         const WAVEFORMATEXTENSIBLE *x = (const WAVEFORMATEXTENSIBLE*)format;
+         if (!memcmp(&x->SubFormat, &ra_dsound_subtype_float, sizeof(GUID)))
+            return "WAVE_FORMAT_EXTENSIBLE float";
+         return "WAVE_FORMAT_EXTENSIBLE PCM";
+      }
+      default:
+         break;
+   }
 
-   wfx->nChannels         = channels;
-   wfx->nSamplesPerSec    = samplerate;
-   wfx->nAvgBytesPerSec   = wfx->nSamplesPerSec * wfx->nBlockAlign;
-   wfx->cbSize            = 0;
+   return "<unknown>";
+}
+
+/* The two stages, from the setting and the format the device took.
+ * The staging fifo dsound_write() fills is what rate control measures
+ * and holds half full; the DirectSound ring the notify thread keeps
+ * full sits behind it, and what the user hears is the ring plus half
+ * the fifo. Both used to be sized to the setting, so a 64 ms setting
+ * played at about 96. The fifo holds the setting - rounded up to a
+ * power of two by retro_spsc, and reported at its real capacity - and
+ * the ring takes what is left of the setting after half the fifo, so
+ * the two add up to it, floored at 16 ms - or the setting, if lower -
+ * to ride out the scheduler between the thread's wake-ups, and at
+ * four chunks in any case. */
+static void dsound_size_stages(dsound_t *ds, unsigned latency,
+      const WAVEFORMATEX *wf)
+{
+   size_t setting_bytes = ((size_t)latency * wf->nAvgBytesPerSec) / 1000;
+   size_t fifo_capacity = 4 * 1024;
+   size_t floor_bytes   = (16 * (size_t)wf->nAvgBytesPerSec) / 1000;
+
+   /* Never a larger ring than the setting asked for in total: at a
+    * setting under 16 ms the ring is the setting, as it always was. */
+   if (floor_bytes > setting_bytes)
+      floor_bytes       = setting_bytes;
+   while (fifo_capacity < setting_bytes)
+      fifo_capacity   <<= 1;
+   ds->fifo_bufsize     = fifo_capacity;
+   ds->buffer_size      = (setting_bytes > fifo_capacity / 2)
+         ? (unsigned)(setting_bytes - fifo_capacity / 2) : 0;
+   if (ds->buffer_size < floor_bytes)
+      ds->buffer_size   = (unsigned)floor_bytes;
+   /* the lock unit: 256 bytes made a multiple of the frame */
+   ds->frame_size       = wf->nBlockAlign;
+   ds->bytes_per_sec    = wf->nAvgBytesPerSec;
+   ds->chunk            = CHUNK_BASE;
+   while (ds->chunk % ds->frame_size)
+      ds->chunk        += CHUNK_BASE;
+   ds->buffer_size     /= CHUNK_SIZE;
+   ds->buffer_size     *= CHUNK_SIZE;
+   if (ds->buffer_size < 4 * CHUNK_SIZE)
+      ds->buffer_size   = 4 * CHUNK_SIZE;
 }
 
 static void *dsound_init(const char *dev, unsigned rate, unsigned latency,
-      unsigned block_frames,
-      unsigned *new_rate)
+       unsigned *new_rate)
 {
-   LPGUID selected_device   = NULL;
-   WAVEFORMATEX wfx         = {0};
-   DSBUFFERDESC bufdesc     = {0};
-   int32_t idx_found        = -1;
-   struct string_list *list = (struct string_list*)dsound_list_new(NULL);
-   dsound_t          *ds    = (dsound_t*)calloc(1, sizeof(*ds));
+   LPGUID selected_device = NULL;
+   WAVEFORMATEXTENSIBLE wfx;
+   WAVEFORMATEX *wf       = &wfx.Format;
+   DSBUFFERDESC bufdesc   = {0};
+   bool want_float        = (config_get_ptr()->uints.audio_format_negotiation
+         == AUDIO_FORMAT_NEGOTIATION_FLOAT);
+   dsound_t *ds           = (dsound_t*)calloc(1, sizeof(*ds));
+   /* The layout the frontend asked for; a buffer the device will not
+    * make with it is retried as stereo, and the layout hook says
+    * which. */
+   uint32_t layout        = audio_driver_requested_layout();
+   unsigned channels      = audio_layout_channels(layout);
 
    if (!ds)
-      goto error;
+      return NULL;
+   ds->layout = AUDIO_LAYOUT_STEREO;
 
-   InitializeCriticalSection(&ds->crit);
 
    if (dev)
    {
+      struct string_list *list = (struct string_list*)dsound_device_list_new(NULL);
+
        /* Search for device name first */
       if (list && list->elems)
       {
+         int32_t idx_found = -1;
          if (list->elems)
          {
-            unsigned i;
+            size_t i;
             for (i = 0; i < list->size; i++)
             {
                if (string_is_equal(dev, list->elems[i].data))
                {
+                  RARCH_DBG("[DirectSound] Found device #%d: \"%s\".\n", i, list->elems[i].data);
                   idx_found       = i;
                   selected_device = (LPGUID)list->elems[idx_found].userdata;
                   break;
@@ -386,19 +664,21 @@ static void *dsound_init(const char *dev, unsigned rate, unsigned latency,
             if (idx_found == -1 && isdigit(dev[0]))
             {
                idx_found = strtoul(dev, NULL, 0);
-               RARCH_LOG("[DirectSound]: Fallback, device index is a single number index instead: %d.\n", idx_found);
+               RARCH_LOG("[DirectSound] Fallback, device index is a single number index instead: %d.\n", idx_found);
 
                if (idx_found != -1)
                {
                   if (idx_found < (int32_t)list->size)
                   {
-                     RARCH_LOG("[DirectSound]: Corresponding name: %s\n", list->elems[idx_found].data);
+                     RARCH_LOG("[DirectSound] Corresponding name: %s.\n", list->elems[idx_found].data);
                      selected_device = (LPGUID)list->elems[idx_found].userdata;
                   }
                }
             }
          }
       }
+
+      string_list_free(list);
    }
 
    if (DirectSoundCreate(selected_device, &ds->ds, NULL) != DS_OK)
@@ -409,16 +689,15 @@ static void *dsound_init(const char *dev, unsigned rate, unsigned latency,
       goto error;
 #endif
 
-   dsound_set_wavefmt(&wfx, 2, rate);
+   dsound_set_format(&wfx, want_float, channels, layout, rate);
+   RARCH_DBG("[DirectSound] Requesting %u-bit %u-channel client with %s samples at %uHz %ums.\n",
+         wf->wBitsPerSample,
+         wf->nChannels,
+         dsound_wave_format_name(wf),
+         wf->nSamplesPerSec,
+         latency);
 
-   ds->buffer_size       = (latency * wfx.nAvgBytesPerSec) / 1000;
-   ds->buffer_size      /= CHUNK_SIZE;
-   ds->buffer_size      *= CHUNK_SIZE;
-   if (ds->buffer_size < 4 * CHUNK_SIZE)
-      ds->buffer_size    = 4 * CHUNK_SIZE;
-
-   RARCH_LOG("[DirectSound]: Setting buffer size of %u bytes\n", ds->buffer_size);
-   RARCH_LOG("[DirectSound]: Latency = %u ms\n", (unsigned)((1000 * ds->buffer_size) / wfx.nAvgBytesPerSec));
+   dsound_size_stages(ds, latency, wf);
 
    bufdesc.dwSize        = sizeof(DSBUFFERDESC);
    bufdesc.dwFlags       = 0;
@@ -426,37 +705,98 @@ static void *dsound_init(const char *dev, unsigned rate, unsigned latency,
    bufdesc.dwFlags       = DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS;
 #endif
    bufdesc.dwBufferBytes = ds->buffer_size;
-   bufdesc.lpwfxFormat   = &wfx;
+   bufdesc.lpwfxFormat   = wf;
 
-   ds->event = CreateEvent(NULL, false, false, NULL);
-   if (!ds->event)
+   if (!retro_eventcount_init(&ds->park))
+      goto error;
+   if (!retro_eventcount_init(&ds->feed))
       goto error;
 
-   ds->buffer = fifo_new(4 * 1024);
-   if (!ds->buffer)
-      goto error;
+   /* The formats in the order they are given up: the layout as asked
+    * in float, the layout as int16, then stereo in each. A refused
+    * layout costs the layout before it costs the sample format. */
+   {
+      unsigned pass;
+      bool     made = false;
+      for (pass = 0; pass < 4 && !made; pass++)
+      {
+         bool     f   = (pass & 1) ? false : want_float;
+         unsigned chs = (pass < 2) ? channels : 2;
+         uint32_t lay = (pass < 2) ? layout : AUDIO_LAYOUT_STEREO;
+         if (pass & 1)
+         {
+            if (!want_float)
+               continue;      /* int16 was the first try already */
+         }
+         if (pass >= 2 && channels <= 2)
+            break;            /* stereo was the first two tries */
+         if (pass)
+         {
+            dsound_set_format(&wfx, f, chs, lay, rate);
+            dsound_size_stages(ds, latency, wf);
+            bufdesc.dwBufferBytes = ds->buffer_size;
+            bufdesc.lpwfxFormat   = wf;
+         }
+         if (IDirectSound_CreateSoundBuffer(ds->ds, &bufdesc, &ds->dsb, 0) == DS_OK)
+         {
+            made          = true;
+            ds->use_float = f;
+            ds->layout    = lay;
+            if (pass == 1)
+               RARCH_WARN("[DirectSound] Failed to create float buffer, falling back to 16-bit PCM.\n");
+            else if (pass >= 2)
+               RARCH_WARN("[DirectSound] The device would not make a %u-channel buffer (layout 0x%03x); opened stereo.\n",
+                     channels, layout);
+         }
+      }
+      if (!made)
+         goto error;
+   }
 
-   if (IDirectSound_CreateSoundBuffer(ds->ds, &bufdesc, &ds->dsb, 0) != DS_OK)
+   /* Staging fifo between dsound_write and the feeder thread.  This is
+    * the only occupancy rate control can observe (write_avail /
+    * buffer_size report it), so it must span a useful measurement
+    * window: the previous fixed 4 KiB was 10.7 ms of float at 48 kHz -
+    * smaller than a single video frame's write, which slammed the
+    * controller's occupancy signal rail-to-rail on every batch.
+    * Mirror the DirectSound ring (latency-scaled, format-aware via
+    * nAvgBytesPerSec, already CHUNK_SIZE-aligned), sized after the
+    * float->int16 fallback so both agree on the final format.  Keep
+    * the old 4 KiB as the floor for very low latency settings. */
+   if (!retro_spsc_init_mirrored(&ds->ring, ds->fifo_bufsize))
       goto error;
+   /* retro_spsc_init rounds capacity up to a power of 2.  Report the
+    * true capacity as the driver buffer size, so rate control computes
+    * its setpoint against the ring's real bounds rather than the
+    * pre-rounding request.  An empty ring's write avail is exactly its
+    * capacity. */
+   ds->fifo_bufsize = retro_spsc_write_avail(&ds->ring);
+
+   RARCH_LOG("[DirectSound] Initialized %u-bit %s: %u ms setting as a %u-byte fifo (%u ms, rate control holds it about half full) in front of a %u-byte ring (%u ms); about %u ms from write to the device.\n",
+         wf->wBitsPerSample,
+         dsound_wave_format_name(wf),
+         latency,
+         (unsigned)ds->fifo_bufsize,
+         (unsigned)((1000 * ds->fifo_bufsize) / wf->nAvgBytesPerSec),
+         ds->buffer_size,
+         (unsigned)((1000 * ds->buffer_size) / wf->nAvgBytesPerSec),
+         (unsigned)((1000 * (ds->fifo_bufsize / 2 + ds->buffer_size)) / wf->nAvgBytesPerSec));
 
    IDirectSoundBuffer_SetVolume(ds->dsb, DSBVOLUME_MAX);
    IDirectSoundBuffer_SetCurrentPosition(ds->dsb, 0);
 
    dsound_clear_buffer(ds);
 
-   if (IDirectSoundBuffer_Play(ds->dsb, 0, 0, DSBPLAY_LOOPING) != DS_OK)
-      goto error;
+#ifdef HAVE_MMDEVICE
+   dsound_imm_start_thread(ds);
+#endif
 
-   if (!dsound_start_thread(ds))
-      goto error;
-
-   string_list_free(list);
-   return ds;
+   if (IDirectSoundBuffer_Play(ds->dsb, 0, 0, DSBPLAY_LOOPING) == DS_OK)
+      if (dsound_start_thread(ds))
+         return ds;
 
 error:
    RARCH_ERR("[DirectSound] Error occurred in init.\n");
-   if (list)
-      string_list_free(list);
    dsound_free(ds);
    return NULL;
 }
@@ -464,11 +804,9 @@ error:
 static bool dsound_stop(void *data)
 {
    dsound_t *ds = (dsound_t*)data;
-
    dsound_stop_thread(ds);
    ds->is_paused = (IDirectSoundBuffer_Stop(ds->dsb) == DS_OK) ? true : false;
-
-   return (ds->is_paused) ? true : false;
+   return ds->is_paused;
 }
 
 static bool dsound_start(void *data, bool is_shutdown)
@@ -482,16 +820,13 @@ static bool dsound_start(void *data, bool is_shutdown)
 
    ds->is_paused = (IDirectSoundBuffer_Play(
             ds->dsb, 0, 0, DSBPLAY_LOOPING) == DS_OK) ? false : true;
-   return (ds->is_paused) ? false : true;
+   return !ds->is_paused;
 }
 
 static bool dsound_alive(void *data)
 {
    dsound_t *ds = (dsound_t*)data;
-
-   if (!ds)
-      return false;
-   return !ds->is_paused;
+   return ds && !ds->is_paused;
 }
 
 static void dsound_set_nonblock_state(void *data, bool state)
@@ -503,11 +838,11 @@ static void dsound_set_nonblock_state(void *data, bool state)
 
 static ssize_t dsound_write(void *data, const void *buf_, size_t len)
 {
-   size_t     written = 0;
+   size_t _len = 0;
    dsound_t       *ds = (dsound_t*)data;
    const uint8_t *buf = (const uint8_t*)buf_;
 
-   if (!ds->thread_alive)
+   if (!retro_atomic_load_acquire_int(&ds->thread_alive))
       return -1;
 
    if (ds->nonblock)
@@ -516,17 +851,15 @@ static ssize_t dsound_write(void *data, const void *buf_, size_t len)
       {
          size_t avail;
 
-         EnterCriticalSection(&ds->crit);
-         avail = FIFO_WRITE_AVAIL(ds->buffer);
+         avail = retro_spsc_write_avail(&ds->ring);
          if (avail > len)
             avail = len;
 
-         fifo_write(ds->buffer, buf, avail);
-         LeaveCriticalSection(&ds->crit);
+         retro_spsc_write(&ds->ring, buf, avail);
+         if (avail)
+            retro_eventcount_notify(&ds->feed);
 
-         buf     += avail;
-         len     -= avail;
-         written += avail;
+         _len += avail;
       }
    }
    else
@@ -535,28 +868,81 @@ static ssize_t dsound_write(void *data, const void *buf_, size_t len)
       {
          size_t avail;
 
-         EnterCriticalSection(&ds->crit);
-         avail = FIFO_WRITE_AVAIL(ds->buffer);
+         avail = retro_spsc_write_avail(&ds->ring);
          if (avail > len)
             avail = len;
 
-         fifo_write(ds->buffer, buf, avail);
-         LeaveCriticalSection(&ds->crit);
+         retro_spsc_write(&ds->ring, buf, avail);
+         if (avail)
+            retro_eventcount_notify(&ds->feed);
 
-         buf     += avail;
-         len     -= avail;
-         written += avail;
+         buf  += avail;
+         _len += avail;
+         len  -= avail;
 
-         if (!ds->thread_alive)
+         if (!retro_atomic_load_acquire_int(&ds->thread_alive))
             break;
 
+         /* The notify thread sets the event after every block it moves
+          * and clears thread_alive when the buffer is lost for good, so
+          * a period with no event is a play cursor that has stalled,
+          * not a device gone: the write returns what went, and a lost
+          * buffer still reports through the flag on the next call. */
          if (avail == 0)
-            if (!(WaitForSingleObject(ds->event, 50) == WAIT_OBJECT_0))
-               return -1;
+         {
+            /* Space and liveness re-checked inside the window, so the
+             * pump's notify - including its last one, clearing
+             * thread_alive - cannot fall between the test and the
+             * park. */
+            int key = retro_eventcount_prepare_wait(&ds->park);
+            if (   retro_spsc_write_avail(&ds->ring)
+                || !retro_atomic_load_acquire_int(&ds->thread_alive))
+               retro_eventcount_cancel_wait(&ds->park);
+            else if (!retro_eventcount_commit_wait_timeout(&ds->park,
+                     key, (int64_t)DSOUND_TIMEOUT * 1000))
+               break;
+         }
       }
    }
 
-   return written;
+   return _len;
+}
+
+/* Sleep on the event the notify thread sets after every block it moves
+ * into the DirectSound buffer until at least len bytes fit in the ring,
+ * capped at half of it so the wait always ends. Returns the free space
+ * then, or 0 once the thread has died or the event stays silent past
+ * the timeout. */
+static size_t dsound_wait_writable(void *data, size_t len)
+{
+   dsound_t *ds = (dsound_t*)data;
+   size_t avail;
+   int laps     = 8;
+
+   if (len > ds->fifo_bufsize / 2)
+      len = ds->fifo_bufsize / 2;
+
+   for (;;)
+   {
+      if (!retro_atomic_load_acquire_int(&ds->thread_alive))
+         return 0;
+      avail = retro_spsc_write_avail(&ds->ring);
+      if (avail >= len)
+         return avail;
+      /* Each wait is bounded; this bounds the loop, for a thread that
+       * keeps moving blocks but never frees enough. */
+      if (--laps < 0)
+         return 0;
+      {
+         int key = retro_eventcount_prepare_wait(&ds->park);
+         if (   retro_spsc_write_avail(&ds->ring) >= len
+             || !retro_atomic_load_acquire_int(&ds->thread_alive))
+            retro_eventcount_cancel_wait(&ds->park);
+         else if (!retro_eventcount_commit_wait_timeout(&ds->park,
+                  key, (int64_t)DSOUND_TIMEOUT * 1000))
+            return 0;
+      }
+   }
 }
 
 static size_t dsound_write_avail(void *data)
@@ -564,31 +950,28 @@ static size_t dsound_write_avail(void *data)
    size_t avail;
    dsound_t *ds = (dsound_t*)data;
 
-   EnterCriticalSection(&ds->crit);
-   avail = FIFO_WRITE_AVAIL(ds->buffer);
-   LeaveCriticalSection(&ds->crit);
+   avail = retro_spsc_write_avail(&ds->ring);
    return avail;
 }
 
-static size_t dsound_buffer_size(void *data) { return 4 * 1024; }
-static bool dsound_use_float(void *data) { return false; }
-
-static void *dsound_list_new(void *u)
+static size_t dsound_frames_consumed(void *data)
 {
-   struct string_list *sl          = string_list_new();
+   dsound_t *ds = (dsound_t*)data;
+   if (!ds)
+      return 0;
+   return (size_t)(unsigned)retro_atomic_load_acquire_int(&ds->frames_played);
+}
 
-   if (!sl)
-      return NULL;
+static size_t dsound_buffer_size(void *data)
+{
+   dsound_t *ds = (dsound_t*)data;
+   return ds->fifo_bufsize;
+}
 
-#ifndef _XBOX
-#ifdef UNICODE
-   DirectSoundEnumerate((LPDSENUMCALLBACKW)enumerate_cb, sl);
-#else
-   DirectSoundEnumerate((LPDSENUMCALLBACKA)enumerate_cb, sl);
-#endif
-#endif
-
-   return sl;
+static bool dsound_use_float(void *data)
+{
+   dsound_t *ds = (dsound_t*)data;
+   return ds && ds->use_float;
 }
 
 static void dsound_device_list_free(void *u, void *slp)
@@ -597,6 +980,51 @@ static void dsound_device_list_free(void *u, void *slp)
 
    if (sl)
       string_list_free(sl);
+}
+
+static uint32_t dsound_layout(void *data)
+{
+   dsound_t *ds = (dsound_t*)data;
+   return ds ? ds->layout : AUDIO_LAYOUT_STEREO;
+}
+
+static size_t dsound_underruns(void *data)
+{
+   dsound_t *ds = (dsound_t*)data;
+   return ds ? retro_atomic_load_acquire_size(&ds->underruns) : 0;
+}
+
+/* The lend pair: the ring the pump thread moves into the secondary
+ * buffer, handed out to its wrap in whole frames. */
+static size_t dsound_write_begin(void *data, size_t len, void **region)
+{
+   dsound_t *ds = (dsound_t*)data;
+   void     *ptr = NULL;
+   size_t    span;
+   *region = NULL;
+   if (!ds || !ds->frame_size || !retro_atomic_load_acquire_int(&ds->thread_alive))
+      return 0;
+   span = retro_spsc_write_begin(&ds->ring, &ptr);
+   if (span > len)
+      span = len;
+   span -= span % ds->frame_size;
+   if (!span || !ptr)
+   {
+      retro_spsc_write_end(&ds->ring, 0);
+      return 0;
+   }
+   *region = ptr;
+   return span;
+}
+
+static ssize_t dsound_write_end(void *data, size_t len)
+{
+   dsound_t *ds = (dsound_t*)data;
+   len         -= len % ds->frame_size;
+   retro_spsc_write_end(&ds->ring, len);
+   if (len)
+      retro_eventcount_notify(&ds->feed);
+   return (ssize_t)len;
 }
 
 audio_driver_t audio_dsound = {
@@ -609,8 +1037,18 @@ audio_driver_t audio_dsound = {
    dsound_free,
    dsound_use_float,
    "dsound",
-   dsound_list_new,
+   dsound_device_list_new,
    dsound_device_list_free,
    dsound_write_avail,
    dsound_buffer_size,
+   NULL, /* write_raw */
+   dsound_wait_writable,
+   dsound_frames_consumed,
+   dsound_underruns,
+   dsound_layout,
+   NULL, /* frames_consumed_fallback */
+   NULL, /* device_clock_ppm */
+   NULL, /* thread_grant */
+   dsound_write_begin,
+   dsound_write_end
 };

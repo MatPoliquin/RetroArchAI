@@ -34,6 +34,7 @@
 #define RARCH_FIRST_META_KEY           RARCH_CUSTOM_BIND_LIST_END
 
 #define RARCH_UNMAPPED                 1024
+#define RARCH_NO_BIND                  "---"
 
 /* Specialized _MOUSE that targets the full screen regardless of viewport.
  */
@@ -45,6 +46,11 @@
  *
  * It is only used internally for overlays. */
 #define RARCH_DEVICE_POINTER_SCREEN    (RETRO_DEVICE_POINTER | 0x10000)
+
+/* Specialized _POINTER for a driver's second list of pointers (Android's
+ * second display). The frontend lists them after the main list's for
+ * RETRO_DEVICE_POINTER. */
+#define RARCH_DEVICE_POINTER_SECOND    (RETRO_DEVICE_POINTER | 0x20000)
 
 #define RARCH_DEVICE_ID_POINTER_BACK   (RETRO_DEVICE_ID_POINTER_PRESSED | 0x10000)
 
@@ -117,6 +123,8 @@ enum
 
    /* Turbo */
    RARCH_TURBO_ENABLE = RARCH_FIRST_MISC_CUSTOM_BIND,
+   /* Hold */
+   RARCH_HOLD_ENABLE,
 
    RARCH_CUSTOM_BIND_LIST_END,
 
@@ -147,6 +155,9 @@ enum
    RARCH_PLAY_REPLAY_KEY,
    RARCH_RECORD_REPLAY_KEY,
    RARCH_HALT_REPLAY_KEY,
+   RARCH_SAVE_REPLAY_CHECKPOINT_KEY,
+   RARCH_PREV_REPLAY_CHECKPOINT_KEY,
+   RARCH_NEXT_REPLAY_CHECKPOINT_KEY,
    RARCH_REPLAY_SLOT_PLUS,
    RARCH_REPLAY_SLOT_MINUS,
 
@@ -176,6 +187,10 @@ enum
    RARCH_VRR_RUNLOOP_TOGGLE,
    RARCH_RUNAHEAD_TOGGLE,
    RARCH_PREEMPT_TOGGLE,
+   RARCH_VIDEO_FILTER_TOGGLE,
+   RARCH_HEADSET_RECENTER,
+   RARCH_LASER_POINTER_TOGGLE,
+   RARCH_HEADSET_VIEW_TOGGLE,
    RARCH_FPS_TOGGLE,
    RARCH_STATISTICS_TOGGLE,
    RARCH_AI_SERVICE,
@@ -191,9 +206,6 @@ enum
 
    RARCH_BIND_LIST_END,
 
-   /* Deprecated */
-   RARCH_SEND_DEBUG_INFO,
-
    RARCH_BIND_LIST_END_NULL
 };
 
@@ -204,6 +216,10 @@ enum analog_dpad_mode
    ANALOG_DPAD_RSTICK,
    ANALOG_DPAD_LSTICK_FORCED,
    ANALOG_DPAD_RSTICK_FORCED,
+   ANALOG_DPAD_LRSTICK,
+   ANALOG_DPAD_TWINSTICK,
+   ANALOG_DPAD_LRSTICK_FORCED,
+   ANALOG_DPAD_TWINSTICK_FORCED,
    ANALOG_DPAD_LAST
 };
 
@@ -221,6 +237,43 @@ enum input_combo_type
    INPUT_COMBO_DOWN_SELECT,
    INPUT_COMBO_L2_R2,
    INPUT_COMBO_LAST
+};
+
+/* input_playerN_aim_stick: the stick that aims a port's lightgun or
+ * pointer, if one does. */
+enum input_aim_stick
+{
+   INPUT_AIM_STICK_NONE = 0,
+   INPUT_AIM_STICK_LEFT,
+   INPUT_AIM_STICK_RIGHT,
+   INPUT_AIM_STICK_LAST
+};
+
+/* input_playerN_touchpad: what the touchpad of a port's pad is to its
+ * core, where the pad has one */
+enum input_touchpad
+{
+   INPUT_TOUCHPAD_OFF = 0,
+   INPUT_TOUCHPAD_POINTER,   /* a touchscreen */
+   INPUT_TOUCHPAD_MOUSE,
+   /* a click on the left or the right half presses a RetroPad button
+    * of each (input_playerN_touchpad_left, _right) */
+   INPUT_TOUCHPAD_HALVES,
+   INPUT_TOUCHPAD_LAST
+};
+
+/* input_rotation: 0 to 3 are quarter turns, as Video Rotation counts
+ * them; this one follows that setting. */
+#define INPUT_ROTATION_AUTO 4
+
+/* What a core sees of two opposite D-Pad directions held together. */
+enum input_socd_mode
+{
+   INPUT_SOCD_OFF = 0,  /* both, as before */
+   INPUT_SOCD_NEUTRAL,  /* neither */
+   INPUT_SOCD_LAST,     /* the one pressed later */
+   INPUT_SOCD_FIRST,    /* the one pressed first */
+   INPUT_SOCD_UP        /* up; up + down only */
 };
 
 enum input_turbo_mode

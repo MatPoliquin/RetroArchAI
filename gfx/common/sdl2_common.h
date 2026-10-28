@@ -25,6 +25,13 @@
 #include "../font_driver.h"
 #include "../../retroarch.h"
 
+/* Views need SDL_SetTextureScaleMode and a custom blend mode */
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+#define SDL2_VIEWS
+#include <retro_atomic.h>
+#include "../video_views.h"
+#endif
+
 enum sd2l_flags
 {
    SDL2_FLAG_QUITTING      = (1 << 0),
@@ -35,12 +42,27 @@ typedef struct sdl2_tex
 {
    SDL_Texture *tex;
 
-   unsigned w;
-   unsigned h;
+   unsigned dims;
    size_t pitch;
    bool active;
    bool rgb32;
 } sdl2_tex_t;
+
+#ifdef HAVE_OVERLAY
+/* On-screen input overlay entry. Defined at file scope (not inside
+ * _sdl2_video) so the tag resolves to the same type in both C and C++;
+ * see the note at the 'overlays' member below. */
+struct sdl2_overlay
+{
+   SDL_Texture *tex;
+   unsigned  tex_w;
+   unsigned  tex_h;
+   float     tex_coords[4];
+   float     vert_coords[4];
+   float     alpha_mod;
+   bool      fullscreen;
+};
+#endif
 
 typedef struct _sdl2_video
 {
@@ -58,13 +80,92 @@ typedef struct _sdl2_video
 
    void *font_data;
    const font_renderer_driver_t *font_driver;
+   /* The OSD font's atlas as ARGB, its texture's source */
+   uint32_t *font_staging;
 
    uint8_t font_r;
    uint8_t font_g;
    uint8_t font_b;
 
    uint8_t flags;
+
+#ifdef HAVE_OVERLAY
+   /* On-screen input overlay state.  Each entry holds an SDL_Texture
+    * uploaded as ARGB8888 (matching the supports_rgba=false byte
+    * layout RetroArch hands us in load()) and rendered via
+    * SDL_RenderCopy with per-texture alpha modulation each frame.
+    *
+    * vert_coords / tex_coords are 4-float (x, y, w, h) tuples in
+    * 0..1 normalised space.  vertex_geom flips y to (1.0f - y) and
+    * negates h, matching d3d8 / gl / d3d9_common; vertex_geom
+    * comments document the rationale - we undo the flip at render
+    * time in sdl2_overlays_render.
+    *
+    * Note: struct sdl2_overlay is defined at file scope (above this
+    * typedef) rather than inline here. Defining a struct inside
+    * another struct's body scopes the tag to the enclosing type in
+    * C++ (sdl2_video::sdl2_overlay), so under CXX_BUILD a file-scope
+    * 'struct sdl2_overlay *' in sdl2_gfx.c would refer to a different,
+    * incomplete type. A top-level definition keeps a single shared
+    * type in both C and C++. */
+   struct sdl2_overlay *overlays;
+   unsigned overlays_size;
+   bool overlays_enabled;
+   /* overlays[].tex are the overlay pack's (load_textures) */
+   bool overlays_borrowed;
+#endif
+
+   /* What a display draw hands SDL_RenderGeometry. Grown as needed and
+    * kept, rather than alloca'd per draw: the count comes from the
+    * caller, so the stack cost was whatever geometry someone asked to
+    * draw - a nine-slice is 52 vertices and a pipeline is thousands. */
+   void   *display_verts;
+   size_t  display_verts_cap;
+   int    *display_indices;
+   size_t  display_indices_cap;
+
+#ifdef SDL2_VIEWS
+   struct
+   {
+      video_views_chains_t  chains;
+      video_views_target_t  canvas_target;
+      video_views_target_t  ui_target;
+      video_views_ui_dims_t saved;
+      /* What the last frame drew, kept for the viewport readback to
+       * draw again: its map, layout, chains and the window's size */
+      video_views_map_t     map;
+      video_views_layout_t  layout;
+      void                 *drawn[RETRO_VIDEO_VIEWS_MAX];
+      unsigned              dims;
+      /* Each view of the frame, written straight into its own texture */
+      SDL_Texture          *tex[RETRO_VIDEO_VIEWS_MAX];
+      unsigned              tex_dims[RETRO_VIDEO_VIEWS_MAX];
+      bool                  tex_rgb32[RETRO_VIDEO_VIEWS_MAX];
+      SDL_Texture          *canvas;
+      SDL_Texture          *ui;
+      SDL_BlendMode         premultiplied;
+      unsigned              frame_dims;
+      /* The game viewport's size while the UI layer is drawn */
+      unsigned              vp_dims;
+      /* For get_flags on the main thread: whether views may be drawn,
+       * and whether the last frame with a map drew it whole */
+      retro_atomic_int_t    allowed;
+      retro_atomic_int_t    fallback;
+      bool                  tried;
+      /* Render targets, for the canvas, and the premultiplied blend the
+       * UI layer is placed with */
+      bool                  targets;
+      bool                  layer;
+      bool                  active;
+      bool                  blend;
+      bool                  direct_seen;
+   } views;
+#endif
 } sdl2_video_t;
+
+/* Keeps the pointer in the SDL2 video driver's window, or lets it go.
+ * Nothing happens when that is not the video driver in use. */
+void sdl2_video_grab_window(bool state);
 
 void sdl2_set_handles(void *data, enum rarch_display_type 
       display_type);

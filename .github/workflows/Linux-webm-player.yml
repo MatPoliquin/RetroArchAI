@@ -1,0 +1,82 @@
+name: CI builtin media player
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'cores/libretro-media/**'
+      - 'samples/cores/webm_player/**'
+      - 'samples/gfx/d3d11_video_decode/**'
+      - 'libretro-common/samples/formats/audio_transfer/**'
+      - 'libretro-common/formats/**'
+      - 'libretro-common/include/formats/**'
+      - '.github/workflows/Linux-webm-player.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'cores/libretro-media/**'
+      - 'samples/cores/webm_player/**'
+      - 'samples/gfx/d3d11_video_decode/**'
+      - 'libretro-common/samples/formats/audio_transfer/**'
+      - 'libretro-common/formats/**'
+      - 'libretro-common/include/formats/**'
+      - '.github/workflows/Linux-webm-player.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  player:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APT_PKGS: build-essential ffmpeg gcc-mingw-w64-x86-64 wine64
+    steps:
+      - uses: actions/checkout@v5
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+      # Bounded, with the main archive tried when the mirror stalls: a
+      # plain apt-get install stalled on it took the job's 15 minutes
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+      - name: Generate media
+        working-directory: samples/cores/webm_player
+        run: python3 mkfixtures.py
+      - name: Metadata-only demuxed audio setup
+        run: |
+          make -j2 -C libretro-common/samples/formats/audio_transfer check-empty SANITIZER=address,undefined SAMPLE_OBJDIR=obj-player-meta
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      - name: Run the builtin core without FFmpeg
+        working-directory: samples/cores/webm_player
+        run: |
+          set -eu
+          make -j2 check SANITIZER=address,undefined SAMPLE_OBJDIR=obj-ci-asan TARGET=webm_player_ci_asan
+          make -j2 check AUDIO=0 SAMPLE_OBJDIR=obj-noaudio TARGET=webm_player_noaudio SANITIZER=address,undefined
+          make -j2 check MP4=0 SAMPLE_OBJDIR=obj-webm TARGET=webm_player_webm SANITIZER=address,undefined
+          make -j2 check THREADS=0 SAMPLE_OBJDIR=obj-nothreads TARGET=webm_player_nothreads SANITIZER=address,undefined
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      - name: Windows core host
+        working-directory: samples/cores/webm_player
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make -j2 check CC=x86_64-w64-mingw32-gcc OS=Windows_NT EXE=.exe SAMPLE_OBJDIR=obj-win RUNNER=wine

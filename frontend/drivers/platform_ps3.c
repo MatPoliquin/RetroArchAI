@@ -19,6 +19,7 @@
 #include <sys/process.h>
 #if !defined(__PSL1GHT__)
 #include <sysutil/sysutil_common.h>
+#include <sysutil/sysutil_userinfo.h>
 #endif
 #if defined (IS_SALAMANDER) && !defined(__PSL1GHT__)
 #include <netex/net.h>
@@ -50,6 +51,7 @@
 #include "../../file_path_special.h"
 #include "../../paths.h"
 #include "../../verbosity.h"
+#include "platform_ps3_paths.h"
 
 #if !defined(IS_SALAMANDER) && defined(HAVE_NETWORKING)
 #include "../../network/netplay/netplay.h"
@@ -59,6 +61,16 @@
 #define EMULATOR_CONTENT_DIR "SSNE10001"
 #else
 #define EMULATOR_CONTENT_DIR "SSNE10000"
+#endif
+
+#ifdef __PSL1GHT__
+struct ps3_user_info
+{
+   uint32_t id;
+   char name[64];
+};
+
+extern int ps3_user_info_get_stat(uint32_t id, struct ps3_user_info *info);
 #endif
 
 #ifndef __PSL1GHT__
@@ -76,18 +88,6 @@ SYS_PROCESS_PARAM(1001, 0x200000)
 #ifdef HAVE_MULTIMAN
 #define MULTIMAN_SELF_FILE "/dev_hdd0/game/BLES80608/USRDIR/RELOAD.SELF"
 static bool multiman_detected  = false;
-#endif
-#endif
-
-#ifdef HAVE_MEMINFO
-typedef struct {
-   uint32_t total;
-   uint32_t avail;
-} sys_memory_info_t;
-#ifdef __PSL1GHT__
-#define sys_memory_get_user_memory_size(x) lv2syscall1(352, x)
-#else
-#define sys_memory_get_user_memory_size(x) system_call_1(352, x)
 #endif
 #endif
 
@@ -129,9 +129,6 @@ static void callback_sysutil_exit(uint64_t status,
 
 static void fill_derived_paths(void)
 {
-    strlcpy(g_defaults.dirs[DEFAULT_DIR_CONTENT_HISTORY],
-            g_defaults.dirs[DEFAULT_DIR_PORT],
-            sizeof(g_defaults.dirs[DEFAULT_DIR_CONTENT_HISTORY]));
     fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE],
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "cores", sizeof(g_defaults.dirs[DEFAULT_DIR_CORE]));
@@ -139,26 +136,12 @@ static void fill_derived_paths(void)
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "info",
 		       sizeof(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]));
-    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_MENU_CONFIG],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "config", sizeof(g_defaults.dirs[DEFAULT_DIR_MENU_CONFIG]));
-    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_REMAP],
-		       g_defaults.dirs[DEFAULT_DIR_MENU_CONFIG],
-		       "remaps", sizeof(g_defaults.dirs[DEFAULT_DIR_REMAP]));
-    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_SAVESTATE],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "savestates", sizeof(g_defaults.dirs[DEFAULT_DIR_SAVESTATE]));
-    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_SRAM],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "savefiles", sizeof(g_defaults.dirs[DEFAULT_DIR_SRAM]));
     fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_SYSTEM],
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "system", sizeof(g_defaults.dirs[DEFAULT_DIR_SYSTEM]));
     fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_SHADER],
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "shaders_cg", sizeof(g_defaults.dirs[DEFAULT_DIR_SHADER]));
-    fill_pathname_join(g_defaults.path_config, g_defaults.dirs[DEFAULT_DIR_PORT],
-		       FILE_PATH_MAIN_CONFIG,  sizeof(g_defaults.path_config));
     fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_OVERLAY],
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "overlays", sizeof(g_defaults.dirs[DEFAULT_DIR_OVERLAY]));
@@ -171,30 +154,57 @@ static void fill_derived_paths(void)
     fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_DATABASE],
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "database/rdb", sizeof(g_defaults.dirs[DEFAULT_DIR_DATABASE]));
-    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_PLAYLIST],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "playlists", sizeof(g_defaults.dirs[DEFAULT_DIR_PLAYLIST]));
     fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS],
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "downloads", sizeof(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS]));
     fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CHEATS],
 		       g_defaults.dirs[DEFAULT_DIR_PORT], "cheats",
 		       sizeof(g_defaults.dirs[DEFAULT_DIR_CHEATS]));
-    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_AUTOCONFIG],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "autoconfig", sizeof(g_defaults.dirs[DEFAULT_DIR_AUTOCONFIG]));
-    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_LOGS],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "logs", sizeof(g_defaults.dirs[DEFAULT_DIR_LOGS]));
 	fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_THUMBNAILS],
 		       g_defaults.dirs[DEFAULT_DIR_PORT],
 		       "thumbnails", sizeof(g_defaults.dirs[DEFAULT_DIR_THUMBNAILS]));
-	fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_REMAP],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "remaps", sizeof(g_defaults.dirs[DEFAULT_DIR_REMAP]));
-	fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_MENU_CONFIG],
-		       g_defaults.dirs[DEFAULT_DIR_PORT],
-		       "config", sizeof(g_defaults.dirs[DEFAULT_DIR_MENU_CONFIG]));
+}
+
+static bool frontend_ps3_init_user_paths(void)
+{
+   char path[DIR_MAX_LENGTH];
+   RFILE *file;
+   unsigned user_id;
+   bool writable;
+#ifdef __PSL1GHT__
+   struct ps3_user_info info;
+   if (   sysModuleIsLoaded(SYSMODULE_USERINFO) != 0
+       && sysModuleLoad(SYSMODULE_USERINFO) < 0)
+      return false;
+   if (ps3_user_info_get_stat(0, &info) < 0)
+      return false;
+   user_id = info.id;
+#else
+   CellUserInfoUserStat info;
+   if (   cellSysmoduleIsLoaded(CELL_SYSMODULE_SYSUTIL_USERINFO) != 0
+       && cellSysmoduleLoadModule(CELL_SYSMODULE_SYSUTIL_USERINFO) < 0)
+      return false;
+   if (cellUserInfoGetStat(CELL_SYSUTIL_USERID_CURRENT, &info) < 0)
+      return false;
+   user_id = info.id;
+#endif
+   if (!ps3_user_paths_init(user_id))
+      return false;
+
+   fill_pathname_basedir(path, g_defaults.path_config, sizeof(path));
+   if (!path_mkdir(path))
+      return false;
+   fill_pathname_join(path, path, ".write-test", sizeof(path));
+   file = filestream_open(path, RETRO_VFS_FILE_ACCESS_WRITE,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   if (!file)
+      return false;
+   writable = filestream_write(file, "", 1) == 1;
+   if (filestream_close(file) < 0)
+      writable = false;
+   if (filestream_delete(path) != 0 || !writable)
+      return false;
+   return ps3_user_data_migrate(g_defaults.dirs[DEFAULT_DIR_PORT]);
 }
 
 static void use_app_path(char *content_info_path)
@@ -209,6 +219,7 @@ static void frontend_ps3_get_env(int *argc, char *argv[],
       void *args, void *params_data)
 {
    char content_info_path[PATH_MAX_LENGTH];
+   bool user_paths;
 #ifndef __PSL1GHT__
    CellGameContentSize size;
    unsigned int type, attributes;
@@ -224,14 +235,6 @@ static void frontend_ps3_get_env(int *argc, char *argv[],
 
 #if defined(HAVE_LOGGER)
    logger_init();
-#elif defined(HAVE_FILE_LOGGER)
-   retro_main_log_file_init("/dev_hdd0/game/"
-      EMULATOR_CONTENT_DIR "/USRDIR/retroarch-log.txt", false);
-#endif
-#elif defined(__PSL1GHT__)
-#ifdef HAVE_FILE_LOGGER
-   retro_main_log_file_init("/dev_hdd0/game/"
-      EMULATOR_CONTENT_DIR "/USRDIR/retroarch-log-salamander.txt", false);
 #endif
 #endif
 
@@ -257,7 +260,7 @@ static void frontend_ps3_get_env(int *argc, char *argv[],
 #endif
 #endif
 #ifndef IS_SALAMANDER
-   if (params && *argc > 1 && !string_is_empty(argv[1]))
+   if (params && *argc > 1 && (argv[1] && *argv[1]))
 #ifdef HAVE_NETWORKING
    /* If the process was forked for netplay purposes,
       DO NOT touch the arguments. */
@@ -277,6 +280,22 @@ static void frontend_ps3_get_env(int *argc, char *argv[],
 #endif
 
    fill_derived_paths();
+   if (!(user_paths = frontend_ps3_init_user_paths()))
+      ps3_legacy_paths_init(g_defaults.dirs[DEFAULT_DIR_PORT]);
+
+#ifdef HAVE_FILE_LOGGER
+   fill_pathname_resolve_relative(content_info_path, g_defaults.path_config,
+#ifdef IS_SALAMANDER
+         "retroarch-log-salamander.txt",
+#else
+         "retroarch-log.txt",
+#endif
+         sizeof(content_info_path));
+   retro_main_log_file_init(content_info_path, false);
+#endif
+   if (!user_paths)
+      RARCH_WARN("[PS3] The current user's directory is unusable, "
+            "using the shared one.\n");
 
 #ifndef IS_SALAMANDER
    if (verbosity)
@@ -284,7 +303,7 @@ static void frontend_ps3_get_env(int *argc, char *argv[],
    else
       verbosity_disable();
 
-   dir_check_defaults("custom.ini");
+   dir_check_defaults(NULL);
 #endif
 }
 
@@ -459,7 +478,7 @@ static void frontend_ps3_exec(const char *path, bool should_load_game)
       if (!netplay_driver_ctl(RARCH_NETPLAY_CTL_GET_FORK_ARGS,
             (void*)arg_data))
 #endif
-      if (!string_is_empty(content))
+      if (content && *content)
       {
          strlcpy(game_path, content, sizeof(game_path));
          arg_data[0] = game_path;
@@ -532,11 +551,6 @@ static void frontend_ps3_exitspawn(char *s, size_t len, char *args)
       verbosity_disable();
 #endif
 #endif
-}
-
-static int frontend_ps3_get_rating(void)
-{
-   return 10;
 }
 
 enum frontend_architecture frontend_ps3_get_arch(void)
@@ -634,22 +648,6 @@ static void frontend_ps3_process_args(int *argc, char *argv[])
 #endif
 }
 
-#ifdef HAVE_MEMINFO
-static size_t frontend_ps3_get_mem_total(void)
-{
-   sys_memory_info_t mem_info;
-   sys_memory_get_user_memory_size((u64)&mem_info);
-   return mem_info.total;
-}
-
-static size_t frontend_ps3_get_mem_used(void)
-{
-   sys_memory_info_t mem_info;
-   sys_memory_get_user_memory_size((u64)&mem_info);
-   return mem_info.avail;
-}
-#endif
-
 frontend_ctx_driver_t frontend_ctx_ps3 = {
    frontend_ps3_get_env,
    frontend_ps3_init,
@@ -665,18 +663,10 @@ frontend_ctx_driver_t frontend_ctx_ps3 = {
    NULL,                         /* shutdown */
    NULL,                         /* get_name */
    NULL,                         /* get_os */
-   frontend_ps3_get_rating,      /* get_rating */
    NULL,                         /* load_content */
    frontend_ps3_get_arch,        /* get_architecture */
    NULL,                         /* get_powerstate */
    frontend_ps3_parse_drive_list,/* parse_drive_list */
-#ifdef HAVE_MEMINFO
-   frontend_ps3_get_mem_total,
-   frontend_ps3_get_mem_used,
-#else
-   NULL,                         /* get_total_mem */
-   NULL,                         /* get_free_mem */
-#endif
    NULL,                         /* install_signal_handler */
    NULL,                         /* get_sighandler_state */
    NULL,                         /* set_sighandler_state */
@@ -685,14 +675,13 @@ frontend_ctx_driver_t frontend_ctx_ps3 = {
    NULL,                         /* detach_console */
    NULL,                         /* get_lakka_version */
    NULL,                         /* set_screen_brightness */
-   NULL,                         /* watch_path_for_changes */
-   NULL,                         /* check_for_path_changes */
    NULL,                         /* set_sustained_performance_mode */
    NULL,                         /* get_cpu_model_name */
    NULL,                         /* get_user_language */
    NULL,                         /* is_narrator_running */
    NULL,                         /* accessibility_speak */
    NULL,                         /* set_gamemode */
+   NULL, /* get_display_type */
    "ps3",                        /* ident */
    NULL                          /* get_video_driver */
 };

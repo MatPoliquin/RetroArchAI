@@ -1,0 +1,182 @@
+name: CI Windows views under Wine
+
+# Views on the GDI, D3D8, D3D9 HLSL, D3D10, D3D11 and D3D12 drivers, end
+# to end: retroarch.exe cross-built with mingw-w64 runs the video_views
+# test core under Wine, on a virtual display through Mesa's software
+# rasterisers (D3D12 on Wine's vkd3d over lavapipe), and
+# samples/cores/video_views/e2e/run.py checks the screen in each stereo
+# mode, from the core's software frames and its D3D11 and D3D12
+# textures, with the menu laid out per eye and the pointer over it.
+# Wine's own shader compiler can't take the drivers' HLSL, so vkd3d's,
+# from its release, is put in as D3DCompiler_47.dll.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'gfx/common/d3d9_*'
+      - 'gfx/drivers/gdi_gfx.c'
+      - 'gfx/common/gdi_defines.h'
+      - 'gfx/drivers/d3d8.c'
+      - 'gfx/drivers/d3d9hlsl.c'
+      - 'gfx/drivers/d3d10.c'
+      - 'gfx/drivers/d3d11.c'
+      - 'gfx/drivers/d3d12.c'
+      - 'gfx/drivers/d3d_shaders/views_sm*.hlsl.h'
+      - 'gfx/video_views.*'
+      - 'gfx/video_views_draw.h'
+      - 'gfx/video_driver.c'
+      - 'gfx/video_thread_wrapper.*'
+      - 'samples/cores/video_views/**'
+      - '.github/workflows/Windows-wine-views.yml'
+  pull_request:
+    paths:
+      - 'gfx/common/d3d9_*'
+      - 'gfx/drivers/gdi_gfx.c'
+      - 'gfx/common/gdi_defines.h'
+      - 'gfx/drivers/d3d8.c'
+      - 'gfx/drivers/d3d9hlsl.c'
+      - 'gfx/drivers/d3d10.c'
+      - 'gfx/drivers/d3d11.c'
+      - 'gfx/drivers/d3d12.c'
+      - 'gfx/drivers/d3d_shaders/views_sm*.hlsl.h'
+      - 'gfx/video_views.*'
+      - 'gfx/video_views_draw.h'
+      - 'gfx/video_driver.c'
+      - 'gfx/video_thread_wrapper.*'
+      - 'samples/cores/video_views/**'
+      - '.github/workflows/Windows-wine-views.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows-wine-views:
+    name: Views on GDI, D3D8, D3D9, D3D10, D3D11 and D3D12 under Wine
+    runs-on: ubuntu-24.04
+    env:
+      APT_PKGS: build-essential ccache gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-tools wine64 xvfb xauth imagemagick libgl1-mesa-dri mesa-vulkan-drivers libvulkan1 autoconf automake libtool flex bison pkg-config libvulkan-dev spirv-headers python3
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Build vkd3d's shader compiler for Windows
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          v="$RUNNER_TEMP/vkd3d"
+          git clone -q --depth 1 --branch vkd3d-2.1 \
+            https://gitlab.winehq.org/wine/vkd3d.git "$v"
+          cd "$v"
+          ./autogen.sh > /dev/null
+          # Its headers from the host; vulkan-1.dll is loaded at run
+          # time, so an import library naming it does.
+          mkdir -p inc lib build
+          ln -s /usr/include/vulkan inc/vulkan
+          ln -s /usr/include/vk_video inc/vk_video
+          ln -s /usr/include/spirv inc/spirv
+          printf 'LIBRARY vulkan-1.dll\nEXPORTS\nvkGetInstanceProcAddr\n' \
+            > lib/vulkan-1.def
+          x86_64-w64-mingw32-dlltool -d lib/vulkan-1.def \
+            -l lib/libvulkan-1.a
+          cd build
+          ../configure -q --host=x86_64-w64-mingw32 --disable-tests \
+            --disable-demos WIDL=x86_64-w64-mingw32-widl \
+            CPPFLAGS="-I$v/inc" LDFLAGS="-L$v/lib"
+          make -j$(nproc) > /dev/null
+          cp .libs/libvkd3d-utils-1.dll "$GITHUB_WORKSPACE/D3DCompiler_47.dll"
+          cp .libs/libvkd3d-shader-1.dll .libs/libvkd3d-1.dll \
+            "$GITHUB_WORKSPACE/"
+
+      - name: Build retroarch.exe with mingw-w64 (D3D8, D3D9, D3D10, D3D11, D3D12, slang)
+        shell: bash
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache -M 250M
+          ./configure --host=x86_64-w64-mingw32 \
+                      --disable-qt --disable-vulkan --disable-ffmpeg \
+                      --disable-cheevos --disable-discord --enable-d3d8 \
+                      --disable-sdl --disable-sdl2
+          make -j$(nproc) CC="ccache x86_64-w64-mingw32-gcc" \
+                          CXX="ccache x86_64-w64-mingw32-g++"
+          ccache -s
+          # The C and C++ runtimes it was linked against
+          for f in libstdc++-6.dll libgcc_s_seh-1.dll; do
+            cp "$(ls /usr/lib/gcc/x86_64-w64-mingw32/*-win32/$f | head -n 1)" .
+          done
+          make -C samples/cores/video_views DLL=1 CC=x86_64-w64-mingw32-gcc
+
+      - name: Views on GDI, D3D8, D3D9, D3D10, D3D11 and D3D12, end to end (Wine, Xvfb, llvmpipe, lavapipe)
+        shell: bash
+        run: |
+          set -eu
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          export LIBGL_ALWAYS_SOFTWARE=1
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          # Initialize the prefix with a display and wait for setup to finish.
+          WINEDEBUG=-all timeout 120 xvfb-run -a sh -c 'wineboot -i && wineserver -w'
+          RA_E2E_WINE=1 python3 samples/cores/video_views/e2e/run.py \
+            ./retroarch.exe "$RUNNER_TEMP/views-e2e" gdi d3d8 d3d9_hlsl d3d10 d3d11 d3d12
+          # And d3d9_hlsl on the device of a system without Direct3D9Ex
+          RETROARCH_D3D9EX=0 RA_E2E_WINE=1 python3 samples/cores/video_views/e2e/run.py \
+            ./retroarch.exe "$RUNNER_TEMP/views-e2e-legacy" d3d9_hlsl
+
+      - name: Preserve views logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-wine-views-logs
+          path: ${{ runner.temp }}/views-e2e/**/*.log
+          if-no-files-found: ignore
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

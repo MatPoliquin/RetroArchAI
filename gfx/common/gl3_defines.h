@@ -26,12 +26,6 @@
 #include "../../config.h"
 #endif
 
-#include <retro_inline.h>
-#include <gfx/math/matrix_4x4.h>
-#include <gfx/scaler/scaler.h>
-#include <glsym/glsym.h>
-#include <formats/image.h>
-
 #include "../video_driver.h"
 #include "../drivers_shader/shader_gl3.h"
 
@@ -57,88 +51,25 @@ enum gl3_flags
    GL3_FLAG_QUITTING               = (1 << 10),
    GL3_FLAG_SHOULD_RESIZE          = (1 << 11),
    GL3_FLAG_KEEP_ASPECT            = (1 << 12),
-   GL3_FLAG_FRAME_DUPE_LOCK        = (1 << 13)
+   GL3_FLAG_FRAME_DUPE_LOCK        = (1 << 13),
+   /* The threaded wrapper's hardware ring is driving this driver: the
+    * core's context is current on the main thread, so this thread
+    * never takes it, and the frame reads the ring's slot. */
+   GL3_FLAG_HW_RING                = (1 << 14),
+   /* Latched at init: the wrapper was active and the driver
+    * configuration allowed a hw ring when this context came up.
+    * core_context_is_mains() reads this instead of consulting the
+    * live settings from the frame path (the video thread, with the
+    * main thread running free). */
+   GL3_FLAG_HW_RING_EXPECTED = (1 << 16),
+   /* overlay_tex names belong to the overlay pack (load_textures):
+    * not deleted with the page. */
+   GL3_FLAG_OVERLAY_BORROWED       = (1 << 17),
+   /* GPU recording is on: taken from the frame the frontend hands over,
+    * so this thread never reads the recording state the main thread
+    * writes (video_frame_info_t::gpu_recording). */
+   GL3_FLAG_GPU_RECORDING          = (1 << 15)
 };
-
-struct gl3_streamed_texture
-{
-   GLuint tex;
-   unsigned width;
-   unsigned height;
-};
-
-
-typedef struct gl3
-{
-   const gfx_ctx_driver_t *ctx_driver;
-   void *ctx_data;
-   gl3_filter_chain_t *filter_chain;
-   gl3_filter_chain_t *filter_chain_default;
-   GLuint *overlay_tex;
-   float *overlay_vertex_coord;
-   float *overlay_tex_coord;
-   float *overlay_color_coord;
-   GLsync fences[GL_CORE_NUM_FENCES];
-   void *readback_buffer_screenshot;
-   struct scaler_ctx pbo_readback_scaler;
-
-   video_info_t video_info;
-   video_viewport_t vp;
-   struct gl3_viewport filter_chain_vp;
-   struct gl3_streamed_texture textures[GL_CORE_NUM_TEXTURES];
-
-   GLuint vao;
-   GLuint menu_texture;
-   GLuint pbo_readback[GL_CORE_NUM_PBOS];
-
-   struct
-   {
-      GLuint alpha_blend;
-      GLuint font;
-      GLuint ribbon;
-      GLuint ribbon_simple;
-      GLuint snow_simple;
-      GLuint snow;
-      GLuint bokeh;
-      struct gl3_buffer_locations alpha_blend_loc;
-      struct gl3_buffer_locations font_loc;
-      struct gl3_buffer_locations ribbon_loc;
-      struct gl3_buffer_locations ribbon_simple_loc;
-      struct gl3_buffer_locations snow_simple_loc;
-      struct gl3_buffer_locations snow_loc;
-      struct gl3_buffer_locations bokeh_loc;
-   } pipelines;
-
-
-   unsigned video_width;
-   unsigned video_height;
-   unsigned overlays;
-   unsigned version_major;
-   unsigned version_minor;
-   unsigned out_vp_width;
-   unsigned out_vp_height;
-   unsigned rotation;
-   unsigned textures_index;
-   unsigned scratch_vbo_index;
-   unsigned fence_count;
-   unsigned pbo_readback_index;
-   unsigned hw_render_max_width;
-   unsigned hw_render_max_height;
-   GLuint scratch_vbos[GL_CORE_NUM_VBOS];
-   GLuint hw_render_texture;
-   GLuint hw_render_fbo;
-   GLuint hw_render_rb_ds;
-
-   float menu_texture_alpha;
-   math_matrix_4x4 mvp;                /* float alignment */
-   math_matrix_4x4 mvp_yflip;
-   math_matrix_4x4 mvp_no_rot;
-   math_matrix_4x4 mvp_no_rot_yflip;
-
-   uint16_t flags;
-
-   bool pbo_readback_valid[GL_CORE_NUM_PBOS];
-} gl3_t;
 
 RETRO_END_DECLS
 

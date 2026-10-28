@@ -1,0 +1,1087 @@
+name: CI Vulkan/GL/D3D11 [idle waits + driver harness]
+
+# Two checks on the Vulkan driver, both born from the same bug: a
+# vkQueuePresentKHR under queue_lock waiting for GPU work that a
+# hardware core could only submit through lock_queue (parallel-GS /
+# Granite stopped the frontend that way). Every vkQueueWaitIdle and
+# vkDeviceWaitIdle in the driver had the same shape - a whole-queue
+# drain, under the lock the core needs, on shader change, overlay
+# load, font free and swapchain resize - and all of them were replaced
+# by waits on the driver's own fences.
+#
+# 1. Idle-wait check: tools/vulkan_idle_wait_check.c fails on any
+#    vkQueueWaitIdle/vkDeviceWaitIdle in the Vulkan code that is not
+#    on tools/vulkan_idle_wait_allow.list, and on a stale entry.
+#    tools/d3d12_idle_wait_check.c holds the D3D12 driver to the same:
+#    a queue drain or a fence wait not on
+#    tools/d3d12_idle_wait_allow.list fails, so the frame paths, which
+#    wait only for their predecessor's own signal, stay that way. A
+#    ResizeBuffers with no drain before it in its function fails too:
+#    that signal is behind the frame's list, not its Present, and the
+#    swap chain resized on a software core's first frame while the
+#    Present still held a back buffer.
+#
+# 2. Validation harness: the threaded-video harness (real frontend,
+#    real driver, only main() replaced) run on the Vulkan driver over
+#    lavapipe under Xvfb, with the tree built VULKAN_DEBUG=1 so
+#    VK_LAYER_KHRONOS_validation is loaded. The lanes exercise driver
+#    reinit under the wrapper, geometry changes, async texture loads,
+#    font marshalling, present repeat and resize; the layer turns a
+#    texture destroyed while a frame still samples it, a barrier
+#    inside a render pass, or an object leaked at device teardown into
+#    a logged error, and the check-vulkan target fails on any. Those
+#    three were the pre-existing findings the lane produced on its
+#    first run.
+#
+# 3. TSan harness: the same lanes on the same driver, built with
+#    -fsanitize=thread. The null-driver TSan job never runs driver
+#    code on the video thread, so a plain field shared between the
+#    frame thread and a driver's frame (the shader chains'
+#    FrameTimeDelta was one) only shows up here. The layer and the
+#    ICD are not instrumented and are suppressed; frontend races fail.
+#    An address,undefined build of the same runs beside it, and the
+#    context-only vulkan_validation sample runs on its own.
+#
+# 5. D3D11 harness: the same lanes on the d3d11 driver, on a Windows
+#    runner through MSYS2's MinGW64 build of the tree (no Qt, so main
+#    stays in retroarch.o for the harness to replace) and the software
+#    adapter the runner exposes (Microsoft Basic Render Driver, which
+#    is WARP). The first real-driver coverage the Windows drivers get.
+#
+# 4. GL harness: the same lanes on the gl and glcore drivers over
+#    llvmpipe (LIBGL_ALWAYS_SOFTWARE=1), release and TSan. A GL
+#    context is owned by one thread at a time, so anything the
+#    frontend does against the driver from the wrong thread is an X
+#    BadAccess here rather than a corruption elsewhere; the first run
+#    caught the OSD font rebuild doing exactly that.
+#
+# 6. Teardown-order check: tools/vulkan_teardown_order_check.c holds
+#    the order the driver retires a frame's objects in - command
+#    pools, then descriptor pools, then the pipelines that own the set
+#    layout - and the rule that destroying a descriptor pool is what
+#    frees its sets. The other order is legal Vulkan and the
+#    validation layer passes it, so the harness lanes above cannot see
+#    it; a driver that walks its own back references as a pool is
+#    destroyed faults inside vkDestroyDescriptorPool at exit, which is
+#    what MoltenVK did.
+#
+# 7. OpenXR build: the validation harness once more on a tree
+#    configured --enable-openxr, without a headset. The headset checks
+#    sit in the frame path's present chain, so the window path is only
+#    proven in a build that compiles them; the GPU readback lane is
+#    where a misplaced one sent a read-back frame to present twice.
+#
+# 8. SDL3 views: the views e2e cases on the SDL3 driver, against an SDL3
+#    built from a pinned release with its renderer, the tree configured
+#    with SDL3 in place of SDL2.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  wait-checkers:
+    name: Vulkan and D3D12 wait and teardown checkers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Vulkan idle-wait allowlist, self-test
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/vulkan_idle_wait_check.c --selftest
+
+      - name: Vulkan idle-wait allowlist, tree check
+        # Each checker runs even when one before it fails.
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/vulkan_idle_wait_check.c
+
+      - name: Vulkan NULL-submit check, self-test
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/vulkan_null_submit_check.c --selftest
+
+      - name: Vulkan NULL-submit check, tree check
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/vulkan_null_submit_check.c
+
+      - name: D3D12 wait allowlist, self-test
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/d3d12_idle_wait_check.c --selftest
+
+      - name: D3D12 wait allowlist, tree check
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/d3d12_idle_wait_check.c
+
+      - name: Vulkan teardown order, self-test
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/vulkan_teardown_order_check.c --selftest
+
+      - name: Vulkan teardown order, tree check
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          tools/check.sh tools/vulkan_teardown_order_check.c
+
+  vulkan-validation-harness:
+    name: Threaded-video harness on Vulkan (lavapipe, validation layer)
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev libgl1-mesa-dri libgl-dev imagemagick libsdl2-dev ccache
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Configure
+        # Non-Qt, as the harness requires (with Qt, main() lives in
+        # ui_qt.o). Everything else at its default so the Vulkan driver
+        # is built with every path a release build has.
+        run: |
+          ./configure --disable-qt
+          grep -q '^HAVE_VULKAN = 1' config.mk
+
+      - name: Build with VULKAN_DEBUG=1
+        # VULKAN_DEBUG enables VK_LAYER_KHRONOS_validation and the
+        # debug messenger that reports through RARCH_ERR. It is a
+        # tree-wide define: vulkan_context_t carries a member under it,
+        # so every TU that includes vulkan_common.h must see it.
+        # GFX_INSTRUMENT counts what the image and surface paths do -
+        # uploads, in-place updates, allocating posts, copies - so the
+        # harness lanes below can hold the budgets the paths are
+        # written to and print what a run cost. This is the one leg
+        # that carries it: under a sanitizer the timings mean nothing,
+        # and the counters change no behaviour.
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN) VULKAN_DEBUG=1 GFX_INSTRUMENT=1
+          test -x retroarch
+
+      - name: Run the harness on Vulkan under the validation layer
+        shell: bash
+        run: |
+          set -eu
+          Xvfb :99 -screen 0 640x480x24 &
+          for i in $(seq 1 15); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          export DISPLAY=:99
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          # The harness build reuses the tree's own compile and link
+          # lines, so it has to name the same build: VK_DEBUG=1. Its
+          # surface and overlay-page lanes run the driver's real
+          # in-place texture update and its borrowed-texture overlay
+          # page here, under the validation layer, and with the tree
+          # built GFX_INSTRUMENT=1 they print their baselines and hold
+          # the budgets: one texture per streaming surface, no
+          # allocation per post, no copy, a 4K submit that stays a
+          # descriptor hand-off.
+          SAN=none VK_DEBUG=1 GFX_INSTRUMENT=1 CYCLES=2 make -C samples/gfx/threaded_video check-vulkan
+          # Once more with the harness core pushing XRGB8888: the
+          # driver samples a linear 32-bit image itself where it
+          # converts RGB565 with a compute pass, so a lent frame and
+          # a window into it take the other upload path (the one
+          # beetle-psx takes).
+          HARNESS_CORE_XRGB8888=1 SAN=none VK_DEBUG=1 GFX_INSTRUMENT=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          # And with the first map of a buffer-chain block refused on
+          # each device: the driver must not suballocate from a buffer
+          # it could not map.
+          SAN=none VK_DEBUG=1 GFX_INSTRUMENT=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan-mapfail
+          # And with the harness core as a Vulkan hardware core, which
+          # runs its own lanes alone: the core's image must not be drawn
+          # from once the core has destroyed it - at a content close,
+          # unthreaded and under the wrapper, and after a set_image(NULL)
+          # - a dupe of a hardware frame must not re-submit a fence that
+          # is already signalled, and a frame the push replaces must not
+          # leave its semaphore signalled for the core to signal again.
+          # Each is a validation error here, and on lavapipe a crash.
+          HARNESS_CORE_HW_VULKAN=1 SAN=none VK_DEBUG=1 GFX_INSTRUMENT=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          make -C samples/gfx/threaded_video clean
+          # And as a core that creates the device itself, through the
+          # negotiation interface's create_device - Beetle PSX, for one.
+          # That device has the extensions the frontend requires and
+          # none of the optional ones it adds to a device of its own, so
+          # anything the driver or the filter chain does that leans on
+          # an optional extension is a validation error here and nowhere
+          # else. The filter chain's mirror-clamp samplers were.
+          HARNESS_CORE_HW_VULKAN=2 SAN=none VK_DEBUG=1 GFX_INSTRUMENT=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          make -C samples/gfx/threaded_video clean
+          # And as a core that caches its context across a video reinit
+          # (Azahar): the instance comes back from the cache with what
+          # it was created with, HDR support included.
+          HARNESS_CORE_HW_VULKAN=3 SAN=none VK_DEBUG=1 GFX_INSTRUMENT=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          make -C samples/gfx/threaded_video clean
+
+      - name: Views on gl, glcore, Vulkan and SDL2, end to end (Xvfb, llvmpipe, lavapipe)
+        shell: bash
+        run: |
+          set -eu
+          # The views compositor (gfx/video_views_draw.h) as gl, glcore,
+          # Vulkan and SDL2 instantiate it: the video_views test core's map in
+          # each stereo mode, a view per eye, the blend canvas, views
+          # read exactly out of the frame in every way the drivers copy
+          # or draw them, the UI layer per eye with the menu open, and a
+          # pointer mapped back through it. Each case runs on an Xvfb of
+          # its own; Vulkan here under the validation layer.
+          make -C samples/cores/video_views
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          export LIBGL_ALWAYS_SOFTWARE=1
+          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-anaglyph|3ds-interlaced|ds-horizontal|exact-3ds|crop-threaded-menu|pointer-sbs-full)$' \
+            python3 samples/cores/video_views/e2e/run.py ./retroarch \
+            "$RUNNER_TEMP/views-e2e" gl glcore vulkan sdl2
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+  vulkan-validation-openxr:
+    name: Threaded-video harness on Vulkan built with OpenXR (lavapipe, validation layer)
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev ccache
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Configure
+        # OpenXR is opt-in. With it the frame path carries the headset
+        # checks in its present chain while the window still presents,
+        # which the default build above never compiles.
+        run: |
+          ./configure --disable-qt --enable-openxr
+          grep -q '^HAVE_VULKAN = 1' config.mk
+          grep -q '^HAVE_OPENXR = 1' config.mk
+
+      - name: Build with VULKAN_DEBUG=1
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN) VULKAN_DEBUG=1
+          test -x retroarch
+
+      - name: Run the harness on Vulkan under the validation layer
+        shell: bash
+        run: |
+          set -eu
+          Xvfb :99 -screen 0 640x480x24 &
+          for i in $(seq 1 15); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          export DISPLAY=:99
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          SAN=none VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          make -C samples/gfx/threaded_video clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+  vulkan-validation-sample:
+    name: vulkan_validation sample (lavapipe, validation layer)
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential libx11-dev libx11-xcb-dev libxcb1-dev xvfb x11-utils libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Build and run
+        shell: bash
+        run: |
+          set -eu
+          # The context-only sample: vulkan_common.c against the real
+          # loader, brought up and torn down under the validation
+          # layer, and every memory type it advertises selected. It
+          # exits 77 with no display or no device, and that is a pass.
+          Xvfb :99 -screen 0 640x480x24 &
+          for i in $(seq 1 15); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          export DISPLAY=:99
+          make -C samples/gfx/vulkan_validation
+          rc=0
+          DISPLAY=:99 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
+            samples/gfx/vulkan_validation/vulkan_validation_test || rc=$?
+          make -C samples/gfx/vulkan_validation clean
+          if [ "$rc" = 77 ]; then echo "skipped: no device"; exit 0; fi
+          exit $rc
+
+  vulkan-asan-harness:
+    name: Threaded-video harness on Vulkan under ASan+UBSan (lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev ccache
+      # Line tables are all a sanitizer report needs. configure and
+      # make take these in place of DEBUG=1's -O0 -g, adding their own.
+      CFLAGS: -O0 -g1
+      CXXFLAGS: -O0 -g1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Configure
+        run: |
+          ./configure --disable-qt
+          grep -q '^HAVE_VULKAN = 1' config.mk
+
+      - name: Build with DEBUG=1, VULKAN_DEBUG=1 and -fsanitize=address,undefined
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN) SANITIZER=address,undefined DEBUG=1 VULKAN_DEBUG=1
+          test -x retroarch
+
+      - name: Run the harness on Vulkan under ASan+UBSan
+        shell: bash
+        run: |
+          set -eu
+          Xvfb :99 -screen 0 640x480x24 &
+          for i in $(seq 1 15); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          export DISPLAY=:99
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          SAN=address VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          HARNESS_CORE_XRGB8888=1 SAN=address VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          HARNESS_CORE_HW_VULKAN=1 SAN=address VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          make -C samples/gfx/threaded_video clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+  vulkan-tsan-harness:
+    name: Threaded-video harness on Vulkan under TSan (lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev ccache
+      # Line tables are all a sanitizer report needs. configure and
+      # make take these in place of DEBUG=1's -O0 -g, adding their own.
+      CFLAGS: -O0 -g1
+      CXXFLAGS: -O0 -g1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Configure
+        run: |
+          ./configure --disable-qt
+          grep -q '^HAVE_VULKAN = 1' config.mk
+
+      - name: Build with DEBUG=1, VULKAN_DEBUG=1 and -fsanitize=thread
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN) SANITIZER=thread DEBUG=1 VULKAN_DEBUG=1
+          test -x retroarch
+
+      - name: Run the harness on Vulkan under TSan
+        shell: bash
+        run: |
+          set -eu
+          Xvfb :99 -screen 0 640x480x24 &
+          for i in $(seq 1 15); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          export DISPLAY=:99
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          SAN=thread VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
+          make -C samples/gfx/threaded_video clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+  gl-harness:
+    name: Threaded-video harness on ${{ matrix.drivers }} (llvmpipe, ${{ matrix.api }}, ${{ matrix.san }})
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libgl-dev libglx-dev libegl-dev libgles-dev libgl1-mesa-dri libglx-mesa0 mesa-utils libasound2-dev ccache
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # One build per API and sanitizer, the harness run on each
+        # driver it serves. The GLES 3 build is the Android one: frame
+        # memory and the framebuffer loan through EXT_buffer_storage,
+        # which llvmpipe's GLES 3.2 has, and the harness fails a GL
+        # driver without them.
+        include:
+          - { api: desktop, san: none,    drivers: gl glcore gl1 }
+          - { api: desktop, san: address, drivers: gl glcore gl1 }
+          - { api: desktop, san: thread,  drivers: gl glcore gl1 }
+          - { api: gles3,   san: none,    drivers: gl glcore }
+          - { api: gles3,   san: address, drivers: gl }
+          - { api: gles3,   san: thread,  drivers: glcore }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.api }}" = gles3 ]; then
+            ./configure --disable-qt --enable-opengles --enable-opengles3 \
+              --disable-opengl1
+            grep -q '^HAVE_OPENGLES3 = 1' config.mk
+          else
+            ./configure --disable-qt
+          fi
+          grep -q '^HAVE_OPENGL = 1' config.mk
+          grep -q '^HAVE_OPENGL_CORE = 1' config.mk
+
+      - name: Build
+        run: |
+          # The sanitizer builds are DEBUG=1: -g1, as in the other jobs.
+          [ "${{ matrix.san }}" = none ] || export CFLAGS="-O0 -g1" CXXFLAGS="-O0 -g1"
+          case "${{ matrix.san }}" in
+            thread)  make -j$(getconf _NPROCESSORS_ONLN) SANITIZER=thread DEBUG=1 ;;
+            address) make -j$(getconf _NPROCESSORS_ONLN) SANITIZER=address,undefined DEBUG=1 ;;
+            *)       make -j$(getconf _NPROCESSORS_ONLN) ;;
+          esac
+          test -x retroarch
+
+      - name: Run the harness on ${{ matrix.drivers }}
+        shell: bash
+        run: |
+          set -eu
+          Xvfb :99 -screen 0 640x480x24 &
+          for i in $(seq 1 15); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          export DISPLAY=:99
+          export LIBGL_ALWAYS_SOFTWARE=1
+          # The harness takes its compile line from the build's own.
+          [ "${{ matrix.san }}" = none ] || export CFLAGS="-O0 -g1" CXXFLAGS="-O0 -g1"
+          # Every driver runs, so one failing does not hide another.
+          fail=0
+          for driver in ${{ matrix.drivers }}; do
+            echo "::group::$driver"
+            SAN=${{ matrix.san }} DRIVER=$driver CYCLES=1 \
+              make -C samples/gfx/threaded_video check-driver ||
+              { echo "::error::the harness failed on $driver"; fail=1; }
+            make -C samples/gfx/threaded_video clean
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-${{ github.sha }}
+
+  d3d-harness:
+    name: Threaded-video harness on ${{ matrix.driver }} (WARP, MSYS2 MinGW64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # d3d12 runs the same lanes on the other explicit-API backend:
+        # its in-place texture update is fence-tagged against the frame
+        # that last copied from the upload buffer, which only a running
+        # driver exercises. It runs with the harness core pushing
+        # XRGB8888: d3d12 lends its framebuffer only for a row pitch
+        # on a 256-byte boundary, which 320 pixels reach at 4 bytes and
+        # not at 2, so that is the run in which a frame is lent and a
+        # window into the loan is read out of it (lent-window lane).
+        driver: [d3d11, d3d12]
+        include:
+          - driver: d3d12
+            core_xrgb8888: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+
+      - name: Install packages
+        shell: msys2 {0}
+        run: |
+          # A mirror that stalls or rate-limits (HTTP 429) fails pacman's
+          # whole transaction; what it fetched stays in the cache, so a
+          # retry fetches only the rest, one file at a time after a
+          # growing wait so a shared runner's rate limit can clear.
+          p=$MINGW_PACKAGE_PREFIX
+          pkgs="base-devel git $p-cc $p-gdb $p-python $p-ffmpeg"
+          for i in 1 2 3 4 5; do
+            pacman -S --noconfirm --needed $pkgs && exit 0
+            [ $i = 5 ] && break
+            echo "package install failed (attempt $i); retrying in $((30 * i))s, serial downloads"
+            sed -i -e '/^#*ParallelDownloads/d' -e '/^\[options\]/a ParallelDownloads = 1' /etc/pacman.conf
+            sleep $((30 * i))
+          done
+          exit 1
+
+      - name: Configure and build RetroArch (no Qt)
+        shell: msys2 {0}
+        run: |
+          set -eu
+          ./configure --disable-qt --disable-ffmpeg --disable-webmplayer --disable-imageviewer
+          grep -q '^HAVE_D3D11 = 1' config.mk
+          grep -q '^HAVE_D3D12 = 1' config.mk
+          make -j"$(nproc)"
+          test -x retroarch.exe
+
+      - name: Run the harness on ${{ matrix.driver }}
+        shell: msys2 {0}
+        run: |
+          set -eu
+          samples/gfx/threaded_video/build.sh
+          HARNESS_CORE_XRGB8888=${{ matrix.core_xrgb8888 || '' }} \
+            SAN=none DRIVER=${{ matrix.driver }} CYCLES=1 GDB=on-failure make -C samples/gfx/threaded_video check-driver
+          make -C samples/gfx/threaded_video clean
+
+      - name: Preserve failed Windows driver harness log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: threaded-video-${{ matrix.driver }}-failure
+          path: |
+            samples/gfx/threaded_video/check.log
+            samples/gfx/threaded_video/debugger.log
+          if-no-files-found: ignore
+
+      - name: RGUI GPU subtitle output on ${{ matrix.driver }}
+        shell: msys2 {0}
+        run: |
+          set -eu
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 3 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -shortest samples/menu/rgui_media/fixture.mp4
+          python3 -c "from pathlib import Path; Path('samples/menu/rgui_media/fixture.srt').write_text('1\n00:00:00,000 --> 00:10:00,000\nSubtitle sidecar\nUTF-8 \u00e9\n\n', encoding='utf-8'); Path('samples/menu/rgui_media/fixture.en.srt').write_text('1\n00:00:00,000 --> 00:10:00,000\nEnglish track\n', encoding='utf-8')"
+          capture="$(cygpath -m "$RUNNER_TEMP/rgui-subtitles-${{ matrix.driver }}")"
+          mkdir -p "$capture"
+          MEDIA_TEST_CAPTURE_DIR="$capture" MEDIA_TEST_SUBTITLE_CONTEXT=1 \
+            python3 samples/menu/rgui_media/run.py --driver rgui --video-driver ${{ matrix.driver }} --gpu-surface --subtitles samples/menu/rgui_media/fixture.mp4
+      - name: RGUI GPU folder playback and settings on ${{ matrix.driver }}
+        shell: msys2 {0}
+        run: |
+          set -eu
+          python3 samples/menu/rgui_media/run.py --driver rgui --video-driver ${{ matrix.driver }} --gpu-surface --refresh-pixels samples/menu/rgui_media/fixture.mp4
+          python3 samples/menu/rgui_media/run.py --driver rgui --video-driver ${{ matrix.driver }} --gpu-surface --continuous-error samples/menu/rgui_media/fixture.mp4
+
+  views-sdl3:
+    name: Views on SDL3, end to end (Xvfb, llvmpipe)
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential ninja-build cmake xvfb x11-utils imagemagick libx11-dev libxext-dev libxrandr-dev libxi-dev libxss-dev libxcursor-dev libxfixes-dev libxkbcommon-dev libgl1-mesa-dri libgl-dev libegl-dev zlib1g-dev libfreetype6-dev libasound2-dev
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Build SDL3
+        # The runner image ships no libsdl3-dev: a pinned release, with
+        # the renderer the driver draws through.
+        run: |
+          set -eu
+          SDL3_VER=3.2.20
+          curl -sL -o /tmp/sdl3.tar.gz \
+             "https://github.com/libsdl-org/SDL/releases/download/release-$SDL3_VER/SDL3-$SDL3_VER.tar.gz"
+          tar -C /tmp -xzf /tmp/sdl3.tar.gz
+          cmake -S "/tmp/SDL3-$SDL3_VER" -B /tmp/sdl3-build -G Ninja \
+             -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+             -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_AUDIO=OFF -DSDL_CAMERA=OFF \
+             -DSDL_WAYLAND=OFF -DSDL_X11=ON -DSDL_RENDER=ON -DSDL_OPENGL=ON \
+             -DSDL_OPENGLES=ON -DSDL_VULKAN=OFF -DCMAKE_INSTALL_PREFIX=/opt/sdl3 \
+             > /tmp/sdl3-cmake.log
+          ninja -C /tmp/sdl3-build > /tmp/sdl3-build.log
+          sudo ninja -C /tmp/sdl3-build install > /tmp/sdl3-install.log
+
+      - name: Build retroarch with SDL3
+        run: |
+          set -eu
+          export PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig
+          ./configure --enable-sdl3 --disable-sdl2 --disable-sdl --disable-qt \
+                      --disable-vulkan --disable-ffmpeg
+          grep -q '^HAVE_SDL3 = 1' config.mk
+          make -j$(getconf _NPROCESSORS_ONLN)
+          make -C samples/cores/video_views
+
+      - name: Pointer helper connection regression
+        run: python3 samples/cores/video_views/e2e/pointer_test.py
+
+      - name: Views on SDL3, end to end
+        shell: bash
+        run: |
+          set -eu
+          # The views compositor as the SDL3 driver instantiates it: each
+          # view written straight into a texture of its own, the
+          # interlaced canvas, views read exactly out of the frame, the
+          # UI layer per eye with the menu open, and a pointer mapped
+          # back through it. Anaglyph draws the frame whole there.
+          export LIBGL_ALWAYS_SOFTWARE=1
+          export LD_LIBRARY_PATH=/opt/sdl3/lib
+          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-interlaced|ds-horizontal|exact-3ds|exact-3ds-rgb565|crop-threaded-menu|pointer-sbs-full)$' \
+            python3 samples/cores/video_views/e2e/run.py ./retroarch \
+            "$RUNNER_TEMP/views-e2e" sdl3
+
+      - name: Preserve views logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: views-sdl3-logs
+          path: ${{ runner.temp }}/views-e2e/**/*.log
+          if-no-files-found: ignore
+
+  views-sdl1:
+    name: Views on SDL 1.2, XShm and XVideo, end to end (Xvfb, sdl12-compat)
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential gdb xvfb x11-utils imagemagick openbox libx11-dev libxext-dev libxv-dev libsdl1.2-dev libgl1-mesa-dri libgl-dev zlib1g-dev libfreetype6-dev libasound2-dev
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Build retroarch with SDL 1.2, XShm and XVideo
+        run: |
+          set -eu
+          ./configure --enable-sdl --disable-sdl2 --disable-sdl3 --enable-xshm \
+                      --enable-xvideo --disable-qt --disable-vulkan --disable-ffmpeg
+          grep -q '^HAVE_SDL = 1' config.mk
+          grep -q '^HAVE_XSHM = 1' config.mk
+          grep -q '^HAVE_XVIDEO = 1' config.mk
+          make -j$(getconf _NPROCESSORS_ONLN)
+          make -C samples/cores/video_views
+          make -C samples/gfx/xv_standin
+
+      - name: Views on SDL 1.2 and XShm, end to end
+        shell: bash
+        run: |
+          set -eu
+          python3 samples/cores/video_views/e2e/test_wm_ready.py
+          # The CPU drivers' views: each view scaled straight out of the
+          # frame into the window's surface or image, the anaglyph and
+          # interlaced canvas blended on the CPU, views read exactly out
+          # of the frame, and the menu with it open. XShm ("x11") also
+          # has the pointer cases; SDL 1.2 runs under openbox, which
+          # sizes sdl12-compat's fullscreen window.
+          RA_E2E_XVFB=1 python3 samples/cores/video_views/e2e/run.py \
+            ./retroarch "$RUNNER_TEMP/views-e2e" sdl x11
+
+      - name: Views on XVideo, end to end
+        shell: bash
+        run: |
+          set -eu
+          # Xvfb has no XVideo adaptor: samples/gfx/xv_standin's,
+          # preloaded, takes the image and scales it to the window.
+          # Views are converted straight from the frame into the
+          # image, packed (YUY2, UYVY) and planar (I420); the stand-in
+          # aborts on a put that reads outside the image.
+          export RA_E2E_XVFB=1
+          export RA_E2E_XV_STANDIN="$PWD/samples/gfx/xv_standin/libxv_standin.so"
+          XV_STANDIN_FORMAT=YUY2 python3 samples/cores/video_views/e2e/run.py \
+            ./retroarch "$RUNNER_TEMP/views-e2e/yuy2" xvideo
+          XV_STANDIN_FORMAT=I420 python3 samples/cores/video_views/e2e/run.py \
+            ./retroarch "$RUNNER_TEMP/views-e2e/i420" xvideo
+          XV_STANDIN_FORMAT=UYVY RA_E2E_ONLY='3ds-2d|anaglyph|interlaced|pointer-sbs-half' \
+            python3 samples/cores/video_views/e2e/run.py \
+            ./retroarch "$RUNNER_TEMP/views-e2e/uyvy" xvideo
+
+      - name: Preserve views logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: views-sdl1-logs
+          path: ${{ runner.temp }}/views-e2e/**/*.log
+          if-no-files-found: ignore

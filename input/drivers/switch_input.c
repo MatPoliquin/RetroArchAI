@@ -25,8 +25,8 @@
 #include "../../config.def.h"
 
 #include "../../retroarch.h"
+#include "../input_driver.h"
 
-#ifdef HAVE_LIBNX
 #include <switch.h>
 
 /* Supports up to this many fingers at once */
@@ -96,7 +96,6 @@ typedef struct
    FingerType tfinger;
 } TouchEvent;
 /* end of touch mouse defines and types */
-#endif
 
 #include "../input_keymaps.h"
 
@@ -105,14 +104,12 @@ typedef struct
 
 typedef struct switch_input
 {
-#ifdef HAVE_LIBNX
    /* pointer */
    bool touch_state[MULTITOUCH_LIMIT];
    bool previous_touch_state[MULTITOUCH_LIMIT];
-   int16_t touch_x_viewport[MULTITOUCH_LIMIT]; /* used for POINTER device */
-   int16_t touch_y_viewport[MULTITOUCH_LIMIT]; /* used for POINTER device */
-   int16_t touch_x_screen[MULTITOUCH_LIMIT]; /* used for POINTER_SCREEN device */
-   int16_t touch_y_screen[MULTITOUCH_LIMIT]; /* used for POINTER_SCREEN device */
+   /* x, y as VIDEO_POS_PACK */
+   uint32_t touch_viewport_pos[MULTITOUCH_LIMIT]; /* used for POINTER device */
+   uint32_t touch_screen_pos[MULTITOUCH_LIMIT];   /* used for POINTER_SCREEN device */
    uint32_t touch_x[MULTITOUCH_LIMIT]; /* used for touch mouse */
    uint32_t touch_y[MULTITOUCH_LIMIT]; /* used for touch mouse */
    uint32_t touch_previous_x[MULTITOUCH_LIMIT];
@@ -120,10 +117,8 @@ typedef struct switch_input
    bool keyboard_state[SWITCH_MAX_SCANCODE + 1];
 
    /* physical mouse */
-   int32_t mouse_x;
-   int32_t mouse_y;
-   int32_t mouse_x_delta;
-   int32_t mouse_y_delta;
+   uint32_t mouse_pos;     /* VIDEO_POS_PACK */
+   uint32_t mouse_delta;   /* VIDEO_POS_PACK */
    int32_t mouse_wheel;
    bool mouse_button_left;
    bool mouse_button_right;
@@ -142,12 +137,8 @@ typedef struct switch_input
    /* sensor handles */
    HidSixAxisSensorHandle sixaxis_handles[DEFAULT_MAX_PADS][4];
    unsigned sixaxis_handles_count[DEFAULT_MAX_PADS];
-#else
-   void *empty;
-#endif
 } switch_input_t;
 
-#ifdef HAVE_LIBNX
 /* beginning of touch mouse function declarations */
 static void switch_handle_touch_mouse(switch_input_t *sw);
 static void switch_normalize_touch_mouse_xy(float *normalized_x, float *normalized_y, int reported_x, int reported_y);
@@ -158,9 +149,7 @@ static void switch_process_touch_mouse_finger_motion(switch_input_t *sw, TouchEv
 static void switch_normalized_to_screen_xy(int *screenX, int *screenY, float x, float y);
 static void switch_finish_simulated_mouse_clicks(switch_input_t *sw, uint64_t currentTime);
 /* end of touch mouse function declarations */
-#endif
 
-#ifdef HAVE_LIBNX
 static void switch_input_poll(void *data)
 {
    HidTouchScreenState touch_screen_state;
@@ -191,21 +180,16 @@ static void switch_input_poll(void *data)
          sw->touch_y[i]              = touch_screen_state.touches[i].y;
 
          /* convert from event coordinates to core and screen coordinates */
-         vp.x                        = 0;
-         vp.y                        = 0;
-         vp.width                    = 0;
-         vp.height                   = 0;
-         vp.full_width               = 0;
-         vp.full_height              = 0;
+         vp.pos                      = VIDEO_POS_PACK(0, 0);
+         vp.dims                     = 0;
+         vp.full_dims                = 0;
 
-         video_driver_translate_coord_viewport_wrap(
+         input_driver_translate_coord_viewport_wrap(
             &vp,
             touch_screen_state.touches[i].x,
             touch_screen_state.touches[i].y,
-            &sw->touch_x_viewport[i],
-            &sw->touch_y_viewport[i],
-            &sw->touch_x_screen[i],
-            &sw->touch_y_screen[i]);
+            &sw->touch_viewport_pos[i],
+            &sw->touch_screen_pos[i]);
       }
    }
 
@@ -274,11 +258,9 @@ static void switch_input_poll(void *data)
    sw->mouse_previous_buttons = mouse_state.buttons;
 
    /* physical mouse position */
-   sw->mouse_x_delta = mouse_state.delta_x;
-   sw->mouse_y_delta = mouse_state.delta_y;
+   sw->mouse_delta = VIDEO_POS_PACK(mouse_state.delta_x, mouse_state.delta_y);
 
-   sw->mouse_x       = mouse_state.x;
-   sw->mouse_y       = mouse_state.y;
+   sw->mouse_pos = VIDEO_POS_PACK(mouse_state.x, mouse_state.y);
 
    /* touch mouse events
     * switch_handle_touch_mouse will update sw->mouse_* variables
@@ -287,27 +269,24 @@ static void switch_input_poll(void *data)
     * supported touch gestures */
    switch_handle_touch_mouse(sw);
 
-   if (sw->mouse_x < 0)
-      sw->mouse_x  = 0;
-   else if (sw->mouse_x > MOUSE_MAX_X)
-      sw->mouse_x  = MOUSE_MAX_X;
+   if (VIDEO_POS_X(sw->mouse_pos) < 0)
+      VIDEO_POS_PUT_X(sw->mouse_pos, 0);
+   else if (VIDEO_POS_X(sw->mouse_pos) > MOUSE_MAX_X)
+      VIDEO_POS_PUT_X(sw->mouse_pos, MOUSE_MAX_X);
 
-   if (sw->mouse_y < 0) 
-      sw->mouse_y  = 0;
-   else if (sw->mouse_y > MOUSE_MAX_Y)
-      sw->mouse_y  = MOUSE_MAX_Y;
+   if (VIDEO_POS_Y(sw->mouse_pos) < 0)
+      VIDEO_POS_PUT_Y(sw->mouse_pos, 0);
+   else if (VIDEO_POS_Y(sw->mouse_pos) > MOUSE_MAX_Y)
+      VIDEO_POS_PUT_Y(sw->mouse_pos, MOUSE_MAX_Y);
 
    sw->mouse_wheel = mouse_state.wheel_delta_y;
 }
-#endif
 
 static int16_t switch_input_state(
       void *data,
       const input_device_driver_t *joypad,
-      const input_device_driver_t *sec_joypad,
       rarch_joypad_info_t *joypad_info,
       const retro_keybind_set *binds,
-      bool keyboard_mapping_blocked,
       unsigned port,
       unsigned device,
       unsigned idx,
@@ -323,7 +302,6 @@ static int16_t switch_input_state(
       case RETRO_DEVICE_JOYPAD:
       case RETRO_DEVICE_ANALOG:
          break;
-#ifdef HAVE_LIBNX
       case RETRO_DEVICE_KEYBOARD:
          return (id && id < RETROK_LAST) && sw->keyboard_state[rarch_keysym_lut[(enum retro_key)id]];
       case RETRO_DEVICE_MOUSE:
@@ -341,18 +319,18 @@ static int16_t switch_input_state(
                   return sw->mouse_button_middle;
                case RETRO_DEVICE_ID_MOUSE_X:
                   if (screen)
-                     return sw->mouse_x;
+                     return VIDEO_POS_X(sw->mouse_pos);
 
-                  val                = sw->mouse_x_delta;
-                  sw->mouse_x_delta  = 0;
+                  val                = VIDEO_POS_X(sw->mouse_delta);
+                  VIDEO_POS_PUT_X(sw->mouse_delta, 0);
                   /* flush delta after it has been read */
                   break;
                case RETRO_DEVICE_ID_MOUSE_Y:
                   if (screen)
-                     return sw->mouse_y;
+                     return VIDEO_POS_Y(sw->mouse_pos);
 
-                  val                = sw->mouse_y_delta;
-                  sw->mouse_y_delta  = 0;
+                  val                = VIDEO_POS_Y(sw->mouse_delta);
+                  VIDEO_POS_PUT_Y(sw->mouse_delta, 0);
                   /* flush delta after it has been read */
                   break;
                case RETRO_DEVICE_ID_MOUSE_WHEELUP:
@@ -382,9 +360,9 @@ static int16_t switch_input_state(
                case RETRO_DEVICE_ID_POINTER_PRESSED:
                   return sw->touch_state[idx];
                case RETRO_DEVICE_ID_POINTER_X:
-                  return sw->touch_x_viewport[idx];
+                  return VIDEO_POS_X(sw->touch_viewport_pos[idx]);
                case RETRO_DEVICE_ID_POINTER_Y:
-                  return sw->touch_y_viewport[idx];
+                  return VIDEO_POS_Y(sw->touch_viewport_pos[idx]);
             }
          }
          break;
@@ -396,19 +374,17 @@ static int16_t switch_input_state(
                case RETRO_DEVICE_ID_POINTER_PRESSED:
                   return sw->touch_state[idx];
                case RETRO_DEVICE_ID_POINTER_X:
-                  return sw->touch_x_screen[idx];
+                  return VIDEO_POS_X(sw->touch_screen_pos[idx]);
                case RETRO_DEVICE_ID_POINTER_Y:
-                  return sw->touch_y_screen[idx];
+                  return VIDEO_POS_Y(sw->touch_screen_pos[idx]);
             }
          }
          break;
-#endif
    }
 
    return 0;
 }
 
-#ifdef HAVE_LIBNX
 static void switch_handle_touch_mouse(switch_input_t *sw)
 {
    unsigned int i;
@@ -613,10 +589,8 @@ static void switch_process_touch_mouse_finger_up(switch_input_t *sw, TouchEvent 
                int x;
                int y;
                switch_normalized_to_screen_xy(&x, &y, event->tfinger.x, event->tfinger.y);
-               sw->mouse_x_delta = x - sw->mouse_x;
-               sw->mouse_y_delta = y - sw->mouse_y;
-               sw->mouse_x       = x;
-               sw->mouse_y       = y;
+               sw->mouse_delta = VIDEO_POS_PACK(x - VIDEO_POS_X(sw->mouse_pos), y - VIDEO_POS_Y(sw->mouse_pos));
+               sw->mouse_pos = VIDEO_POS_PACK(x, y);
             }
             simulated_button = TOUCH_MOUSE_BUTTON_LEFT;
             /* need to raise the button later */
@@ -722,10 +696,8 @@ static void switch_process_touch_mouse_finger_motion(switch_input_t *sw, TouchEv
       int x;
       int y;
       switch_normalized_to_screen_xy(&x, &y, event->tfinger.x, event->tfinger.y);
-      sw->mouse_x_delta = x - sw->mouse_x;
-      sw->mouse_y_delta = y - sw->mouse_y;
-      sw->mouse_x       = x;
-      sw->mouse_y       = y;
+      sw->mouse_delta = VIDEO_POS_PACK(x - VIDEO_POS_X(sw->mouse_pos), y - VIDEO_POS_Y(sw->mouse_pos));
+      sw->mouse_pos = VIDEO_POS_PACK(x, y);
    }
    else
    {
@@ -740,10 +712,8 @@ static void switch_process_touch_mouse_finger_motion(switch_input_t *sw, TouchEv
       int y_rel     = sw->hires_dy / 256;
       if (x_rel || y_rel)
       {
-         sw->mouse_x_delta  = x_rel;
-         sw->mouse_y_delta  = y_rel;
-         sw->mouse_x       += x_rel;
-         sw->mouse_y       += y_rel;
+         sw->mouse_delta = VIDEO_POS_PACK(x_rel, y_rel);
+         VIDEO_POS_ADD(sw->mouse_pos, x_rel, y_rel);
       }
       sw->hires_dx         %= 256;
       sw->hires_dy         %= 256;
@@ -779,7 +749,6 @@ static void switch_finish_simulated_mouse_clicks(
       sw->simulated_click_start_time[i] = 0;
    }
 }
-#endif
 
 static void switch_input_free_input(void *data)
 {
@@ -799,14 +768,11 @@ static void switch_input_free_input(void *data)
 
 static void* switch_input_init(const char *joypad_driver)
 {
-#ifdef HAVE_LIBNX
    unsigned int i;
-#endif
    switch_input_t *sw = (switch_input_t*) calloc(1, sizeof(*sw));
    if (!sw)
       return NULL;
 
-#ifdef HAVE_LIBNX
     hidInitializeTouchScreen();
     hidInitializeMouse();
     hidInitializeKeyboard();
@@ -816,8 +782,7 @@ static void* switch_input_init(const char *joypad_driver)
    for (i = 0; i <= SWITCH_MAX_SCANCODE; i++)
       sw->keyboard_state[i]     = false;
 
-   sw->mouse_x                  = 0;
-   sw->mouse_y                  = 0;
+   sw->mouse_pos = 0;
    sw->mouse_previous_buttons   = 0;
 
    /* touch mouse init */
@@ -833,7 +798,6 @@ static void* switch_input_init(const char *joypad_driver)
       sw->simulated_click_start_time[i] = 0;
    for (i = 0; i < DEFAULT_MAX_PADS; i++)
       sw->sixaxis_handles_count[i]      = 0;
-#endif
 
    return sw;
 }
@@ -841,11 +805,9 @@ static void* switch_input_init(const char *joypad_driver)
 static uint64_t switch_input_get_capabilities(void *data)
 {
    return
-#ifdef HAVE_LIBNX
            (1 << RETRO_DEVICE_POINTER) 
          | (1 << RETRO_DEVICE_KEYBOARD) 
          | (1 << RETRO_DEVICE_MOUSE) |
-#endif
            (1 << RETRO_DEVICE_JOYPAD) 
          | (1 << RETRO_DEVICE_ANALOG);
 }
@@ -853,7 +815,6 @@ static uint64_t switch_input_get_capabilities(void *data)
 static bool switch_input_set_sensor_state(void *data, unsigned port,
       enum retro_sensor_action action, unsigned event_rate)
 {
-#ifdef HAVE_LIBNX
    unsigned i, handles_count;
    switch_input_t *sw = (switch_input_t*) data;
 
@@ -896,7 +857,6 @@ static bool switch_input_set_sensor_state(void *data, unsigned port,
             break;
       }
    }
-#endif
 
    return false;
 }
@@ -904,7 +864,6 @@ static bool switch_input_set_sensor_state(void *data, unsigned port,
 static float switch_input_get_sensor_input(void *data,
       unsigned port, unsigned id)
 {
-#ifdef HAVE_LIBNX
    float f;
    unsigned int i;
    HidSixAxisSensorState sixaxis;
@@ -942,18 +901,13 @@ static float switch_input_get_sensor_input(void *data,
       appletGetCurrentIlluminance(&f);
       return f;
    }
-#endif
 
    return 0.0f;
 }
 
 input_driver_t input_switch = {
    switch_input_init,
-#ifdef HAVE_LIBNX
    switch_input_poll,
-#else
-   NULL,                            /* poll       */
-#endif
    switch_input_state,
    switch_input_free_input,
    switch_input_set_sensor_state,

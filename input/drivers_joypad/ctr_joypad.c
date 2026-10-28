@@ -41,7 +41,7 @@ static void ctr_joypad_autodetect_add(unsigned autoconf_pad)
 {
    input_autoconfigure_connect(
          ctr_joypad_name(autoconf_pad),
-         NULL,
+         NULL, NULL,
          ctr_joypad.ident,
          autoconf_pad,
          0,
@@ -122,10 +122,11 @@ static int16_t ctr_joypad_axis(unsigned port_num, uint32_t joyaxis)
 
 static int16_t ctr_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
-   unsigned i;
+   int i;
    int16_t ret                          = 0;
    uint16_t port_idx                    = joypad_info->joy_idx;
 
@@ -134,17 +135,14 @@ static int16_t ctr_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
-      
-      if ((uint16_t)joykey != NO_BTN && 
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
+
+      if ((uint16_t)joykey != NO_BTN &&
             (pad_state & (1 << (uint16_t)joykey)))
          ret |= ( 1 << i);
       else if (joyaxis != AXIS_NONE &&
-            ((float)abs(ctr_joypad_axis_state(port_idx, joyaxis)) 
+            ((float)abs(ctr_joypad_axis_state(port_idx, joyaxis))
              / 0x8000) > joypad_info->axis_threshold)
          ret |= (1 << i);
    }
@@ -154,7 +152,7 @@ static int16_t ctr_joypad_state(
 
 static int16_t ctr_joypad_fix_range(int16_t val)
 {
-   val = (val > 127)? 127: (val < -127)? -127: val;
+   val = (val > 127) ? 127 : (val < -127) ? -127 : val;
    return val * 256;
 }
 
@@ -193,15 +191,9 @@ static void ctr_joypad_poll(void)
    analog_state[0][RETRO_DEVICE_INDEX_ANALOG_RIGHT] [RETRO_DEVICE_ID_ANALOG_Y] = -ctr_joypad_fix_range(state_tmp_right_analog.dy);
 }
 
-static bool ctr_joypad_query_pad(unsigned pad)
-{
-   /* FIXME */
-   return pad < MAX_USERS && pad_state;
-}
+static bool ctr_joypad_query_pad(unsigned pad) { return pad == 0; }
 
-static void ctr_joypad_destroy(void)
-{
-}
+static void ctr_joypad_destroy(void) { }
 
 input_device_driver_t ctr_joypad = {
    ctr_joypad_init,

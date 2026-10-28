@@ -39,24 +39,21 @@ void switch_ctx_destroy(void *data)
 #ifdef HAVE_EGL
         egl_destroy(&ctx_nx->egl);
 #endif
-        ctx_nx->resize = false;
         free(ctx_nx);
     }
 }
 
 static void switch_ctx_get_video_size(void *data,
-      unsigned *width, unsigned *height)
+      unsigned *dims)
 {
    switch (appletGetOperationMode())
    {
       default:
       case AppletOperationMode_Handheld:
-         *width  = 1280;
-         *height = 720;
+         *dims = VIDEO_SCALE_PACK(1280, 720);
          break;
       case AppletOperationMode_Console:
-         *width  = 1920;
-         *height = 1080;
+         *dims = VIDEO_SCALE_PACK(1920, 1080);
          break;
    }
 }
@@ -115,34 +112,25 @@ error:
 }
 
 static void switch_ctx_check_window(void *data, bool *quit,
-      bool *resize, unsigned *width, unsigned *height)
+      bool *resize, unsigned *dims)
 {
-    unsigned new_width, new_height;
+    unsigned new_dims;
+    switch_ctx_data_t *ctx_nx = (switch_ctx_data_t *)data;
+    switch_ctx_get_video_size(data, &new_dims);
 
-    switch_ctx_get_video_size(data, &new_width, &new_height);
-
-    if (new_width != *width || new_height != *height)
+    if (new_dims != *dims)
     {
-        *width = new_width;
-        *height = new_height;
-        switch_ctx_data_t *ctx_nx = (switch_ctx_data_t *)data;
-
-        ctx_nx->width = *width;
-        ctx_nx->height = *height;
-
-        ctx_nx->native_window.width = ctx_nx->width;
-        ctx_nx->native_window.height = ctx_nx->height;
-        ctx_nx->resize = true;
-
+        *dims = new_dims;
         *resize = true;
-        nwindowSetCrop(ctx_nx->win, 0, 1080 - ctx_nx->height, ctx_nx->width, 1080);
+        nwindowSetCrop(ctx_nx->win, 0, 1080 - VIDEO_SCALE_H(new_dims),
+              VIDEO_SCALE_W(new_dims), 1080);
     }
 
     *quit = (bool)false;
 }
 
 static bool switch_ctx_set_video_mode(void *data,
-      unsigned width, unsigned height,
+      unsigned dims,
       bool fullscreen)
 {
     /* Create an EGL rendering context */
@@ -152,11 +140,9 @@ static bool switch_ctx_set_video_mode(void *data,
             EGL_NONE};
 
     switch_ctx_data_t *ctx_nx = (switch_ctx_data_t *)data;
+    unsigned win_dims         = 0;
 
-    switch_ctx_get_video_size(data, &ctx_nx->width, &ctx_nx->height);
-
-    ctx_nx->native_window.width = ctx_nx->width;
-    ctx_nx->native_window.height = ctx_nx->height;
+    switch_ctx_get_video_size(data, &win_dims);
 
     ctx_nx->refresh_rate = 60;
 
@@ -173,7 +159,8 @@ static bool switch_ctx_set_video_mode(void *data,
         goto error;
 #endif
 
-    nwindowSetCrop(ctx_nx->win, 0, 1080 - ctx_nx->height, ctx_nx->width, 1080);
+    nwindowSetCrop(ctx_nx->win, 0, 1080 - VIDEO_SCALE_H(win_dims),
+          VIDEO_SCALE_W(win_dims), 1080);
 
     return true;
 
@@ -183,11 +170,8 @@ error:
 }
 
 static void switch_ctx_input_driver(void *data,
-      const char *name,
-      input_driver_t **input, void **input_data)
+      const char *name)
 {
-    *input      = NULL;
-    *input_data = NULL;
 }
 
 static enum gfx_ctx_api switch_ctx_get_api(void *data) { return GFX_CTX_OPENGL_API; }
@@ -234,7 +218,7 @@ static uint32_t switch_ctx_get_flags(void *data)
 
    if (string_is_equal(video_driver_get_ident(), "glcore"))
    {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
       BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
 #endif
    }
@@ -245,10 +229,24 @@ static uint32_t switch_ctx_get_flags(void *data)
 #endif
    }
 
+   /* nvservices gives a process one GL context: a second one, shared
+    * or not, is not usable. The threaded wrapper's ring hands this one
+    * between the threads instead. */
+   BIT32_SET(flags, GFX_CTX_FLAGS_NO_SHARED_CONTEXT);
+
     return flags;
 }
 
 static void switch_ctx_set_flags(void *data, uint32_t flags) { }
+
+static void switch_ctx_release_current(void *data)
+{
+#ifdef HAVE_EGL
+    switch_ctx_data_t *ctx_nx = (switch_ctx_data_t *)data;
+    if (ctx_nx)
+        egl_release_current(&ctx_nx->egl);
+#endif
+}
 
 static float switch_ctx_get_refresh_rate(void *data)
 {
@@ -306,6 +304,26 @@ bool switch_ctx_get_metrics(void *data,
    return false;
 }
 
+static bool switch_ctx_create_surface(void *data)
+{
+#ifdef HAVE_EGL
+   switch_ctx_data_t *ctx_nx = (switch_ctx_data_t*)data;
+   return egl_create_surface(&ctx_nx->egl, ctx_nx->win);
+#else
+   return false;
+#endif
+}
+
+static bool switch_ctx_destroy_surface(void *data)
+{
+#ifdef HAVE_EGL
+   switch_ctx_data_t *ctx_nx = (switch_ctx_data_t*)data;
+   return egl_destroy_surface(&ctx_nx->egl);
+#else
+   return false;
+#endif
+}
+
 const gfx_ctx_driver_t switch_ctx = {
     switch_ctx_init,
     switch_ctx_destroy,
@@ -341,5 +359,10 @@ const gfx_ctx_driver_t switch_ctx = {
     switch_ctx_set_flags,
     switch_ctx_bind_hw_render,
     NULL,
-    NULL
+    NULL,
+    switch_ctx_create_surface,
+    switch_ctx_destroy_surface,
+    NULL, /* presentable */
+    NULL, /* last_present_time */
+    switch_ctx_release_current
 };

@@ -14,6 +14,12 @@
  *  You should have received a copy of the GNU General Public License along with RetroArch.
  *  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <stdlib.h>
+
+#include <compat/strl.h>
+#include <encodings/utf.h>
+#include <string/stdstring.h>
+#include <queues/mpsc_stack.h>
 
 #include "../gfx_widgets.h"
 #include "../gfx_animation.h"
@@ -62,6 +68,12 @@ struct gfx_widget_generic_message_state
    enum gfx_widget_generic_message_status status;
 
    char message[512];
+   char progress[32];
+   char slot[32];
+   char prefix[64];
+   char name[PATH_MAX_LENGTH];
+   char suffix[8];
+   bool fixed;
    bool message_updated;
 };
 
@@ -74,7 +86,7 @@ static gfx_widget_generic_message_state_t p_w_generic_message_st = {
    0,                                  /* bg_height */
    0,                                  /* frame_width */
    0,                                  /* text_padding */
-   0xFFFFFFFF,                         /* text_color */
+   TEXT_COLOR_INFO,                    /* text_color */
 
    0,                                  /* message_duration */
 
@@ -89,14 +101,20 @@ static gfx_widget_generic_message_state_t p_w_generic_message_st = {
 
    0.0f,                               /* alpha */
 
-   COLOR_HEX_TO_FLOAT(0x3A3A3A, 1.0f), /* bg_color */
-   COLOR_HEX_TO_FLOAT(0x7A7A7A, 1.0f), /* frame_color */
+   COLOR_HEX_TO_FLOAT(BG_COLOR_DEFAULT, 1.0f), /* bg_color */
+   COLOR_HEX_TO_FLOAT(BG_COLOR_DEFAULT, 0.0f), /* frame_color */
   
    0,                                  /* message_len */
 
    GFX_WIDGET_GENERIC_MESSAGE_IDLE,    /* status */
 
    {'\0'},                             /* message */
+   {'\0'},                             /* progress */
+   {'\0'},                             /* slot */
+   {'\0'},                             /* prefix */
+   {'\0'},                             /* name */
+   {'\0'},                             /* suffix */
+   false,                              /* fixed */
    false                               /* message_updated */
 };
 
@@ -109,13 +127,90 @@ static void gfx_widget_generic_message_reset(bool cancel_pending)
    uintptr_t timer_tag                       = (uintptr_t)&state->timer;
 
    /* Kill any existing timers/animations */
-   gfx_animation_kill_by_tag(&timer_tag);
-   gfx_animation_kill_by_tag(&alpha_tag);
+   gfx_animation_kill_widget_by_tag(&timer_tag);
+   gfx_animation_kill_widget_by_tag(&alpha_tag);
 
    /* Reset status */
    state->status             = GFX_WIDGET_GENERIC_MESSAGE_IDLE;
    if (cancel_pending)
       state->message_updated = false;
+}
+
+/* Builds the fixed message with @skip leading characters of the name
+ * dropped, and returns how wide it comes out. */
+static int gfx_widget_generic_message_build_fixed(
+      gfx_widget_generic_message_state_t *state,
+      gfx_widget_font_data_t *font_msg_queue,
+      size_t skip)
+{
+   const char *name = utf8skip(state->name, skip);
+
+   strlcpy(state->message, state->prefix, sizeof(state->message));
+   if (skip)
+      strlcat(state->message, "...", sizeof(state->message));
+   strlcat(state->message, name,          sizeof(state->message));
+   strlcat(state->message, state->suffix, sizeof(state->message));
+   state->message_len = strlen(state->message);
+
+   return font_driver_get_message_width(font_msg_queue->font,
+         state->message, state->message_len, 1.0f);
+}
+
+/* Fixed layout: constant box, left-aligned message and a reserved
+ * label slot, so the text stays put between shader messages. The
+ * name is cut from the left until the message fits. */
+static void gfx_widget_generic_message_layout_fixed(
+      gfx_widget_generic_message_state_t *state,
+      dispgfx_widget_t *p_dispwidget)
+{
+   unsigned area;
+   int text_width;
+   unsigned slot_width                    = 0;
+   gfx_widget_font_data_t *font_msg_queue = &p_dispwidget->gfx_widget_fonts.msg_queue;
+   unsigned last_video_width              = VIDEO_SCALE_W(p_dispwidget->last_video_dims);
+
+   if (*state->slot)
+   {
+      int width = font_driver_get_message_width(font_msg_queue->font,
+            state->slot, strlen(state->slot), 1.0f);
+      if (width > 0)
+         slot_width      = (unsigned)width + state->text_padding;
+   }
+
+   state->bg_width       = state->bg_min_width;
+   if (!state->bg_width || state->bg_width > last_video_width)
+      state->bg_width    = last_video_width;
+   state->bg_x           = ((float)last_video_width
+         - (float)state->bg_width) * 0.5f;
+   state->text_x         = state->bg_x + (float)state->text_padding;
+
+   area                  = state->bg_width - (state->text_padding * 2);
+   area                  = (area > slot_width) ? area - slot_width : 0;
+
+   text_width            = gfx_widget_generic_message_build_fixed(
+         state, font_msg_queue, 0);
+
+   /* Past the widest fit the leading characters go. Binary searched,
+    * so a long path costs a handful of width measurements rather
+    * than one per character of it. */
+   if (text_width > (int)area && *state->name)
+   {
+      size_t lo = 1;
+      size_t hi = utf8len(state->name);
+
+      while (lo < hi)
+      {
+         size_t mid = lo + ((hi - lo) >> 1);
+
+         if (gfx_widget_generic_message_build_fixed(
+                  state, font_msg_queue, mid) <= (int)area)
+            hi     = mid;
+         else
+            lo     = mid + 1;
+      }
+
+      gfx_widget_generic_message_build_fixed(state, font_msg_queue, lo);
+   }
 }
 
 /* Callbacks */
@@ -141,7 +236,7 @@ static void gfx_widget_generic_message_wait_cb(void *userdata)
    animation_entry.cb           = gfx_widget_generic_message_fade_out_cb;
    animation_entry.userdata     = NULL;
 
-   gfx_animation_push(&animation_entry);
+   gfx_animation_push_widget(&animation_entry);
    state->status = GFX_WIDGET_GENERIC_MESSAGE_FADE_OUT;
 }
 
@@ -156,28 +251,30 @@ static void gfx_widget_generic_message_slide_in_cb(void *userdata)
    timer.cb       = gfx_widget_generic_message_wait_cb;
    timer.userdata = state;
 
-   gfx_animation_timer_start(&state->timer, &timer);
+   gfx_animation_timer_start_widget(&state->timer, &timer);
    state->status = GFX_WIDGET_GENERIC_MESSAGE_WAIT;
 }
 
 /* Widget interface */
-void gfx_widget_set_generic_message(
+static void gfx_widget_set_generic_message_state(
       const char *msg, unsigned duration)
 {
    dispgfx_widget_t *p_dispwidget            = dispwidget_get_ptr();
    gfx_widget_generic_message_state_t *state = &p_w_generic_message_st;
-   unsigned last_video_width                 = p_dispwidget->last_video_width;
+   unsigned last_video_width                 = VIDEO_SCALE_W(p_dispwidget->last_video_dims);
    int text_width                            = 0;
    gfx_widget_font_data_t *font_msg_queue    = &p_dispwidget->gfx_widget_fonts.msg_queue;
 
    /* Ensure we have a valid message string */
-   if (string_is_empty(msg))
+   if (!msg || !*msg)
       return;
 
    /* Cache message parameters */
    state->message_len      = strlcpy(state->message,
          msg, sizeof(state->message));
    state->message_duration = duration;
+   state->progress[0]      = '\0';
+   state->fixed            = false;
 
    /* Get background width */
    text_width         = font_driver_get_message_width(
@@ -229,6 +326,151 @@ void gfx_widget_set_generic_message(
    state->message_updated = true;
 }
 
+/* A change from any thread, applied by the widgets' owner in
+ * iterate() */
+enum generic_message_cmd_kind
+{
+   GENERIC_MESSAGE_CMD_SET = 0,
+   GENERIC_MESSAGE_CMD_FIXED,
+   GENERIC_MESSAGE_CMD_PROGRESS
+};
+
+struct generic_message_cmd
+{
+   mpsc_stack_node_t link;  /* first: the stack's, from push to drain */
+   unsigned duration;
+   uint8_t  kind;           /* enum generic_message_cmd_kind */
+   char     msg[512];       /* SET: the message; PROGRESS: the label */
+   char     prefix[64];
+   char     suffix[8];
+   char     slot[32];
+   char     name[PATH_MAX_LENGTH];
+};
+
+static mpsc_stack_t generic_message_pending;
+
+static struct generic_message_cmd *generic_message_cmd_new(uint8_t kind,
+      unsigned duration)
+{
+   struct generic_message_cmd *cmd = (struct generic_message_cmd*)
+      malloc(sizeof(*cmd));
+   if (!cmd)
+      return NULL;
+   cmd->kind      = kind;
+   cmd->duration  = duration;
+   cmd->msg[0]    = '\0';
+   cmd->prefix[0] = '\0';
+   cmd->suffix[0] = '\0';
+   cmd->slot[0]   = '\0';
+   cmd->name[0]   = '\0';
+   return cmd;
+}
+
+void gfx_widget_set_generic_message(
+      const char *msg, unsigned duration)
+{
+   struct generic_message_cmd *cmd;
+   if (!msg || !*msg)
+      return;
+   if (!(cmd = generic_message_cmd_new(GENERIC_MESSAGE_CMD_SET, duration)))
+      return;
+   strlcpy(cmd->msg, msg, sizeof(cmd->msg));
+   mpsc_stack_push(&generic_message_pending, &cmd->link);
+}
+
+static void gfx_widget_set_generic_message_fixed_state(
+      const struct generic_message_cmd *cmd)
+{
+   gfx_widget_generic_message_state_t *state = &p_w_generic_message_st;
+
+   strlcpy(state->prefix, cmd->prefix, sizeof(state->prefix));
+   strlcpy(state->name,   cmd->name,   sizeof(state->name));
+   strlcpy(state->suffix, cmd->suffix, sizeof(state->suffix));
+   strlcpy(state->slot,   cmd->slot,   sizeof(state->slot));
+   state->message_duration = cmd->duration;
+   state->progress[0]      = '\0';
+   state->fixed            = true;
+
+   gfx_widget_generic_message_layout_fixed(state, dispwidget_get_ptr());
+
+   /* Same deferred animation handling as gfx_widget_set_generic_message() */
+   if (state->status != GFX_WIDGET_GENERIC_MESSAGE_SLIDE_IN)
+      state->message_updated = true;
+}
+
+void gfx_widget_set_generic_message_fixed(const char *prefix,
+      const char *name, const char *suffix, const char *slot,
+      unsigned duration)
+{
+   struct generic_message_cmd *cmd;
+
+   if (!prefix || !*prefix)
+      return;
+   if (!(cmd = generic_message_cmd_new(GENERIC_MESSAGE_CMD_FIXED,
+               duration)))
+      return;
+   strlcpy(cmd->prefix, prefix, sizeof(cmd->prefix));
+   if (name)
+      strlcpy(cmd->name,   name,   sizeof(cmd->name));
+   if (suffix)
+      strlcpy(cmd->suffix, suffix, sizeof(cmd->suffix));
+   if (slot)
+      strlcpy(cmd->slot,   slot,   sizeof(cmd->slot));
+   mpsc_stack_push(&generic_message_pending, &cmd->link);
+}
+
+static void gfx_widget_set_generic_message_progress_state(const char *label)
+{
+   gfx_widget_generic_message_state_t *state = &p_w_generic_message_st;
+
+   /* Only a message that reserved a slot takes a label */
+   if (state->fixed && *state->slot)
+   {
+      strlcpy(state->progress, label, sizeof(state->progress));
+
+      /* Restart the wait timer so the box stays up while loading;
+       * a pending slide-in picks up the change by itself */
+      if (state->status != GFX_WIDGET_GENERIC_MESSAGE_SLIDE_IN)
+         state->message_updated = true;
+   }
+}
+
+void gfx_widget_set_generic_message_progress(const char *label)
+{
+   struct generic_message_cmd *cmd = generic_message_cmd_new(
+         GENERIC_MESSAGE_CMD_PROGRESS, 0);
+   if (!cmd)
+      return;
+   if (label)
+      strlcpy(cmd->msg, label, sizeof(cmd->msg));
+   mpsc_stack_push(&generic_message_pending, &cmd->link);
+}
+
+static void gfx_widget_generic_message_apply_pending(void)
+{
+   mpsc_stack_node_t *link =
+         mpsc_stack_reverse(mpsc_stack_drain(&generic_message_pending));
+
+   while (link)
+   {
+      struct generic_message_cmd *cmd = (struct generic_message_cmd*)link;
+      link                            = link->next;
+      switch (cmd->kind)
+      {
+         case GENERIC_MESSAGE_CMD_SET:
+            gfx_widget_set_generic_message_state(cmd->msg, cmd->duration);
+            break;
+         case GENERIC_MESSAGE_CMD_FIXED:
+            gfx_widget_set_generic_message_fixed_state(cmd);
+            break;
+         case GENERIC_MESSAGE_CMD_PROGRESS:
+            gfx_widget_set_generic_message_progress_state(cmd->msg);
+            break;
+      }
+      free(cmd);
+   }
+}
+
 /* Widget layout() */
 
 static void gfx_widget_generic_message_layout(
@@ -238,8 +480,8 @@ static void gfx_widget_generic_message_layout(
    dispgfx_widget_t *p_dispwidget            = (dispgfx_widget_t*)data;
    gfx_widget_generic_message_state_t *state = &p_w_generic_message_st;
 
-   unsigned last_video_width                 = p_dispwidget->last_video_width;
-   unsigned last_video_height                = p_dispwidget->last_video_height;
+   unsigned last_video_width                 = VIDEO_SCALE_W(p_dispwidget->last_video_dims);
+   unsigned last_video_height                = VIDEO_SCALE_H(p_dispwidget->last_video_dims);
    unsigned divider_width                    = p_dispwidget->divider_width_1px;
    unsigned widget_padding                   = 0;
    int text_width                            = 0;
@@ -272,7 +514,7 @@ static void gfx_widget_generic_message_layout(
    /* Set background width */
    state->bg_width     = state->text_padding * 2;
 
-   if (!string_is_empty(state->message))
+   if (*state->message)
    {
       text_width       = font_driver_get_message_width(
             font_msg_queue->font, state->message,
@@ -312,16 +554,21 @@ static void gfx_widget_generic_message_layout(
    state->text_y_end      = state->bg_y_end + 
       ((float)state->bg_height * 0.5f) +
       (float)font_msg_queue->line_centre_offset;
+
+   if (state->fixed)
+      gfx_widget_generic_message_layout_fixed(state, p_dispwidget);
 }
 
 /* Widget iterate() */
 
 static void gfx_widget_generic_message_iterate(void *user_data,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       bool is_threaded)
 {
    gfx_widget_generic_message_state_t *state = &p_w_generic_message_st;
+
+   gfx_widget_generic_message_apply_pending();
 
    if (state->message_updated)
    {
@@ -348,7 +595,7 @@ static void gfx_widget_generic_message_iterate(void *user_data,
             animation_entry.cb           = gfx_widget_generic_message_slide_in_cb;
             animation_entry.userdata     = state;
 
-            gfx_animation_push(&animation_entry);
+            gfx_animation_push_widget(&animation_entry);
             state->status = GFX_WIDGET_GENERIC_MESSAGE_SLIDE_IN;
             break;
          case GFX_WIDGET_GENERIC_MESSAGE_FADE_IN:
@@ -379,7 +626,7 @@ static void gfx_widget_generic_message_iterate(void *user_data,
                   animation_entry.cb           = gfx_widget_generic_message_slide_in_cb;
                   animation_entry.userdata     = state;
 
-                  gfx_animation_push(&animation_entry);
+                  gfx_animation_push_widget(&animation_entry);
                   state->status = GFX_WIDGET_GENERIC_MESSAGE_FADE_IN;
                }
             }
@@ -418,8 +665,8 @@ static void gfx_widget_generic_message_frame(void *data, void *user_data)
       video_frame_info_t *video_info         = (video_frame_info_t*)data;
       dispgfx_widget_t *p_dispwidget         = (dispgfx_widget_t*)user_data;
 
-      unsigned video_width                   = video_info->width;
-      unsigned video_height                  = video_info->height;
+      unsigned video_width                   = VIDEO_SCALE_W(video_info->dims);
+      unsigned video_height                  = VIDEO_SCALE_H(video_info->dims);
       void *userdata                         = video_info->userdata;
       gfx_display_t *p_disp                  = (gfx_display_t*)video_info->disp_userdata;
       gfx_widget_font_data_t *font_msg_queue = &p_dispwidget->gfx_widget_fonts.msg_queue;
@@ -469,14 +716,11 @@ static void gfx_widget_generic_message_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_x,
                bg_y,
-               state->bg_width,
-               state->bg_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->bg_width, state->bg_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_color,
                NULL);
 
@@ -486,14 +730,12 @@ static void gfx_widget_generic_message_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_x - (float)state->frame_width,
                bg_y - (float)state->frame_width,
-               state->bg_width + (state->frame_width * 2),
-               state->frame_width,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->bg_width + (state->frame_width * 2),
+                     state->frame_width),
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->frame_color,
                NULL);
 
@@ -501,14 +743,11 @@ static void gfx_widget_generic_message_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_x - (float)state->frame_width,
                bg_y,
-               state->frame_width,
-               state->bg_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->frame_width, state->bg_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->frame_color,
                NULL);
 
@@ -516,14 +755,11 @@ static void gfx_widget_generic_message_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_x + (float)state->bg_width,
                bg_y,
-               state->frame_width,
-               state->bg_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->frame_width, state->bg_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->frame_color,
                NULL);
 
@@ -533,16 +769,28 @@ static void gfx_widget_generic_message_frame(void *data, void *user_data)
                state->message,
                state->text_x,
                text_y,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                text_color,
                TEXT_ALIGN_LEFT,
                true);
 
+         if (*state->progress)
+            gfx_widgets_draw_text(
+                  font_msg_queue,
+                  state->progress,
+                  state->bg_x + (float)state->bg_width
+                        - (float)state->text_padding,
+                  text_y,
+                  VIDEO_SCALE_PACK(video_width, video_height),
+                  COLOR_TEXT_ALPHA(state->text_color,
+                        (unsigned)(widget_alpha * 128.0f)),
+                  TEXT_ALIGN_RIGHT,
+                  true);
+
          /* If the message queue is active, must flush the
           * text here to avoid overlaps */
          if (msg_queue_size > 0)
-            gfx_widgets_flush_text(video_width, video_height,
+            gfx_widgets_flush_text(VIDEO_SCALE_PACK(video_width, video_height),
                   font_msg_queue);
       }
    }
@@ -552,10 +800,23 @@ static void gfx_widget_generic_message_frame(void *data, void *user_data)
 
 static void gfx_widget_generic_message_free(void)
 {
+   mpsc_stack_node_t *link = mpsc_stack_drain(&generic_message_pending);
+   while (link)
+   {
+      mpsc_stack_node_t *next = link->next;
+      free(link);
+      link                    = next;
+   }
    gfx_widget_generic_message_reset(true);
 }
 
 /* Widget definition */
+
+static bool gfx_widget_generic_message_visible(void)
+{
+   gfx_widget_generic_message_state_t *state = &p_w_generic_message_st;
+   return state->status != GFX_WIDGET_GENERIC_MESSAGE_IDLE;
+}
 
 const gfx_widget_t gfx_widget_generic_message = {
    NULL, /* init */
@@ -564,5 +825,6 @@ const gfx_widget_t gfx_widget_generic_message = {
    NULL, /* context_destroy */
    gfx_widget_generic_message_layout,
    gfx_widget_generic_message_iterate,
-   gfx_widget_generic_message_frame
+   gfx_widget_generic_message_frame,
+   gfx_widget_generic_message_visible
 };

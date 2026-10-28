@@ -1,5 +1,8 @@
 image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-amd64-ubuntu:latest
 
+default:
+  interruptible: true
+
 stages:
   - build-prepare
   - build
@@ -7,7 +10,7 @@ stages:
   - trigger-static-cores
 
 build-retroarch-windows-x64:
-  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-mxe-win64-cross:gcc10
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-mxe-win64-cross:gcc16
   stage: build
   variables:
     MEDIA_PATH: .media
@@ -51,7 +54,7 @@ build-retroarch-windows-x64:
     - "rm -f ${MEDIA_PATH}/${CI_PROJECT_NAME}/redist/opengl32.dll"
 
 build-retroarch-windows-i686:
-  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-mxe-win32-cross:gcc10
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-mxe-win32-cross:gcc16
   stage: build
   variables:
     MEDIA_PATH: .media
@@ -327,7 +330,75 @@ build-retroarch-linux-i686:
     - "cd gfx/video_filters && make -j$NUMPROC build=release && make -j$NUMPROC build=release strip && cd -"
     - "cp -f gfx/video_filters/*.so ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video"
     - "cp -f gfx/video_filters/*.filt ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video"
-  
+
+build-retroarch-linux-aarch64:
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-aarch64-ubuntu:latest
+  stage: build
+  tags:
+    - aarch64
+  variables:
+    MEDIA_PATH: .media
+    STRIP_BIN:  1
+  before_script:
+    - export NUMPROC=$(($(nproc)/3))
+  artifacts:
+    paths:
+    - retroarch
+    - retroarch_qt
+    - ${MEDIA_PATH}
+    expire_in: 10 min
+  dependencies: []
+  script:
+    # Qt build
+    - "mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/AppDirQt"
+    - "./configure --disable-ffmpeg --prefix=/usr"
+    - "make -j$NUMPROC"
+    - if [ $STRIP_BIN -eq 1 ]; then strip --strip-unneeded retroarch; fi
+    - "make install DESTDIR=${MEDIA_PATH}/${CI_PROJECT_NAME}/AppDirQt prefix=/usr"
+    - "rm -rf ${MEDIA_PATH}/${CI_PROJECT_NAME}/AppDirQt/etc"
+    - "cd ${MEDIA_PATH}/${CI_PROJECT_NAME}/ && tar -czf AppDirQt.tar.gz AppDirQt && rm -rf AppDirQt && cd -"
+    - "mv -f retroarch retroarch_qt"
+    # Non-Qt build
+    - "mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/AppDir"
+    - "make clean"
+    - "./configure --disable-ffmpeg --disable-qt --enable-openxr --prefix=/usr"
+    - "make -j$NUMPROC"
+    - if [ $STRIP_BIN -eq 1 ]; then strip --strip-unneeded retroarch; fi
+    - "make install DESTDIR=${MEDIA_PATH}/${CI_PROJECT_NAME}/AppDir prefix=/usr"
+    - "rm -rf ${MEDIA_PATH}/${CI_PROJECT_NAME}/AppDir/etc"
+    - "cd ${MEDIA_PATH}/${CI_PROJECT_NAME}/ && tar -czf AppDir.tar.gz AppDir && rm -rf AppDir && cd -"
+    # Filters
+    - "mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/audio"
+    - "mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video"
+    - "cd libretro-common/audio/dsp_filters && make -j$NUMPROC build=release && make -j$NUMPROC build=release strip && cd -"
+    - "cp -f libretro-common/audio/dsp_filters/*.so ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/audio"
+    - "cp -f libretro-common/audio/dsp_filters/*.dsp ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/audio"
+    - "cd gfx/video_filters && make -j$NUMPROC build=release && make -j$NUMPROC build=release strip && cd -"
+    - "cp -f gfx/video_filters/*.so ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video"
+    - "cp -f gfx/video_filters/*.filt ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video"
+
+build-retroarch-webos-armv7a:
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-webos:latest
+  stage: build
+  variables:
+    MEDIA_PATH: .media
+  before_script:
+    - export NUMPROC=$(($(nproc)/3))
+    - . /developer/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+  artifacts:
+    paths:
+    - retroarch
+    - ${MEDIA_PATH}
+    expire_in: 10 min
+  dependencies: []
+  script:
+    - make -f Makefile.webos retroarch -j$NUMPROC
+    - arm-webos-linux-gnueabi-strip --strip-unneeded retroarch
+    - mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/audio
+    - mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video
+    - cp -f libretro-common/audio/dsp_filters/*.dsp ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/audio
+    - cp -f gfx/video_filters/*.filt ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video
+
 .build-retroarch-macos-xcode:
   # Metal/Universal x86_64 arm64 is default
   tags:
@@ -629,7 +700,7 @@ build-retroarch-android-playstore-plus:
       mv .retroarch-precompiled/ retroarch-precompiled/
 
 build-static-retroarch-libnx-aarch64:
-  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-libnx-devkitpro:latest
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-libnx-devkitpro:v4-10-0
   stage: prepare-for-static-cores
   before_script:
     - export NUMPROC=$(($(nproc)/3))
@@ -649,7 +720,7 @@ build-static-retroarch-libnx-aarch64:
     - "mv .retroarch-precompiled/ retroarch-precompiled/"
 
 build-static-retroarch-dummy-libnx-aarch64:
-  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-libnx-devkitpro:latest
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-libnx-devkitpro:v4-10-0
   stage: build
   variables:
     MEDIA_PATH: .media
@@ -714,7 +785,7 @@ build-static-retroarch-dummy-psp:
     - "cp -f pkg/psp1/PIC1.PNG ${MEDIA_PATH}/${CI_PROJECT_NAME}/pkg"
 
 build-static-retroarch-vita:
-  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-vita:latest
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-vita:latest-20260905
   stage: prepare-for-static-cores
   before_script:
     - export NUMPROC=$(($(nproc)/3))
@@ -740,7 +811,7 @@ build-static-retroarch-vita:
     - "mv .retroarch-precompiled-gl/ retroarch-precompiled-gl/"
 
 build-static-retroarch-dummy-vita:
-  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-vita:latest
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-vita:latest-20260905
   stage: build
   variables:
     MEDIA_PATH: .media
@@ -877,6 +948,19 @@ build-static-retroarch-djgpp:
     - "cp -r ./* .retroarch-precompiled/"
     - "mv .retroarch-precompiled/ retroarch-precompiled/"
 
+#build-static-retroarch-dummy-djgpp:
+#  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-djgpp-build-container:latest
+#  stage: build
+#  before_script:
+#    - export NUMPROC=$(($(nproc)/3))
+#  artifacts:
+#    paths:
+#    -  retrodos.exe
+#    expire_in: 10 min
+#  dependencies: []
+#  script:
+#    - "make -f Makefile.dos.salamander -j$NUMPROC release"
+
 build-static-retroarch-ctr:
   image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-devkitpro:latest
   stage: prepare-for-static-cores
@@ -910,7 +994,7 @@ build-static-retroarch-ctr-legacy:
   needs: []
   script:
     # Allow failure since we don't have a core
-    - "make -f Makefile.ctr -j$NUMPROC ||:"
+    - "make -f Makefile.ctr -j$NUMPROC USE_CTRULIB_2=0 ||:"
     - "mkdir .retroarch-precompiled"
     - "cp -r ./* .retroarch-precompiled/"
     - "mv .retroarch-precompiled/ retroarch-precompiled/"
@@ -997,7 +1081,7 @@ build-static-retroarch-wii:
     - build-static-retroarch-dummy-wii
   script:
     # Allow failure since we don't have a core
-    - "make -f Makefile.wii -j$NUMPROC EXTERNAL_LIBOGC=1 GX_PTHREAD_LEGACY=0 ||:"
+    - "make -f Makefile.wii -j$NUMPROC HAVE_LIBOGC=1 ||:"
     - "mkdir .retroarch-precompiled"
     - "cp -r ./* .retroarch-precompiled/"
     - "mv .retroarch-precompiled/ retroarch-precompiled/"
@@ -1016,7 +1100,7 @@ build-static-retroarch-dummy-wii:
     expire_in: 10 min
   dependencies: []
   script:
-    - "make -f Makefile.wii.salamander -j$NUMPROC EXTERNAL_LIBOGC=1 GX_PTHREAD_LEGACY=0"
+    - "make -f Makefile.wii.salamander -j$NUMPROC HAVE_LIBOGC=1"
     - "mv -f retroarch-salamander_wii.dol boot.dol"
     - "mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/audio"
     - "mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/filters/video"
@@ -1041,7 +1125,7 @@ build-static-retroarch-ngc:
     - build-static-retroarch-dummy-ngc
   script:
     # Allow failure since we don't have a core
-    - "make -f Makefile.ngc -j$NUMPROC EXTERNAL_LIBOGC=1 GX_PTHREAD_LEGACY=0 ||:"
+    - "make -f Makefile.ngc -j$NUMPROC HAVE_LIBOGC=1 ||:"
     - "mkdir .retroarch-precompiled"
     - "cp -r ./* .retroarch-precompiled/"
     - "mv .retroarch-precompiled/ retroarch-precompiled/"

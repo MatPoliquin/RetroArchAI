@@ -1,0 +1,55 @@
+# The ffmpeg core's audio pipe (decode thread -> main thread), driven
+# as a libretro host: steady state, seeks both ways, teardown.
+
+include ../../sample_objdir.mk
+
+CORE_DIR          := ../../..
+LIBRETRO_COMM_DIR := $(CORE_DIR)/libretro-common
+FF_CORE_DIR       := $(CORE_DIR)/cores/libretro-ffmpeg
+
+TARGET    := ffmpeg_audio_pipe_test
+
+SOURCES_C := \
+	ffmpeg_audio_pipe_test.c \
+	$(FF_CORE_DIR)/ffmpeg_core.c \
+	$(LIBRETRO_COMM_DIR)/queues/retro_spsc.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/tpool.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.c
+
+OBJS      := $(call sample_objs,$(SOURCES_C:.c=.o))
+
+FF_CFLAGS := $(shell pkg-config --cflags libavcodec libavformat libavutil libswscale libswresample 2>/dev/null)
+FF_LIBS   := $(shell pkg-config --libs   libavcodec libavformat libavutil libswscale libswresample 2>/dev/null)
+
+INCDIRS   := -I$(LIBRETRO_COMM_DIR)/include -I$(LIBRETRO_COMM_DIR)/include/compat -I$(FF_CORE_DIR)
+CFLAGS   += -Wall $(INCDIRS) $(FF_CFLAGS)
+CFLAGS   += -DHAVE_THREADS -DHAVE_SWRESAMPLE -D_GNU_SOURCE
+LDFLAGS  += $(FF_LIBS) -lm -lpthread
+
+ifneq ($(SANITIZER),)
+CFLAGS  += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer -g1
+LDFLAGS += -fsanitize=$(SANITIZER)
+else
+CFLAGS  += -g1 -O1
+endif
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $(OBJS) $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -std=gnu99 -c -o $@ $<
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -std=gnu99 -c -o $@ $<
+
+clean:
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(TARGET) $(OBJS) ffmpeg_audio_pipe_test.mkv
+
+.PHONY: clean

@@ -34,19 +34,20 @@ typedef struct gl3_filter_chain gl3_filter_chain_t;
 struct gl3_filter_chain_texture
 {
    GLuint image;
-   unsigned width;
-   unsigned height;
-   unsigned padded_width;
-   unsigned padded_height;
+   unsigned dims;        /* VIDEO_SCALE_PACK */
+   /* The texture's size, and where in it the frame starts, when the
+    * frame is not all of it: VIDEO_SCALE_PACK, padded_dims 0 for all. */
+   unsigned padded_dims;
+   unsigned origin;
    GLenum format;
 };
 
 struct gl3_viewport
 {
-   GLint x;
-   GLint y;
-   GLsizei width;
-   GLsizei height;
+   /* The origin and the drawn area, one word each, in
+    * VIDEO_POS_PACK's and VIDEO_SCALE_PACK's layouts. */
+   unsigned pos;
+   unsigned dims;
 };
 
 struct gl3_filter_chain_pass_info
@@ -77,6 +78,10 @@ struct gl3_buffer_locations
    GLint flat_push_fragment;
    GLuint buffer_index_ubo_vertex;
    GLuint buffer_index_ubo_fragment;
+   /* Only used by the GL_ARB_gl_spirv path, where the push constant block
+    * is lowered into a second uniform buffer. GL_INVALID_INDEX otherwise. */
+   GLuint buffer_index_push_vertex;
+   GLuint buffer_index_push_fragment;
 };
 
 gl3_filter_chain_t *gl3_filter_chain_new(void);
@@ -98,11 +103,25 @@ void gl3_filter_chain_set_pass_info(
 
 bool gl3_filter_chain_init(gl3_filter_chain_t *chain);
 
+void gl3_filter_chain_set_passthrough(
+      gl3_filter_chain_t *chain, unsigned passthrough);
+
+void gl3_filter_chain_set_source_hdr(
+      gl3_filter_chain_t *chain, unsigned source_hdr);
+
 void gl3_filter_chain_set_input_texture(
       gl3_filter_chain_t *chain,
       const struct gl3_filter_chain_texture *texture);
 
+/* Whether the chain reads a frame where it lies in a larger texture,
+ * rather than copying it out. */
+bool gl3_filter_chain_reads_in_place(gl3_filter_chain_t *chain);
+
 void gl3_filter_chain_set_frame_count(
+      gl3_filter_chain_t *chain,
+      uint64_t count);
+
+void gl3_filter_chain_set_swap_count(
       gl3_filter_chain_t *chain,
       uint64_t count);
 
@@ -118,6 +137,10 @@ void gl3_filter_chain_set_frame_direction(
 void gl3_filter_chain_set_frame_time_delta(
       gl3_filter_chain_t *chain,
       uint32_t time_delta);
+
+void gl3_filter_chain_set_hdr_parameters(
+      gl3_filter_chain_t *chain, unsigned mode,
+      float paper_white_nits, unsigned expand_gamut, float peak_nits);
 
 void gl3_filter_chain_set_original_fps(
       gl3_filter_chain_t *chain,
@@ -147,7 +170,13 @@ void gl3_filter_chain_set_current_shader_subframe(
 void gl3_filter_chain_set_simulate_scanline(
       gl3_filter_chain_t *chain,
       bool simulate_scanline);
-#endif // GL3_ROLLING_SCANLINE_SIMULATION
+#endif /* GL3_ROLLING_SCANLINE_SIMULATION */
+
+/* Cuts the final pass to @scissor, inside its viewport, until NULL is
+ * set: a view placed larger than the part of its target it may fill. */
+void gl3_filter_chain_set_scissor(
+      gl3_filter_chain_t *chain,
+      const struct gl3_viewport *scissor);
 
 void gl3_filter_chain_set_pass_name(
       gl3_filter_chain_t *chain,
@@ -163,15 +192,72 @@ void gl3_filter_chain_build_viewport_pass(
       const struct gl3_viewport *vp,
       const float *mvp);
 
+/* The final pass again, into another viewport in the same frame, for a
+ * view shown in both eyes: the feedback buffers swap once per frame. */
+void gl3_filter_chain_build_viewport_pass_again(
+      gl3_filter_chain_t *chain,
+      const struct gl3_viewport *vp,
+      const float *mvp);
+
 gl3_filter_chain_t *gl3_filter_chain_create_default(
       enum glslang_filter_chain_filter filter);
 
+gl3_filter_chain_t *gl3_filter_chain_create_shrink(void);
+
+/* @frame_rect: frames may come inside a larger texture (padded_dims);
+ * the passes are built to read them there where the preset allows,
+ * rather than have each copied out. */
 gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
       const char *path,
-      enum glslang_filter_chain_filter filter);
+      enum glslang_filter_chain_filter filter,
+      bool frame_rect);
 
+/**
+ * Deferred (per-frame) filter chain creation API.
+ * Splits gl3_filter_chain_create_from_preset into three phases:
+ *   1. create_deferred  - parse preset, load LUTs, allocate pass slots
+ *   2. compile_pass     - compile one shader pass (call once per frame)
+ *   3. finalize         - init history/feedback, mark chain ready
+ **/
 struct video_shader *gl3_filter_chain_get_preset(
       gl3_filter_chain_t *chain);
+
+/* ---- Deferred (per-frame) filter chain construction ---- */
+
+/**
+ * gl3_filter_chain_create_deferred:
+ *
+ * Parse a preset and allocate a chain, load LUT textures, but do NOT
+ * compile any shader passes. Returns NULL on failure.
+ * The returned chain is NOT yet usable for rendering.
+ **/
+/* The scheduled count may include a copy step pruned after reflection. */
+gl3_filter_chain_t *gl3_filter_chain_create_deferred(
+      const char *path,
+      enum glslang_filter_chain_filter filter,
+      bool frame_rect,
+      unsigned *out_num_passes);
+
+/**
+ * gl3_filter_chain_compile_pass:
+ *
+ * SPIRV-cross-compile and GL-compile/link one shader pass.
+ * Call once per frame with incrementing pass_index.
+ * Returns true on success, false on error.
+ **/
+bool gl3_filter_chain_compile_pass(
+      gl3_filter_chain_t *chain,
+      unsigned pass_index,
+      enum glslang_filter_chain_filter filter);
+
+/**
+ * gl3_filter_chain_finalize:
+ *
+ * Finalize the chain after all passes are compiled:
+ * init aliases, build GPU resources, set up history/feedback.
+ * Returns true on success.
+ **/
+bool gl3_filter_chain_finalize(gl3_filter_chain_t *chain);
 
 void gl3_filter_chain_end_frame(gl3_filter_chain_t *chain);
 
@@ -182,6 +268,38 @@ GLuint gl3_cross_compile_program(
       size_t fragment_size,
       struct gl3_buffer_locations *loc,
       bool flatten);
+
+/**
+ * gl3_spirv_binary_supported:
+ *
+ * Returns true when the driver can consume SPIR-V modules directly through
+ * GL_ARB_gl_spirv, i.e. when cross compilation to GLSL can be skipped.
+ * Implemented by the gl3 driver; the result is cached after the first call.
+ **/
+bool gl3_spirv_binary_supported(void);
+/* Latches the direct-SPIR-V user toggle; called at init and
+ * set_shader (blocking windows) so binary_supported never reads
+ * live settings from the video thread. */
+void gl3_spirv_refresh_direct_toggle(void);
+
+/**
+ * gl3_spirv_link_program:
+ * @push_binding : uniform block binding to give the lowered push constant
+ *                 block. Must differ from the binding the shader's own UBO
+ *                 uses.
+ *
+ * Builds a program by handing both SPIR-V modules straight to the driver,
+ * bypassing SPIRV-Cross and the driver's GLSL front end. Returns 0 if the
+ * modules cannot be lowered to OpenGL SPIR-V, or if specialization or
+ * linking fails, in which case the caller should fall back to
+ * gl3_cross_compile_program().
+ **/
+GLuint gl3_spirv_link_program(
+      const uint32_t *vertex,
+      size_t vertex_words,
+      const uint32_t *fragment,
+      size_t fragment_words,
+      unsigned push_binding);
 
 RETRO_END_DECLS
 

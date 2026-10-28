@@ -1,0 +1,210 @@
+name: CI Linux samples/record
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'record/**'
+      - 'gfx/common/videotoolbox_encode*.h'
+      - 'libretro-common/queues/**'
+      - 'libretro-common/include/retro_spsc.h'
+      - 'libretro-common/include/retro_atomic.h'
+      - 'samples/record/**'
+      - '.github/workflows/Linux-samples-record.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'record/**'
+      - 'gfx/common/videotoolbox_encode*.h'
+      - 'libretro-common/queues/**'
+      - 'libretro-common/include/retro_spsc.h'
+      - 'libretro-common/include/retro_atomic.h'
+      - 'samples/record/**'
+      - '.github/workflows/Linux-samples-record.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  samples-record:
+    name: Build and run samples/record
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: mingw-w64 wine build-essential pkg-config ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev ccache
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Build and run ffmpeg_pipeline_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/record/ffmpeg_pipeline
+        run: |
+          set -eu
+          # record/drivers/record_ffmpeg.c end to end: frames whose
+          # pixels encode their number, plus audio, pushed from the
+          # test thread while the driver's encoder thread drains the
+          # attr/video/audio rings; the file is decoded back and every
+          # frame checked in order and pixel-exact.  Covers the rings
+          # under contention, the full-queue wait, and the drain after
+          # the encoder thread is joined.  Needs libavcodec with
+          # libx264rgb (Ubuntu's has it).
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x ffmpeg_pipeline_test
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 300 \
+             ./ffmpeg_pipeline_test
+          echo "[pass] ffmpeg_pipeline_test (ASan)"
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 300 ./ffmpeg_pipeline_test
+          echo "[pass] ffmpeg_pipeline_test (TSan)"
+          # The same run on a video ring that cannot be mirrored, as on
+          # a platform without a double mapping: frames that straddle
+          # the wrap go through the encoder side's scratch copy.
+          make clean SANITIZER=address,undefined PLAIN_RING=1 && make -j$(nproc) all SANITIZER=address,undefined PLAIN_RING=1
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 300 \
+             ./ffmpeg_pipeline_test
+          echo "[pass] ffmpeg_pipeline_test (plain ring, ASan)"
+
+      - name: Native overlapped file output
+        working-directory: samples/record/file_win32
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean && make check SANITIZER=address,undefined
+          make clean && make check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make clean
+
+      - name: Native MP4 mux (ASan + UBSan, mingw-w64)
+        shell: bash
+        working-directory: samples/record/mp4_mux
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean && make -j$(nproc) check SANITIZER=address,undefined
+          make clean && make -j$(nproc) check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make clean
+
+      - name: GPU PCM output pipeline (ASan + UBSan, TSan, mingw-w64)
+        working-directory: samples/record/gpu_av_output
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean && make -j$(nproc) check SANITIZER=address,undefined
+          make clean && make thread_test session_test SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./thread_test
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./session_test
+          make clean && make -j$(nproc) check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make clean
+
+      - name: GPU recording dispatcher (ASan + UBSan, TSan, mingw-w64)
+        working-directory: samples/record/gpu_dispatch
+        run: |
+          set -eu
+          make clean && make check SANITIZER=address,undefined
+          make clean && make dispatch_test session_integration SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./dispatch_test
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./session_integration
+          # one Wine server for the three tests: one each, a test that
+          # starts as the last server leaves is cut off before main()
+          wineserver -p
+          trap 'wineserver -k || true' EXIT
+          make clean && make check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make clean
+
+      - name: Native recording frontend clock and PCM (ASan + UBSan, mingw-w64)
+        working-directory: samples/record/nvenc_frontend
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean && make check SANITIZER=address,undefined
+          make clean && make check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make clean
+
+      # The Apple API stand-in checks ownership/configuration only. Native
+      # compilation and hardware encode run in MacOS-videotoolbox-encode.yml.
+      - name: VideoToolbox encode callback and session contracts
+        working-directory: samples/record/videotoolbox_encode
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean && make check thread_test worker_thread_test audio_thread_test av_session_thread_test SANITIZER=address,undefined
+          ./thread_test
+          ./worker_thread_test
+          ./audio_thread_test
+          ./av_session_thread_test
+          make clean && make thread_test worker_thread_test audio_thread_test av_session_thread_test SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./thread_test
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./worker_thread_test
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./audio_thread_test
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./av_session_thread_test
+          make clean && make check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

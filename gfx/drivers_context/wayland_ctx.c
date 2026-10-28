@@ -16,16 +16,23 @@
 
 #include <unistd.h>
 
+#ifdef HAVE_WAYLAND_BACKPORT
+#include "../../gfx/common/wayland_common_backport.h"
+#endif
+
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 
 #include <string/stdstring.h>
+#include <lists/string_list.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
 #endif
 
 #include "../common/wayland_common.h"
+#include "../common/wayland_resize.h"
+#include "../gfx/video_driver.h"
 #include "../../frontend/frontend_driver.h"
 #include "../../input/common/wayland_common.h"
 #include "../../input/input_driver.h"
@@ -34,7 +41,6 @@
 
 #ifdef HAVE_EGL
 #include <wayland-egl.h>
-#include <poll.h>
 #include "../common/egl_common.h"
 #endif
 
@@ -46,117 +52,87 @@
 #define EGL_PLATFORM_WAYLAND_KHR 0x31D8
 #endif
 
+#ifdef WEBOS
+extern void gfx_ctx_wl_get_video_size_webos(void*, unsigned*);
+extern void gfx_ctx_wl_update_title_webos(void*);
+extern bool gfx_ctx_wl_init_webos(driver_configure_handler_t, gfx_ctx_wayland_data_t**);
+extern bool gfx_ctx_wl_set_video_mode_common_size_webos(gfx_ctx_wayland_data_t*, unsigned, unsigned, bool);
+extern bool gfx_ctx_wl_set_video_mode_common_fullscreen_webos(gfx_ctx_wayland_data_t*, bool);
+extern bool gfx_ctx_wl_suppress_screensaver_webos(void*, bool);
+extern void gfx_ctx_wl_check_window_webos(gfx_ctx_wayland_data_t*, void (*)(void*, unsigned*), bool*, bool*, unsigned*);
+
+#define gfx_ctx_wl_get_video_size_common gfx_ctx_wl_get_video_size_webos
+#define gfx_ctx_wl_update_title_common gfx_ctx_wl_update_title_webos
+#define gfx_ctx_wl_init_common gfx_ctx_wl_init_webos
+#define gfx_ctx_wl_set_video_mode_common_size gfx_ctx_wl_set_video_mode_common_size_webos
+#define gfx_ctx_wl_set_video_mode_common_fullscreen gfx_ctx_wl_set_video_mode_common_fullscreen_webos
+#define gfx_ctx_wl_suppress_screensaver gfx_ctx_wl_suppress_screensaver_webos
+#define gfx_ctx_wl_check_window_common gfx_ctx_wl_check_window_webos
+#endif
+
 static enum gfx_ctx_api wl_api   = GFX_CTX_NONE;
 
-/* Shell surface callbacks. */
-static void xdg_toplevel_handle_configure(void *data,
-      struct xdg_toplevel *toplevel,
-      int32_t width, int32_t height, struct wl_array *states)
-{
-   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-   if (wl->ignore_configuration)
-      return;
-   xdg_toplevel_handle_configure_common(wl, toplevel, width, height, states);
 #ifdef HAVE_EGL
+/* Invoked from the common shell-surface configure handlers after the
+ * shared configure processing; resizes (or lazily creates) the
+ * wl_egl_window to the new buffer dimensions. */
+static void gfx_ctx_wl_egl_configure(gfx_ctx_wayland_data_t *wl)
+{
    if (wl->win)
       wl_egl_window_resize(wl->win,
-            wl->buffer_width,
-            wl->buffer_height,
+            VIDEO_SCALE_W(wl->buffer_dims),
+            VIDEO_SCALE_H(wl->buffer_dims),
             0, 0);
    else
       wl->win = wl_egl_window_create(wl->surface,
-            wl->buffer_width,
-            wl->buffer_height);
-#endif
-
-   wl->configured = false;
+            VIDEO_SCALE_W(wl->buffer_dims),
+            VIDEO_SCALE_H(wl->buffer_dims));
 }
+#endif
 
 static void gfx_ctx_wl_destroy_resources(gfx_ctx_wayland_data_t *wl)
 {
    if (!wl)
       return;
 
+   /* The GPU list goes with the context, on every path out of it */
+   if (wl->gl_gpu_list)
+   {
+      video_driver_set_gpu_api_devices(wl_api, NULL);
+      string_list_free(wl->gl_gpu_list);
+      wl->gl_gpu_list = NULL;
+   }
+
 #ifdef HAVE_EGL
    egl_destroy(&wl->egl);
 
    if (wl->win)
       wl_egl_window_destroy(wl->win);
-#endif
-
-   gfx_ctx_wl_destroy_resources_common(wl);
-
-#ifdef HAVE_EGL
    wl->win          = NULL;
 #endif
 }
 
 static void gfx_ctx_wl_check_window(void *data, bool *quit,
-      bool *resize, unsigned *width, unsigned *height)
+      bool *resize, unsigned *dims)
 {
    gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-   gfx_ctx_wl_check_window_common(wl, gfx_ctx_wl_get_video_size_common, quit, resize, width, height);
+   gfx_ctx_wl_check_window_common(wl, gfx_ctx_wl_get_video_size_common,
+         quit, resize, dims);
 }
 
-static bool gfx_ctx_wl_set_resize(void *data, unsigned width, unsigned height)
+static bool gfx_ctx_wl_set_resize(void *data, unsigned dims)
 {
    gfx_ctx_wayland_data_t *wl    = (gfx_ctx_wayland_data_t*)data;
    wl->last_buffer_scale         = wl->buffer_scale;
    wl->last_fractional_scale_num = wl->fractional_scale_num;
-   if (!wl->fractional_scale)
-      wl_surface_set_buffer_scale(wl->surface, wl->buffer_scale);
-
-   wl->ignore_configuration = false;
+   wl_surface_resized(wl->surface, wl->fractional_scale != NULL,
+         wl->buffer_scale, &wl->ignore_configuration);
 #ifdef HAVE_EGL
-   wl_egl_window_resize(wl->win, width, height, 0, 0);
+   wl_egl_window_resize(wl->win, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), 0, 0);
 #endif
 
    return true;
 }
-
-#ifdef HAVE_LIBDECOR_H
-static void
-libdecor_frame_handle_configure(struct libdecor_frame *frame,
-      struct libdecor_configuration *configuration, void *data)
-{
-   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-   if (wl->ignore_configuration)
-      return;
-   libdecor_frame_handle_configure_common(frame, configuration, wl);
-
-#ifdef HAVE_EGL
-   if (wl->win)
-      wl_egl_window_resize(wl->win,
-            wl->buffer_width,
-            wl->buffer_height,
-            0, 0);
-   else
-      wl->win     = wl_egl_window_create(
-            wl->surface,
-            wl->buffer_width,
-            wl->buffer_height);
-#endif
-
-   wl->configured = false;
-}
-#endif
-
-static const toplevel_listener_t toplevel_listener = {
-#ifdef HAVE_LIBDECOR_H
-   .libdecor_frame_interface = {
-     libdecor_frame_handle_configure,
-     libdecor_frame_handle_close,
-     libdecor_frame_handle_commit,
-   },
-#endif
-   .xdg_toplevel_listener = {
-      xdg_toplevel_handle_configure,
-      xdg_toplevel_handle_close,
-   },
-};
-
-static const toplevel_listener_t xdg_toplevel_listener = {
-};
 
 #ifdef HAVE_EGL
 #define WL_EGL_ATTRIBS_BASE \
@@ -176,7 +152,7 @@ static bool gfx_ctx_wl_egl_init_context(gfx_ctx_wayland_data_t *wl)
    };
 
 #ifdef HAVE_OPENGLES
-#ifdef HAVE_OPENGLES2
+#if defined(HAVE_OPENGLES2) || defined(HAVE_OPENGLES3)
    static const EGLint egl_attribs_gles[] = {
       WL_EGL_ATTRIBS_BASE,
       EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
@@ -222,7 +198,7 @@ static bool gfx_ctx_wl_egl_init_context(gfx_ctx_wayland_data_t *wl)
          else
 #endif
 #endif
-#ifdef HAVE_OPENGLES2
+#if defined(HAVE_OPENGLES2) || defined(HAVE_OPENGLES3)
             attrib_ptr = egl_attribs_gles;
 #endif
 #endif
@@ -237,17 +213,78 @@ static bool gfx_ctx_wl_egl_init_context(gfx_ctx_wayland_data_t *wl)
          break;
    }
 
-   if (!egl_init_context(&wl->egl,
+   /* The GPU: the GL GPU index picks one of EGL's devices, 0 leaving
+    * it to the implementation as before; a device that cannot drive
+    * this display gives way to the default. */
+   {
+      bool ok              = false;
+      void *device         = NULL;
+      settings_t *settings = config_get_ptr();
+      if (wl->gl_gpu_list)
+         string_list_free(wl->gl_gpu_list);
+      wl->gl_gpu_list = egl_gpu_list_new();
+      /* The device the index was chosen as, wherever the list now
+       * puts it */
+      if (wl->gl_gpu_list && settings)
+         settings->ints.gl_gpu_index = video_driver_gpu_index_resolve(
+               wl_api, settings->ints.gl_gpu_index, wl->gl_gpu_list);
+      if (wl->gl_gpu_list && settings && settings->ints.gl_gpu_index > 0)
+      {
+         if ((device = egl_gpu_device_at(settings->ints.gl_gpu_index)))
+            RARCH_LOG("[Wayland] Using GPU #%d: \"%s\".\n",
+                  settings->ints.gl_gpu_index,
+                  wl->gl_gpu_list->elems[settings->ints.gl_gpu_index].data);
+         else
+            RARCH_WARN("[Wayland] GPU #%d not found; using the default.\n",
+                  settings->ints.gl_gpu_index);
+      }
+      egl_set_display_device(device);
+      ok = egl_init_context(&wl->egl,
             EGL_PLATFORM_WAYLAND_KHR,
             (EGLNativeDisplayType)wl->input.dpy,
             &major, &minor, &n, attrib_ptr,
-            egl_default_accept_config_cb))
-   {
-      egl_report_error();
-      return false;
+            egl_default_accept_config_cb);
+      if (!ok && device)
+      {
+         RARCH_WARN("[Wayland] The chosen GPU cannot drive this display; using the default.\n");
+         egl_set_display_device(NULL);
+         ok = egl_init_context(&wl->egl,
+               EGL_PLATFORM_WAYLAND_KHR,
+               (EGLNativeDisplayType)wl->input.dpy,
+               &major, &minor, &n, attrib_ptr,
+               egl_default_accept_config_cb);
+      }
+      egl_set_display_device(NULL);
+      if (!ok)
+      {
+         egl_report_error();
+         return false;
+      }
+      if (wl->gl_gpu_list)
+         video_driver_set_gpu_api_devices(wl_api, wl->gl_gpu_list);
    }
    if (n == 0 || !wl->egl.config)
       return false;
+
+   /* HDR: an FP16 framebuffer the compositor is told is scRGB, as
+    * OpenGL HDR is on Windows, and only where all of it is there. */
+   if (     wl_api == GFX_CTX_OPENGL_API
+         && wl_color_scrgb_supported(&wl->color))
+   {
+      settings_t *settings = config_get_ptr();
+      if (settings && settings->uints.video_hdr_mode > 0)
+      {
+         if (egl_choose_scrgb_config(&wl->egl, true))
+         {
+            wl->color.flags |= WL_COLOR_FP16;
+            RARCH_LOG("[Wayland] Using FP16 scRGB framebuffer for HDR.\n");
+            if (settings->uints.video_hdr_mode == 1)
+               RARCH_LOG("[Wayland] OpenGL HDR output is scRGB-only; HDR10 setting maps to scRGB.\n");
+         }
+         else
+            RARCH_LOG("[Wayland] HDR requested but EGL has no FP16 window config; using SDR.\n");
+      }
+   }
    return true;
 }
 #endif
@@ -256,17 +293,78 @@ static void *gfx_ctx_wl_init(void *data)
 {
    int i;
    gfx_ctx_wayland_data_t *wl = NULL;
-   if (!gfx_ctx_wl_init_common(&toplevel_listener, &wl))
+   if (!gfx_ctx_wl_init_common(
+#ifdef HAVE_EGL
+         gfx_ctx_wl_egl_configure,
+#else
+         NULL,
+#endif
+         &wl))
       goto error;
+   wl->max_swapchain_images = config_get_ptr()->uints.video_max_swapchain_images;
 #ifdef HAVE_EGL
    if (!gfx_ctx_wl_egl_init_context(wl))
       goto error;
+
+   /* The HDR settings are offered where they can work: the compositor
+    * takes scRGB and EGL has an FP16 config for it. GL HDR is scRGB
+    * only, so HDR10 support stays clear. */
+   video_driver_modify_disp_flags(0,
+           VIDEO_FLAG_HDR_SUPPORT
+         | VIDEO_FLAG_HDR10_SUPPORT
+         | VIDEO_FLAG_SCRGB_SUPPORT);
+   if (     wl_api == GFX_CTX_OPENGL_API
+         && wl_color_scrgb_supported(&wl->color)
+         && egl_choose_scrgb_config(&wl->egl, false))
+   {
+      video_driver_modify_disp_flags(
+            VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT,
+            VIDEO_FLAG_HDR10_SUPPORT);
+      RARCH_LOG("[Wayland] Compositor takes scRGB; HDR settings available.\n");
+   }
+
+   if (wl->color.flags & WL_COLOR_FP16)
+   {
+      /* An FP16 config has alpha, which the compositor would honour */
+      struct wl_region *opaque = wl_compositor_create_region(wl->compositor);
+      if (opaque)
+      {
+         wl_region_add(opaque, 0, 0, 0x7FFFFFFF, 0x7FFFFFFF);
+         wl_surface_set_opaque_region(wl->surface, opaque);
+         wl_region_destroy(opaque);
+      }
+      {
+         settings_t *settings = config_get_ptr();
+         bool tagged          = false;
+         /* The frame's own luminances where the user asked for them and
+          * the compositor takes them; otherwise Windows-scRGB, as
+          * before */
+         if (     settings
+               && settings->bools.video_hdr_send_luminance
+               && wl_color_parametric_supported(&wl->color))
+            tagged = wl_color_attach_luminances(&wl->color, wl->surface,
+                  settings->floats.video_hdr_paper_white_nits,
+                  video_driver_get_hdr_max_nits());
+         if (!tagged && !wl_color_attach_scrgb(&wl->color, wl->surface))
+            RARCH_WARN("[Wayland] Could not tag the surface for HDR output.\n");
+      }
+   }
 #endif
+   if (wl->tearing_control_manager)
+   {
+      settings_t *settings = config_get_ptr();
+      bool video_vsync     = settings->bools.video_vsync;
+      wl->tearing_control  = wp_tearing_control_manager_v1_get_tearing_control(
+         wl->tearing_control_manager, wl->surface);
+      wp_tearing_control_v1_set_presentation_hint(wl->tearing_control,
+                                                  video_vsync
+                                                  ? WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC
+                                                  : WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
+   }
    return wl;
 error:
    gfx_ctx_wl_destroy_resources(wl);
-   if (wl)
-      free(wl);
+   gfx_ctx_wl_free_common(wl, false);
    return NULL;
 }
 
@@ -352,9 +450,13 @@ static void gfx_ctx_wl_destroy(void *data)
    if (!wl)
       return;
 
+   /* This context's HDR settings go with it */
+   video_driver_modify_disp_flags(0,
+           VIDEO_FLAG_HDR_SUPPORT
+         | VIDEO_FLAG_HDR10_SUPPORT
+         | VIDEO_FLAG_SCRGB_SUPPORT);
    gfx_ctx_wl_destroy_resources(wl);
-
-   free(wl);
+   gfx_ctx_wl_free_common(wl, true);
 }
 
 static void gfx_ctx_wl_set_swap_interval(void *data, int swap_interval)
@@ -364,25 +466,48 @@ static void gfx_ctx_wl_set_swap_interval(void *data, int swap_interval)
 #ifdef HAVE_EGL
    egl_set_swap_interval(&wl->egl, swap_interval);
 #endif
+   wl->swap_interval = swap_interval;
+
+   if (wl->tearing_control)
+   {
+      wp_tearing_control_v1_set_presentation_hint(wl->tearing_control,
+                                                  swap_interval == 0
+                                                  ? WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC
+                                                  : WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC);
+   }
 }
 
 static bool gfx_ctx_wl_set_video_mode(void *data,
-      unsigned width, unsigned height,
+      unsigned dims,
       bool fullscreen)
 {
+   unsigned width  = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    gfx_ctx_wayland_data_t *wl   = (gfx_ctx_wayland_data_t*)data;
+#ifdef HAVE_EGL
+   EGLint egl_attribs[16];
+   EGLint *attr;
+#endif
 
    if (!gfx_ctx_wl_set_video_mode_common_size(wl, width, height, fullscreen))
       goto error;
 
 #ifdef HAVE_EGL
-   EGLint egl_attribs[16];
-   EGLint *attr              = egl_fill_attribs(
-         (gfx_ctx_wayland_data_t*)data, egl_attribs);
+   attr                      = egl_fill_attribs(wl, egl_attribs);
 
+   /* Set buffer scale before creating wl_egl_window.
+    * Fixes incorrect size/offset on HiDPI/fullscreen. */
+   if (!wl->fractional_scale &&
+       wl_compositor_get_version(wl->compositor) >=
+       WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+      wl_surface_set_buffer_scale(wl->surface, wl->buffer_scale);
+
+   /* A configure handled before this may have made one already */
+   if (wl->win)
+      wl_egl_window_destroy(wl->win);
    wl->win = wl_egl_window_create(wl->surface,
-      wl->buffer_width,
-      wl->buffer_height);
+      VIDEO_SCALE_W(wl->buffer_dims),
+      VIDEO_SCALE_H(wl->buffer_dims));
 
    if (!egl_create_context(&wl->egl, (attr != egl_attribs)
             ? egl_attribs : NULL))
@@ -391,14 +516,22 @@ static bool gfx_ctx_wl_set_video_mode(void *data,
       goto error;
    }
 
+   /* The FP16 scRGB config has alpha the frame does not fill */
+   egl_set_surface_opaque(!!(wl->color.flags & WL_COLOR_FP16));
    if (!egl_create_surface(&wl->egl, (void*)wl->win))
       goto error;
    egl_set_swap_interval(&wl->egl, wl->egl.interval);
 #endif
 
+   /* Fullscreen is compositor-sized on Wayland.
+    * Do not ignore configure events in fullscreen. */
+   if (fullscreen)
+      wl->ignore_configuration = false;
+
    if (!gfx_ctx_wl_set_video_mode_common_fullscreen(wl, fullscreen))
       goto error;
 
+   video_driver_set_hdr_output_mode((wl->color.flags & WL_COLOR_FP16) ? 2 : 0);
    return true;
 
 error:
@@ -406,28 +539,14 @@ error:
    return false;
 }
 
-bool input_wl_init(void *data, const char *joypad_name);
-
 static void gfx_ctx_wl_input_driver(void *data,
-      const char *joypad_name,
-      input_driver_t **input, void **input_data)
+      const char *joypad_name)
 {
    gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-   /* Input is heavily tied to the window stuff
-    * on Wayland, so just implement the input driver here. */
-   if (!input_wl_init(&wl->input, joypad_name))
-   {
-      wl->input.gfx = NULL;
-      *input        = NULL;
-      *input_data   = NULL;
-   }
-   else
-   {
-      wl->input.gfx = wl;
-      *input        = &input_wayland;
-      *input_data   = &wl->input;
-      input_driver_init_joypads();
-   }
+   /* On Wayland the seat's state lives with the surface, here. The
+    * frontend starts the input driver; it is handed that state. */
+   wl->input.gfx = wl;
+   input_driver_video_window(INPUT_WINDOW_WAYLAND, &wl->input);
 }
 
 static enum gfx_ctx_api gfx_ctx_wl_get_api(void *data)
@@ -486,73 +605,54 @@ static bool gfx_ctx_wl_bind_api(void *data,
    return false;
 }
 
-static void wl_surface_frame_done(void *data, struct wl_callback *cb, uint32_t time)
-{
-   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-
-   wl->swap_complete = true;
-
-   /* Destroy this callback */
-   wl_callback_destroy(cb);
-}
-
-static const struct wl_callback_listener wl_surface_frame_listener = { 
-   .done = wl_surface_frame_done,
-};
-
 static void gfx_ctx_wl_swap_buffers(void *data)
 {
 #ifdef HAVE_EGL
-   struct wl_callback *cb; 
    gfx_ctx_wayland_data_t *wl     = (gfx_ctx_wayland_data_t*)data;
-   settings_t *settings           = config_get_ptr();
-   unsigned max_swapchain_images  = settings->uints.video_max_swapchain_images;
+   unsigned max_swapchain_images  = wl->max_swapchain_images;
+   /* Only throttle to the compositor frame callback when actually
+    * vsync-pacing. A swap interval of 0 (fast-forward, or vsync
+    * disabled) means we explicitly do not want to wait for the
+    * display cadence; blocking on the frame callback here would gate
+    * unthrottled frames on vsync-rate callbacks and stall the core. */
+   /* Skip the frame-callback wait while the compositor reports the
+    * surface suspended (occluded, minimized, screen locked): hidden
+    * surfaces receive no frame callbacks, so waiting would burn the
+    * 50ms deadline every frame.  Compositors older than xdg_wm_base
+    * v6 never send the state; wl->suspended then stays false and
+    * behavior is unchanged. */
+   bool frame_throttle            = (max_swapchain_images <= 2)
+      && (wl->egl.interval != 0)
+      && !wl->suspended;
 
-   if (max_swapchain_images <= 2)
+   if (frame_throttle)
+      wl_frame_request(&wl->frame, wl->input.dpy, wl->surface);
+
+   if (wl->present.clock)
+      wl_present_dispatch(&wl->present, wl->input.dpy);
+
+   /* Skip presentation-time pacing and feedback while the surface is
+    * suspended: the compositor is not scanning out the surface, so
+    * there are no vblank events to track and requesting feedback for
+    * a frame that will not be displayed is wasteful. */
+   if (!wl->suspended)
    {
-      /* Set Wayland frame callback. */
-      cb = wl_surface_frame(wl->surface);
-      wl_callback_add_listener(cb, &wl_surface_frame_listener, wl);
+      /* The EGL frame-callback throttle above already paces to the
+       * compositor's cadence.  Running presentation-time pacing on top
+       * of it double-throttles the frame, so only pace here when that
+       * throttle is not engaged (e.g. >2 max swapchain images). */
+      if (!frame_throttle)
+         wl_present_wait(&wl->present, wl->swap_interval);
+
+      if (wl->present.clock)
+         wl_present_request(&wl->present, wl->surface);
    }
 
    egl_swap_buffers(&wl->egl);
 
-   if (max_swapchain_images <= 2)
-   {
-      /* Wait for the frame callback we set earlier. */
-      struct pollfd pollfd = {.fd = wl->input.fd, .events = POLLIN};
-      uint64_t deadline = cpu_features_get_time_usec() + 50000;
-      wl->swap_complete = false;
-
-      while (!wl->swap_complete)
-      {
-         uint64_t current_time = cpu_features_get_time_usec();
-         if (current_time >= deadline)
-         {
-            /* Deadline met. */
-            wl_callback_destroy(cb);
-            return;
-         }
-         uint64_t remaining_time = deadline - current_time;
-         int ret = (wl_display_dispatch_pending(wl->input.dpy));
-         if (ret == 0)
-         {
-            ret = wl_display_prepare_read(wl->input.dpy);
-            if (ret == -1)
-               continue; /* Retry dispatch_pending. */
-
-            ret = poll(&pollfd, 1, remaining_time / 1000);
-            if (ret <= 0)
-            {
-               /* Timeout met, or polling error. */
-               wl_display_cancel_read(wl->input.dpy);
-               wl_callback_destroy(cb);
-               return;
-            }
-            wl_display_read_events(wl->input.dpy);
-         }
-      }
-   }
+   if (frame_throttle)
+      wl_frame_wait(&wl->frame, wl->input.dpy,
+            cpu_features_get_time_usec() + 50000);
 #endif
 }
 
@@ -564,6 +664,18 @@ static void gfx_ctx_wl_bind_hw_render(void *data, bool enable)
 #endif
 }
 
+#ifdef HAVE_EGL
+static bool gfx_ctx_wl_shared_context_new(void *data,
+      gfx_ctx_shared_context_t *out)
+{
+   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
+   memset(out, 0, sizeof(*out));
+   if (!wl || wl_api != GFX_CTX_OPENGL_API)
+      return false;
+   return egl_shared_context_new(&wl->egl, EGL_OPENGL_API, out);
+}
+#endif
+
 static uint32_t gfx_ctx_wl_get_flags(void *data)
 {
    uint32_t             flags = 0;
@@ -572,10 +684,12 @@ static uint32_t gfx_ctx_wl_get_flags(void *data)
 
    if (wl->core_hw_context_enable)
       BIT32_SET(flags, GFX_CTX_FLAGS_GL_CORE_CONTEXT);
+   if (wl->color.flags & WL_COLOR_FP16)
+      BIT32_SET(flags, GFX_CTX_FLAGS_SCRGB_FRAMEBUFFER);
 
    if (string_is_equal(video_ident, "glcore"))
    {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
       BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
 #endif
    }
@@ -596,6 +710,40 @@ static void gfx_ctx_wl_set_flags(void *data, uint32_t flags)
       wl->core_hw_context_enable = true;
 }
 
+static bool gfx_ctx_wl_create_surface(void *data)
+{
+#ifdef HAVE_EGL
+   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
+   egl_set_surface_opaque(!!(wl->color.flags & WL_COLOR_FP16));
+   return egl_create_surface(&wl->egl, (void*)wl->win);
+#else
+   return false;
+#endif
+}
+
+static bool gfx_ctx_wl_destroy_surface(void *data)
+{
+#ifdef HAVE_EGL
+   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
+   return egl_destroy_surface(&wl->egl);
+#else
+   return false;
+#endif
+}
+
+/* The compositor tells us when the surface is not being scanned out -
+ * occluded, minimised, screen locked - and the swap path above already
+ * skips the frame callback and the presentation feedback in that
+ * state, for the same reason. Reported here so the runloop can pace
+ * the loop rather than the swap spinning through it. Compositors older
+ * than xdg_wm_base v6 never send the state, wl->suspended stays false,
+ * and this is always true, as before. */
+static bool gfx_ctx_wl_presentable(void *data)
+{
+   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
+   return wl && !wl->suspended;
+}
+
 const gfx_ctx_driver_t gfx_ctx_wayland = {
    gfx_ctx_wl_init,
    gfx_ctx_wl_destroy,
@@ -604,11 +752,11 @@ const gfx_ctx_driver_t gfx_ctx_wayland = {
    gfx_ctx_wl_set_swap_interval,
    gfx_ctx_wl_set_video_mode,
    gfx_ctx_wl_get_video_size_common,
-   gfx_ctx_wl_get_refresh_rate,
+   NULL, /* refresh_rate - handled by display server */
    NULL, /* get_video_output_size */
    NULL, /* get_video_output_prev */
    NULL, /* get_video_output_next */
-   gfx_ctx_wl_get_metrics_common,
+   NULL, /* metrics - handled by display server */
    NULL,
    gfx_ctx_wl_update_title_common,
    gfx_ctx_wl_check_window,
@@ -632,4 +780,18 @@ const gfx_ctx_driver_t gfx_ctx_wayland = {
    gfx_ctx_wl_bind_hw_render,
    NULL,
    NULL,
+   gfx_ctx_wl_create_surface,
+   gfx_ctx_wl_destroy_surface,
+   gfx_ctx_wl_presentable,
+   NULL, /* last_present_time */
+   NULL, /* release_current */
+#ifdef HAVE_EGL
+   gfx_ctx_wl_shared_context_new,
+   egl_shared_context_bind,
+   egl_shared_context_free
+#else
+   NULL, /* shared_context_new */
+   NULL, /* shared_context_bind */
+   NULL  /* shared_context_free */
+#endif
 };

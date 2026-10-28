@@ -24,33 +24,14 @@
 #include "../input_defines.h"
 #include "../../driver.h"
 
-struct wiiupro_buttons
-{
-   bool a;
-   bool b;
-   bool x;
-   bool y;
-   bool l;
-   bool r;
-   bool zl;
-   bool zr;
-   bool minus;
-   bool plus;
-   bool l3;
-   bool r3;
-   bool home;
-
-   /* D-Pad */
-   bool left;
-   bool right;
-   bool up;
-   bool down;
-}__attribute__((packed));
+/* report 0x34, its ID first: the sticks from 3, the buttons from 0x0B
+ * to 0x0D */
+#define WIIUPRO_REPORT_ID  0x34
+#define WIIUPRO_REPORT_MIN 0x0E
 
 struct wiiupro
 {
    int32_t hatvalue[4];
-   struct wiiupro_buttons btn;
 };
 
 struct hidpad_wiiupro_data
@@ -58,7 +39,9 @@ struct hidpad_wiiupro_data
    struct pad_connection* connection;
    hid_driver_t *driver;
    struct wiiupro data;
+   input_pad_view_t view;  /* the buttons, which the getters answer */
    uint32_t slot;
+   bool ids_first;      /* the driver wants no HIDP header */
    bool have_led;
    uint16_t motors[2];
    struct
@@ -70,10 +53,15 @@ struct hidpad_wiiupro_data
 
 static void hidpad_wiiupro_send_control(struct hidpad_wiiupro_data* device)
 {
-   /* 0x12 = Set data report; 0x34 = All buttons and analogs */
+   /* 0x12 = Set data report; 0x34 = All buttons and analogs; after the
+    * HIDP header where the driver takes one */
    static uint8_t report_buffer[4] = { 0xA2, 0x12, 0x00, 0x34 };
-   device->driver->send_control(device->connection,
-         report_buffer, sizeof(report_buffer));
+   if (device->ids_first)
+      device->driver->send_control(device->connection,
+            report_buffer + 1, sizeof(report_buffer) - 1);
+   else
+      device->driver->send_control(device->connection,
+            report_buffer, sizeof(report_buffer));
 }
 
 static void* hidpad_wiiupro_init(void *data,
@@ -95,6 +83,7 @@ static void* hidpad_wiiupro_init(void *data,
    device->connection        = connection;
    device->slot              = slot;
    device->driver            = driver;
+   device->ids_first         = PAD_CONNECTION_IDS_FIRST(driver);
 
    device->calib.calib_round = 0;
    /* Without this, the digital buttons won't be reported. */
@@ -114,48 +103,8 @@ static void hidpad_wiiupro_deinit(void *data)
 static void hidpad_wiiupro_get_buttons(void *data, input_bits_t *state)
 {
    struct hidpad_wiiupro_data *device = (struct hidpad_wiiupro_data*)data;
-   struct wiiupro                *rpt = device ?
-      (struct wiiupro*)&device->data : NULL;
-
-   if (!device || !rpt)
-      return;
-
-   BIT256_CLEAR_ALL_PTR(state);
-
-   if (rpt->btn.r3)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_R3);
-   if (rpt->btn.l3)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_L3);
-   if (rpt->btn.plus)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_START);
-   if ( rpt->btn.minus)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_SELECT);
-   if ( rpt->btn.zr)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_R2);
-   if ( rpt->btn.zl)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_L2);
-   if ( rpt->btn.r)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_R);
-   if ( rpt->btn.l)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_L);
-   if ( rpt->btn.x)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_X);
-   if ( rpt->btn.a)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_A);
-   if ( rpt->btn.b)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_B);
-   if ( rpt->btn.y)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_Y);
-   if ( rpt->btn.left)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_LEFT);
-   if ( rpt->btn.down)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_DOWN);
-   if ( rpt->btn.right)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_RIGHT);
-   if ( rpt->btn.up)
-      BIT256_SET_PTR(state, RETRO_DEVICE_ID_JOYPAD_UP);
-   if ( rpt->btn.home)
-      BIT256_SET_PTR(state, RARCH_MENU_TOGGLE);
+   if (device)
+      *state = device->view.buttons;
 }
 
 static int16_t hidpad_wiiupro_get_axis(void *data, unsigned axis)
@@ -180,7 +129,15 @@ static void hidpad_wiiupro_packet_handler(void *data,
 {
    struct hidpad_wiiupro_data *device = (struct hidpad_wiiupro_data*)data;
 
-   if (!device)
+   if (!device || !packet)
+      return;
+   /* a Bluetooth stack's DATA | INPUT header */
+   if (size && packet[0] == 0xa1)
+   {
+      packet++;
+      size--;
+   }
+   if (size < WIIUPRO_REPORT_MIN || packet[0] != WIIUPRO_REPORT_ID)
       return;
 
 #if 0
@@ -191,50 +148,50 @@ static void hidpad_wiiupro_packet_handler(void *data,
    }
 #endif
 
-   packet[0x0C]            ^= 0xFF;
-   packet[0x0D]            ^= 0xFF;
-   packet[0x0E]            ^= 0xFF;
-
-   memset(&device->data, 0, sizeof(struct wiiupro));
-
-   device->data.btn.b       = (packet[0x0D] & 0x40) ? 1 : 0;
-   device->data.btn.a       = (packet[0x0D] & 0x10) ? 1 : 0;
-   device->data.btn.y       = (packet[0x0D] & 0x20) ? 1 : 0;
-   device->data.btn.x       = (packet[0x0D] & 0x08) ? 1 : 0;
-   device->data.btn.l       = (packet[0x0C] & 0x20) ? 1 : 0;
-   device->data.btn.r       = (packet[0x0C] & 0x02) ? 1 : 0;
-   device->data.btn.zl      = (packet[0x0D] & 0x80) ? 1 : 0;
-   device->data.btn.zr      = (packet[0x0D] & 0x04) ? 1 : 0;
-   device->data.btn.minus   = (packet[0x0C] & 0x10) ? 1 : 0;
-   device->data.btn.plus    = (packet[0x0C] & 0x04) ? 1 : 0;
-   device->data.btn.l3      = (packet[0x0E] & 0x02) ? 1 : 0;
-   device->data.btn.r3      = (packet[0x0E] & 0x01) ? 1 : 0;
-
-   device->data.btn.left    = (packet[0x0D] & 0x02) ? 1 : 0;
-   device->data.btn.right   = (packet[0x0C] & 0x80) ? 1 : 0;
-   device->data.btn.up      = (packet[0x0D] & 0x01) ? 1 : 0;
-   device->data.btn.down    = (packet[0x0C] & 0x40) ? 1 : 0;
-
-   device->data.btn.home    = (packet[0x0C] & 0x8)  ? 1 : 0;
+   /* the buttons are low when held; read where they lie, the report
+    * left as it was given */
+   {
+      uint8_t c       = (uint8_t)~packet[0x0B];
+      uint8_t d       = (uint8_t)~packet[0x0C];
+      uint8_t e       = (uint8_t)~packet[0x0D];
+      uint32_t b      = 0;
+      if (d & 0x40) b |= 1u << RETRO_DEVICE_ID_JOYPAD_B;
+      if (d & 0x10) b |= 1u << RETRO_DEVICE_ID_JOYPAD_A;
+      if (d & 0x20) b |= 1u << RETRO_DEVICE_ID_JOYPAD_Y;
+      if (d & 0x08) b |= 1u << RETRO_DEVICE_ID_JOYPAD_X;
+      if (c & 0x20) b |= 1u << RETRO_DEVICE_ID_JOYPAD_L;
+      if (c & 0x02) b |= 1u << RETRO_DEVICE_ID_JOYPAD_R;
+      if (d & 0x80) b |= 1u << RETRO_DEVICE_ID_JOYPAD_L2;
+      if (d & 0x04) b |= 1u << RETRO_DEVICE_ID_JOYPAD_R2;
+      if (c & 0x10) b |= 1u << RETRO_DEVICE_ID_JOYPAD_SELECT;
+      if (c & 0x04) b |= 1u << RETRO_DEVICE_ID_JOYPAD_START;
+      if (e & 0x02) b |= 1u << RETRO_DEVICE_ID_JOYPAD_L3;
+      if (e & 0x01) b |= 1u << RETRO_DEVICE_ID_JOYPAD_R3;
+      if (d & 0x02) b |= 1u << RETRO_DEVICE_ID_JOYPAD_LEFT;
+      if (c & 0x80) b |= 1u << RETRO_DEVICE_ID_JOYPAD_RIGHT;
+      if (d & 0x01) b |= 1u << RETRO_DEVICE_ID_JOYPAD_UP;
+      if (c & 0x40) b |= 1u << RETRO_DEVICE_ID_JOYPAD_DOWN;
+      pad_view_set_buttons(&device->view, b, (c & 0x08) != 0);
+   }
 
    if (device->calib.calib_round < 5)
    {
-       device->calib.hatvalue_calib[0] = (packet[4] |  (packet[4 + 1] << 8));
-       device->calib.hatvalue_calib[1] = (packet[8] |  (packet[8 + 1] << 8));
-       device->calib.hatvalue_calib[2] = (packet[6] |  (packet[6 + 1] << 8));
-       device->calib.hatvalue_calib[3] = (packet[10] | (packet[10 + 1] << 8));
+       device->calib.hatvalue_calib[0] = (packet[3] |  (packet[3 + 1] << 8));
+       device->calib.hatvalue_calib[1] = (packet[7] |  (packet[7 + 1] << 8));
+       device->calib.hatvalue_calib[2] = (packet[5] |  (packet[5 + 1] << 8));
+       device->calib.hatvalue_calib[3] = (packet[9] |  (packet[9 + 1] << 8));
 
        device->calib.calib_round++;
    }
    else
    {
-       device->data.hatvalue[0] = (packet[4] |  (packet[4 + 1] << 8))
+       device->data.hatvalue[0] = (packet[3] |  (packet[3 + 1] << 8))
           - device->calib.hatvalue_calib[0];
-       device->data.hatvalue[1] = (packet[8] |  (packet[8 + 1] << 8))
+       device->data.hatvalue[1] = (packet[7] |  (packet[7 + 1] << 8))
           - device->calib.hatvalue_calib[1];
-       device->data.hatvalue[2] = (packet[6] |  (packet[6 + 1] << 8))
+       device->data.hatvalue[2] = (packet[5] |  (packet[5 + 1] << 8))
           - device->calib.hatvalue_calib[2];
-       device->data.hatvalue[3] = (packet[10] | (packet[10 + 1] << 8))
+       device->data.hatvalue[3] = (packet[9] |  (packet[9 + 1] << 8))
           - device->calib.hatvalue_calib[3];
    }
 }
@@ -246,53 +203,14 @@ static void hidpad_wiiupro_set_rumble(void *data,
 static int32_t hidpad_wiiupro_button(void *data, uint16_t joykey)
 {
    struct hidpad_wiiupro_data *device = (struct hidpad_wiiupro_data*)data;
-   struct wiiupro                *rpt = device
-      ? (struct wiiupro*)&device->data : NULL;
+   if (!device || joykey >= 256)
+      return 0;
+   return BIT256_GET(device->view.buttons, joykey) ? 1 : 0;
+}
 
-   if (device && rpt)
-   {
-      switch (joykey)
-      {
-         case RETRO_DEVICE_ID_JOYPAD_R3:
-            return rpt->btn.r3;
-         case RETRO_DEVICE_ID_JOYPAD_L3:
-            return rpt->btn.l3;
-         case RETRO_DEVICE_ID_JOYPAD_START:
-            return rpt->btn.plus;
-         case RETRO_DEVICE_ID_JOYPAD_SELECT:
-            return rpt->btn.minus;
-         case RETRO_DEVICE_ID_JOYPAD_R2:
-            return rpt->btn.zr;
-         case RETRO_DEVICE_ID_JOYPAD_L2:
-            return rpt->btn.zl;
-         case RETRO_DEVICE_ID_JOYPAD_R:
-            return rpt->btn.r;
-         case RETRO_DEVICE_ID_JOYPAD_L:
-            return rpt->btn.l;
-         case RETRO_DEVICE_ID_JOYPAD_X:
-            return rpt->btn.x;
-         case RETRO_DEVICE_ID_JOYPAD_A:
-            return rpt->btn.a;
-         case RETRO_DEVICE_ID_JOYPAD_B:
-            return rpt->btn.b;
-         case RETRO_DEVICE_ID_JOYPAD_Y:
-            return rpt->btn.y;
-         case RETRO_DEVICE_ID_JOYPAD_LEFT:
-            return rpt->btn.left;
-         case RETRO_DEVICE_ID_JOYPAD_RIGHT:
-            return rpt->btn.right;
-         case RETRO_DEVICE_ID_JOYPAD_DOWN:
-            return rpt->btn.down;
-         case RETRO_DEVICE_ID_JOYPAD_UP:
-            return rpt->btn.up;
-         case RARCH_MENU_TOGGLE:
-            return rpt->btn.home;
-         default:
-            break;
-      }
-   }
-
-   return 0;
+static const input_pad_view_t *hidpad_wiiupro_view(void *data)
+{
+   return &((struct hidpad_wiiupro_data*)data)->view;
 }
 
 pad_connection_interface_t pad_connection_wiiupro = {
@@ -304,5 +222,12 @@ pad_connection_interface_t pad_connection_wiiupro = {
    hidpad_wiiupro_get_axis,
    NULL, /* get_name */
    hidpad_wiiupro_button,
-   false
+   false, /* multi_pad */
+   0,     /* max_pad */
+   NULL,  /* pad_init */
+   NULL,  /* pad_deinit */
+   NULL,  /* status */
+   NULL,  /* joypad */
+   NULL,  /* set_player */
+   hidpad_wiiupro_view
 };

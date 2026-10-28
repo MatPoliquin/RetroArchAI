@@ -62,6 +62,10 @@ If no arguments are passed to retroarch, it is equivalent to calling retroarch w
 Prints available features compiled into RetroArch, then exits.
 
 .TP
+\fB--cloudsync\fR
+Runs a cloud sync with the configured cloud sync driver, then exits.
+
+.TP
 \fB-L PATH, --libretro PATH\fR
 Path to a libretro implementation which is to be used.
 This option will override any setting in a config file.
@@ -109,8 +113,11 @@ A default config file will also be created in the same manner as Unix.
 .TP
 \fB--appendconfig PATH\fR
 Appends a different set of config files to the config file loaded in -c (or default).
-Multiple config files are delimited by ','.
+Multiple config files are delimited by '|'.
 Every config file will be appended in order where the key-value pairs of the next config file takes priority over the old ones.
+
+The appended settings are not kept apart once loaded. Whenever the main config file is saved - on exit, if config_save_on_exit is set, or from the menu - they are written to it with everything else, and are there the next time RetroArch starts without --appendconfig.
+To use an appended config for one session only, put config_save_on_exit = "false" in the appended file.
 
 .TP
 \fB--subsystem SUBSYSTEM\fR
@@ -202,6 +209,7 @@ The command is formatted as "COMMAND;HOST;PORT".
 HOST and PORT are both optional. "COMMAND;HOST" will set PORT to
 "network_cmd_port" default setting.
 If only "COMMAND" is used, HOST and PORT will be assumed to be "localhost" and "network_cmd_port" respectively.
+HOST and PORT are read from the end, and only where they cannot be part of a STEPS list (no space, no "|", not "checkpoint"), so such a list is sent whole.
 
 The available commands are listed if "COMMAND" is invalid.
 

@@ -29,6 +29,7 @@
 #include "../common/egl_common.h"
 #endif
 
+#include "../common/android_windows.h"
 #include "../../frontend/frontend_driver.h"
 #include "../../frontend/drivers/platform_unix.h"
 #include "../../verbosity.h"
@@ -44,6 +45,7 @@ typedef struct
 {
 #ifdef HAVE_EGL
    egl_ctx_data_t egl;
+   EGLint format; /* EGL_NATIVE_VISUAL_ID */
 #endif
 } android_ctx_data_t;
 
@@ -58,6 +60,97 @@ bool android_display_get_metrics(void *data,
       enum display_metric_types type, float *value);
 bool android_display_has_focus(void *data);
 
+#ifdef HAVE_EGL
+/* The second display's EGL surface, made on first use after its
+ * surface arrives, on the main context */
+static bool android_gfx_ctx_window_bind_gl(void *owner,
+      video_window_native_t *window)
+{
+   android_ctx_data_t *and = (android_ctx_data_t*)owner;
+   android_window_t *state;
+   bool made               = false;
+   if (!window)
+      return egl_window_surface_bind(&and->egl, EGL_NO_SURFACE, false);
+   state = (android_window_t*)window->state;
+   if (!state || !window->configured || !window->surface)
+      return false;
+   if (state->gl_surface && state->gl_window != window->surface)
+   {
+      egl_window_surface_free(&and->egl, (EGLSurface)state->gl_surface);
+      state->gl_surface = NULL;
+   }
+   if (!state->gl_surface)
+   {
+      EGLSurface surf;
+      ANativeWindow_setBuffersGeometry(
+            (ANativeWindow*)window->surface, 0, 0, and->format);
+      if ((surf = egl_window_surface_new(&and->egl, window->surface))
+            == EGL_NO_SURFACE)
+         return false;
+      state->gl_surface = surf;
+      state->gl_window  = window->surface;
+      made              = true;
+   }
+   /* The interval is the surface's own, so once is enough */
+   return egl_window_surface_bind(&and->egl,
+         (EGLSurface)state->gl_surface, made);
+}
+
+/* A window whose surface Java took back loses its EGL surface now,
+ * not when the window goes */
+static unsigned android_gfx_ctx_window_poll(void *owner,
+      video_window_event_t *events, unsigned capacity)
+{
+   unsigned i;
+   android_ctx_data_t *and = (android_ctx_data_t*)owner;
+   unsigned count          = android_windows_poll(owner, events, capacity);
+   for (i = 1; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      android_window_t *state = android_windows_find(owner, i);
+      if (     state && state->gl_surface
+            && state->gl_window != state->common.native->surface)
+      {
+         egl_window_surface_free(&and->egl, (EGLSurface)state->gl_surface);
+         state->gl_surface = NULL;
+         state->gl_window  = NULL;
+      }
+   }
+   return count;
+}
+
+static bool android_gfx_ctx_window_present_gl(void *owner,
+      video_window_native_t *window)
+{
+   android_ctx_data_t *and = (android_ctx_data_t*)owner;
+   android_window_t *state = window ? (android_window_t*)window->state : NULL;
+   if (!state || !state->gl_surface || !window->presentable)
+      return false;
+   return egl_window_surface_swap(&and->egl, (EGLSurface)state->gl_surface);
+}
+
+static void android_gfx_ctx_window_destroy(void *owner,
+      video_window_native_t *window)
+{
+   android_ctx_data_t *and = (android_ctx_data_t*)owner;
+   android_window_t *state = window ? (android_window_t*)window->state : NULL;
+   if (state && state->common.owner == owner && state->gl_surface)
+   {
+      egl_window_surface_free(&and->egl, (EGLSurface)state->gl_surface);
+      state->gl_surface = NULL;
+   }
+   android_windows_destroy(owner, window);
+}
+
+static const gfx_ctx_window_driver_t android_gfx_ctx_windows = {
+   android_windows_create,
+   android_windows_update,
+   android_gfx_ctx_window_poll,
+   android_gfx_ctx_window_bind_gl,
+   android_gfx_ctx_window_present_gl,
+   android_gfx_ctx_window_destroy
+};
+#endif
+
 static void android_gfx_ctx_destroy(void *data)
 {
    android_ctx_data_t *and         = (android_ctx_data_t*)data;
@@ -66,6 +159,7 @@ static void android_gfx_ctx_destroy(void *data)
       return;
 
 #ifdef HAVE_EGL
+   android_windows_free(and, android_gfx_ctx_window_destroy);
    egl_destroy(&and->egl);
 #endif
 
@@ -77,7 +171,7 @@ static void *android_gfx_ctx_init(void *video_driver)
 #ifdef HAVE_OPENGLES
    EGLint n, major, minor;
    EGLint format;
-#if 0
+#ifdef DEBUG
    struct retro_hw_render_callback *hwr = video_driver_get_hw_context();
    bool debug                           = hwr->debug_context;
 #endif
@@ -93,11 +187,23 @@ static void *android_gfx_ctx_init(void *video_driver)
    };
 #endif
    struct android_app *android_app      = (struct android_app*)g_android;
+   ANativeWindow *window                = NULL;
    android_ctx_data_t        *and       = (android_ctx_data_t*)
       calloc(1, sizeof(*and));
 
-   if (!android_app || !and)
-      return false;
+   /* Separate the two checks so the combined bail doesn't leak
+    * 'and' when it succeeded but android_app was NULL.  In the
+    * pre-patch form both conditions shared one return without
+    * a free.  Also fixed the return value: the pre-patch
+    * 'return false' was 'return 0' which is NULL for a void*-
+    * returning function but sloppy; use NULL explicitly. */
+   if (!and)
+      return NULL;
+   if (!android_app)
+   {
+      free(and);
+      return NULL;
+   }
 
 #ifdef HAVE_OPENGLES
    if (g_es3)
@@ -105,7 +211,7 @@ static void *android_gfx_ctx_init(void *video_driver)
 #endif
 
 #ifdef HAVE_EGL
-   RARCH_LOG("Android EGL: GLES version = %d.\n", g_es3 ? 3 : 2);
+   RARCH_LOG("[Android] EGL: GLES version = %d.\n", g_es3 ? 3 : 2);
 
    if (!egl_init_context(&and->egl, EGL_NONE, EGL_DEFAULT_DISPLAY,
             &major, &minor, &n, attribs, NULL))
@@ -115,19 +221,21 @@ static void *android_gfx_ctx_init(void *video_driver)
    }
    if (!egl_get_native_visual_id(&and->egl, &format))
       goto error;
+   and->format = format;
 #endif
 
-   slock_lock(android_app->mutex);
-   if (!android_app->window)
+   /* Held across the call, so the app thread cannot hand the window
+    * back to the framework under it. */
+   if (!(window = (ANativeWindow*)android_lifecycle_window_acquire(
+               &android_app->lc)))
    {
-      slock_unlock(android_app->mutex);
       android_gfx_ctx_destroy(and);
       return NULL;
    }
 
-   ANativeWindow_setBuffersGeometry(android_app->window, 0, 0, format);
+   ANativeWindow_setBuffersGeometry(window, 0, 0, format);
 
-   slock_unlock(android_app->mutex);
+   android_lifecycle_window_release(&android_app->lc);
    return and;
 
 error:
@@ -137,43 +245,41 @@ error:
 }
 
 static void android_gfx_ctx_get_video_size(void *data,
-      unsigned *width, unsigned *height)
+      unsigned *dims)
 {
 #ifdef HAVE_EGL
    android_ctx_data_t *and  = (android_ctx_data_t*)data;
-   egl_get_video_size(&and->egl, width, height);
+   egl_get_video_size(&and->egl, dims);
 #endif
 }
 
 static void android_gfx_ctx_check_window(void *data, bool *quit,
-      bool *resize, unsigned *width, unsigned *height)
+      bool *resize, unsigned *dims)
 {
-   unsigned new_width       = 0;
-   unsigned new_height      = 0;
+   unsigned new_dims       = 0;
    android_ctx_data_t *and  = (android_ctx_data_t*)data;
 
    *quit                    = false;
 
 #ifdef HAVE_EGL
-   egl_get_video_size(&and->egl, &new_width, &new_height);
+   egl_get_video_size(&and->egl, &new_dims);
 #endif
 
-   if (new_width != *width || new_height != *height)
+   if (new_dims != *dims)
    {
-      RARCH_LOG("[Android]: Resizing (%u x %u) -> (%u x %u).\n",
-              *width, *height, new_width, new_height);
+      RARCH_LOG("[Android] Resizing (%u x %u) -> (%u x %u).\n",
+              VIDEO_SCALE_W(*dims), VIDEO_SCALE_H(*dims),
+              VIDEO_SCALE_W(new_dims), VIDEO_SCALE_H(new_dims));
 
-      *width  = new_width;
-      *height = new_height;
+      *dims  = new_dims;
       *resize = true;
    }
 }
 
-static bool android_gfx_ctx_set_resize(void *data,
-      unsigned width, unsigned height) { return false; }
+static bool android_gfx_ctx_set_resize(void *data, unsigned dims) { return false; }
 
 static bool android_gfx_ctx_set_video_mode(void *data,
-      unsigned width, unsigned height,
+      unsigned dims,
       bool fullscreen)
 {
 #if defined(HAVE_OPENGLES)
@@ -182,7 +288,7 @@ static bool android_gfx_ctx_set_video_mode(void *data,
 #if defined(HAVE_EGL)
    EGLint     context_attributes[] = {
       EGL_CONTEXT_CLIENT_VERSION, g_es3 ? 3 : 2,
-#if 0
+#ifdef DEBUG
       EGL_CONTEXT_FLAGS_KHR, debug ? EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR : 0,
 #endif
       EGL_NONE
@@ -195,7 +301,7 @@ static bool android_gfx_ctx_set_video_mode(void *data,
          egl_report_error();
          return false;
       }
-      if (!egl_create_surface(&and->egl, android_app->window))
+      if (!egl_create_surface(&and->egl, android_app_window(android_app)))
          return false;
    }
 #endif
@@ -204,13 +310,11 @@ static bool android_gfx_ctx_set_video_mode(void *data,
 }
 
 static void android_gfx_ctx_input_driver(void *data,
-      const char *joypad_name,
-      input_driver_t **input, void **input_data)
+      const char *joypad_name)
 {
-   void *androidinput   = input_driver_init_wrap(&input_android, joypad_name);
-
-   *input               = androidinput ? &input_android : NULL;
-   *input_data          = androidinput;
+   /* no input driver of this context's own: the frontend starts the
+    * platform's */
+   input_driver_video_window(INPUT_WINDOW_PLATFORM, NULL);
 }
 
 static enum gfx_ctx_api android_gfx_ctx_get_api(void *data)
@@ -261,6 +365,15 @@ static void android_gfx_ctx_bind_hw_render(void *data, bool enable)
 #endif
 }
 
+static void android_gfx_ctx_release_current(void *data)
+{
+#ifdef HAVE_EGL
+   android_ctx_data_t *and  = (android_ctx_data_t*)data;
+   if (and)
+      egl_release_current(&and->egl);
+#endif
+}
+
 static uint32_t android_gfx_ctx_get_flags(void *data)
 {
    uint32_t flags = 0;
@@ -274,6 +387,27 @@ static uint32_t android_gfx_ctx_get_flags(void *data)
 
 static void android_gfx_ctx_set_flags(void *data, uint32_t flags) { }
 
+static bool android_gfx_ctx_create_surface(void *data)
+{
+#ifdef HAVE_EGL
+   struct android_app *android_app = (struct android_app*)g_android;
+   android_ctx_data_t *and = (android_ctx_data_t*)data;
+   return egl_create_surface(&and->egl, android_app_window(android_app));
+#else
+   return false;
+#endif
+}
+
+static bool android_gfx_ctx_destroy_surface(void *data)
+{
+#ifdef HAVE_EGL
+   android_ctx_data_t *and = (android_ctx_data_t*)data;
+   return egl_destroy_surface(&and->egl);
+#else
+   return false;
+#endif
+}
+
 const gfx_ctx_driver_t gfx_ctx_android = {
    android_gfx_ctx_init,
    android_gfx_ctx_destroy,
@@ -286,7 +420,7 @@ const gfx_ctx_driver_t gfx_ctx_android = {
    NULL, /* get_video_output_size */
    NULL, /* get_video_output_prev */
    NULL, /* get_video_output_next */
-   android_display_get_metrics,
+   NULL, /* get_metrics - handled by display server */
    NULL,
    NULL, /* update_title */
    android_gfx_ctx_check_window,
@@ -309,5 +443,18 @@ const gfx_ctx_driver_t gfx_ctx_android = {
    android_gfx_ctx_set_flags,
    android_gfx_ctx_bind_hw_render,
    NULL,
-   NULL
+   NULL,
+   android_gfx_ctx_create_surface,
+   android_gfx_ctx_destroy_surface,
+   NULL, /* presentable */
+   NULL, /* last_present_time */
+   android_gfx_ctx_release_current,
+   NULL, /* shared_context_new */
+   NULL, /* shared_context_bind */
+   NULL, /* shared_context_free */
+#ifdef HAVE_EGL
+   &android_gfx_ctx_windows
+#else
+   NULL  /* windows */
+#endif
 };

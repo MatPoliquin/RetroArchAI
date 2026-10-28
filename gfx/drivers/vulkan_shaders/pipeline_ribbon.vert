@@ -1,12 +1,13 @@
 #version 310 es
 
-layout(location = 0) in vec3 VertexCoord;
+layout(location = 0) in vec2 Position;
 layout(location = 0) out vec3 vEC;
 
 layout(std140, set = 0, binding = 0) uniform UBO
 {
    float time;
    float yflip;
+   float alpha;
 } constants;
 
 float iqhash(float n)
@@ -31,9 +32,13 @@ float xmb_noise2(vec3 x)
    return cos(x.z * 4.0) * cos(x.z + constants.time / 10.0 + x.x);
 }
 
+/* Position is the ribbon mesh's grid as gfx_display stores it. Where
+ * yflip turns clip space over (-1) the grid's depth axis turns with it
+ * and runs 1 - y; where it does not (1) it runs y. */
 void main()
 {
-   vec3 v = vec3(VertexCoord.x, 0.0, VertexCoord.y);
+   vec3 v = vec3(Position.x, 0.0,
+         0.5 * (1.0 - constants.yflip) + constants.yflip * Position.y);
    vec3 v2 = v;
    vec3 v3 = v;
 
@@ -47,8 +52,9 @@ void main()
 
    v.z -= noise(v3 * 7.0) / 15.0;
    v.y -= noise(v3 * 7.0) / 15.0 + cos(v.x * 2.0 - constants.time / 2.0) / 5.0 - 0.3;
+   v.y = -v.y;
 
    vEC = v;
-   gl_Position = vec4(v, 1.0);
+   gl_Position = vec4(v.xy, 0.0, 1.0);
    gl_Position.y *= constants.yflip;
 }

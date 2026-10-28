@@ -19,10 +19,14 @@
 #include <retro_inline.h>
 #include <boolean.h>
 
-#include <d3dcommon.h>
-#include <d3dcompiler.h>
+#include "../include/dxsdk/d3dcompiler.h"
+#include "../include/dxsdk/d3dcommon.h"
 
 typedef ID3DBlob*                D3DBlob;
+
+/* Loads the compiler now rather than at the first compile, so threads
+ * compiling at once find it loaded.  False when it cannot be had. */
+bool d3d_compiler_load(void);
 
 bool d3d_compile(const char* src, size_t len,
       LPCSTR src_name, LPCSTR entrypoint, LPCSTR target, D3DBlob* out);

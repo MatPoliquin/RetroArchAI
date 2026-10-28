@@ -14,24 +14,34 @@
  */
 
 #include <spa/param/audio/format-utils.h>
+/* A note for the eventcount census: this driver stays off it, on
+ * purpose, for pulse.c's reason - pw_thread_loop is the library's
+ * mandated rendezvous, its lock covers every pw_* call, and the
+ * data path already runs on PipeWire's own lock-free
+ * spa_ringbuffer. Same column as ALSA's device waits. */
 #include <spa/utils/ringbuffer.h>
 #include <spa/utils/result.h>
 #include <spa/param/props.h>
 #include <pipewire/pipewire.h>
 
 #include <boolean.h>
-#include <retro_assert.h>
 #include <retro_miscellaneous.h>
+#include <retro_atomic.h>
 #include <retro_endianness.h>
 
 #include "../common/pipewire.h"
 #include "../audio_driver.h"
+#include "../../configuration.h"
 #include "../../verbosity.h"
 
-
-#define DEFAULT_CHANNELS   2
 #define RINGBUFFER_SIZE    (1u << 22)
 #define RINGBUFFER_MASK    (RINGBUFFER_SIZE - 1)
+
+#ifdef HAVE_MICROPHONE
+#include "../microphone_driver.h"
+
+#define MIC_DEFAULT_CHANNELS   1
+#endif
 
 typedef struct pipewire_audio
 {
@@ -41,153 +51,433 @@ typedef struct pipewire_audio
    struct spa_audio_info_raw info;
    uint32_t highwater_mark;
    uint32_t frame_size;
+   uint32_t layout;      /* the frontend's mask the stream carries */
    struct spa_ringbuffer ring;
+   uint32_t lend_idx;    /* where the outstanding lend began */
    uint8_t buffer[RINGBUFFER_SIZE];
+   /* Frames handed to the graph since the stream started, for the sink
+    * rate estimate. The process callback is the graph asking for a
+    * quantum, so what it takes is the device's own clock; silence
+    * during an underrun counts, because the quantum elapsed either
+    * way. Written only by the callback, read by the frontend through
+    * pwire_frames_consumed(). */
+   retro_atomic_size_t consumed;
+   /* Quanta the graph asked for and this driver had nothing at all
+    * for, so the whole buffer went out as silence. A short read is
+    * not one: that hands the graph fewer frames, not silence. */
+   retro_atomic_size_t underruns;
+   /* Process calls that found no buffer to take - and, capturing, a
+    * ring whose reader was behind or overtaken. */
+   retro_atomic_size_t xruns;
+
+   /* The device clock, fitted from the time report the graph already
+    * hands over.
+    *
+    * pw_time carries three things worth having and this driver was
+    * using one of them: now, the nanosecond time the report was taken
+    * at; ticks, the position the far end is reading, in units of rate;
+    * and delay, which is what the latency line uses. ticks against now
+    * is the graph's clock against the wall, and since ticks are in
+    * 1/samplerate units both sides are seconds - so the slope is the
+    * ratio directly and needs no sample rate to interpret.
+    *
+    * A fit over every sample, not two points: noise on a single anchor
+    * divides by the window and reads as drift. Touched under the
+    * thread loop lock, beside the call that already fetches the
+    * report, so this adds no call and nothing to the data thread.
+    * Nothing here feeds rate control. */
+   int64_t  clk_anchor_now;
+   uint64_t clk_anchor_ticks;
+   int      clk_have_anchor;
+   double   clk_sx, clk_sy, clk_sxx, clk_sxy, clk_n;
+   int      clk_ppm;
+   int      clk_valid;
 } pipewire_audio_t;
 
-static void stream_destroy_cb(void *data)
+static size_t pwire_calc_frame_size(enum spa_audio_format fmt, uint32_t nchannels)
 {
-   pipewire_audio_t *audio = (pipewire_audio_t*)data;
-   spa_hook_remove(&audio->stream_listener);
-   audio->stream = NULL;
+   switch (fmt)
+   {
+      case SPA_AUDIO_FORMAT_S8:
+      case SPA_AUDIO_FORMAT_U8:
+         break;
+      case SPA_AUDIO_FORMAT_S16_BE:
+      case SPA_AUDIO_FORMAT_S16_LE:
+      case SPA_AUDIO_FORMAT_U16_BE:
+      case SPA_AUDIO_FORMAT_U16_LE:
+         return 2 * nchannels;
+      case SPA_AUDIO_FORMAT_S32_BE:
+      case SPA_AUDIO_FORMAT_S32_LE:
+      case SPA_AUDIO_FORMAT_U32_BE:
+      case SPA_AUDIO_FORMAT_U32_LE:
+      case SPA_AUDIO_FORMAT_F32_BE:
+      case SPA_AUDIO_FORMAT_F32_LE:
+         return 4 * nchannels;
+      default:
+         RARCH_ERR("[PipeWire] Bad spa_audio_format %d.\n", fmt);
+         break;
+   }
+   return nchannels;
 }
 
-static void playback_process_cb(void *data)
+/* The stream's positions from the frontend's layout mask, in the
+ * mask's ascending-bit order - which is the order the frames carry.
+ * Mono is its own case. A count never decides a position: the two
+ * six-channel layouts differ in the rear pair, and each is given as
+ * itself. */
+static void pwire_set_position_layout(uint32_t layout,
+      uint32_t position[SPA_AUDIO_MAX_CHANNELS])
 {
-   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   static const struct { uint32_t bit; uint32_t spa; } map[] = {
+      { AUDIO_SPEAKER_FRONT_LEFT,            SPA_AUDIO_CHANNEL_FL  },
+      { AUDIO_SPEAKER_FRONT_RIGHT,           SPA_AUDIO_CHANNEL_FR  },
+      { AUDIO_SPEAKER_FRONT_CENTER,          SPA_AUDIO_CHANNEL_FC  },
+      { AUDIO_SPEAKER_LOW_FREQUENCY,         SPA_AUDIO_CHANNEL_LFE },
+      { AUDIO_SPEAKER_BACK_LEFT,             SPA_AUDIO_CHANNEL_RL  },
+      { AUDIO_SPEAKER_BACK_RIGHT,            SPA_AUDIO_CHANNEL_RR  },
+      { AUDIO_SPEAKER_FRONT_LEFT_OF_CENTER,  SPA_AUDIO_CHANNEL_FLC },
+      { AUDIO_SPEAKER_FRONT_RIGHT_OF_CENTER, SPA_AUDIO_CHANNEL_FRC },
+      { AUDIO_SPEAKER_BACK_CENTER,           SPA_AUDIO_CHANNEL_RC  },
+      { AUDIO_SPEAKER_SIDE_LEFT,             SPA_AUDIO_CHANNEL_SL  },
+      { AUDIO_SPEAKER_SIDE_RIGHT,            SPA_AUDIO_CHANNEL_SR  },
+   };
+   size_t i, n = 0;
+   for (i = 0; i < SPA_AUDIO_MAX_CHANNELS; i++)
+      position[i] = SPA_AUDIO_CHANNEL_UNKNOWN;
+   for (i = 0; i < ARRAY_SIZE(map); i++)
+      if (layout & map[i].bit)
+         position[n++] = map[i].spa;
+}
+
+static void pwire_set_position(uint32_t channels, uint32_t position[SPA_AUDIO_MAX_CHANNELS])
+{
+   if (channels == 1)
+   {
+      size_t i;
+      for (i = 1; i < SPA_AUDIO_MAX_CHANNELS; i++)
+         position[i] = SPA_AUDIO_CHANNEL_UNKNOWN;
+      position[0] = SPA_AUDIO_CHANNEL_MONO;
+      return;
+   }
+   pwire_set_position_layout(AUDIO_LAYOUT_STEREO, position);
+}
+
+#ifdef HAVE_MICROPHONE
+typedef struct pipewire_audio pipewire_microphone_t;
+static void pwire_stream_destroy_cb(void *data);
+
+static void pwire_mic_stream_state_changed_cb(void *data,
+      enum pw_stream_state old, enum pw_stream_state state, const char *error)
+{
+   pipewire_microphone_t *mic = (pipewire_microphone_t*)data;
+
+   RARCH_DBG("[Microphone] [PipeWire] Stream state changed %s -> %s.\n",
+             pw_stream_state_as_string(old),
+             pw_stream_state_as_string(state));
+
+   pw_thread_loop_signal(mic->pw->thread_loop, false);
+}
+
+static void pwire_capture_process_cb(void *data)
+{
    void *p;
+   int32_t filled;
    struct pw_buffer *b;
    struct spa_buffer *buf;
-   uint32_t req, idx, n_bytes;
-   int32_t avail;
+   uint32_t idx, offs, n_bytes;
+   pipewire_microphone_t *mic = (pipewire_microphone_t*)data;
 
-   retro_assert(audio);
-   retro_assert(audio->stream);
-
-   if ((b = pw_stream_dequeue_buffer(audio->stream)) == NULL)
+   /* Out of buffers: counted with the overruns, on the graph's thread,
+    * and logged in the total when the microphone closes. */
+   if (!(b = pw_stream_dequeue_buffer(mic->stream)))
    {
-      RARCH_WARN("[Audio] [PipeWire]: Out of buffers: %s\n", strerror(errno));
-      return pw_thread_loop_signal(audio->pw->thread_loop, false);
+      retro_atomic_fetch_add_size(&mic->xruns, 1);
+      pw_thread_loop_signal(mic->pw->thread_loop, false);
+      return;
    }
 
    buf = b->buffer;
    if ((p = buf->datas[0].data) == NULL)
-      return pw_thread_loop_signal(audio->pw->thread_loop, false);
-
-   /* calculate the total no of bytes to read data from buffer */
-   n_bytes = buf->datas[0].maxsize;
-   if (b->requested)
-      n_bytes = MIN(b->requested * audio->frame_size, n_bytes);
-
-   avail = spa_ringbuffer_get_read_index(&audio->ring, &idx);
-
-   if (avail <= 0)
-      /* fill rest buffer with silence */
-      memset(p, 0x00, n_bytes);
-   else
    {
-      if (avail < (int32_t)n_bytes)
-         n_bytes = avail;
-
-      spa_ringbuffer_read_data(&audio->ring,
-                               audio->buffer, RINGBUFFER_SIZE,
-                               idx & RINGBUFFER_MASK, p, n_bytes);
-
-      idx += n_bytes;
-      spa_ringbuffer_read_update(&audio->ring, idx);
+      pw_thread_loop_signal(mic->pw->thread_loop, false);
+      return;
    }
 
-   buf->datas[0].chunk->offset = 0;
-   buf->datas[0].chunk->stride = audio->frame_size;
-   buf->datas[0].chunk->size   = n_bytes;
+   offs    = MIN(buf->datas[0].chunk->offset, buf->datas[0].maxsize);
+   n_bytes = MIN(buf->datas[0].chunk->size, buf->datas[0].maxsize - offs);
 
-   pw_stream_queue_buffer(audio->stream, b);
-   pw_thread_loop_signal(audio->pw->thread_loop, false);
+   /* A ring the reader has fallen behind on, or one it has overtaken:
+    * counted here, on the graph's thread, and logged as one total when
+    * the microphone is closed. */
+   filled = spa_ringbuffer_get_write_index(&mic->ring, &idx);
+   if (filled < 0 || (uint32_t)filled + n_bytes > RINGBUFFER_SIZE)
+      retro_atomic_fetch_add_size(&mic->xruns, 1);
+   spa_ringbuffer_write_data(&mic->ring,
+         mic->buffer, RINGBUFFER_SIZE,
+         idx & RINGBUFFER_MASK,
+         SPA_PTROFF(p, offs, void), n_bytes);
+   idx += n_bytes;
+   spa_ringbuffer_write_update(&mic->ring, idx);
+
+   pw_stream_queue_buffer(mic->stream, b);
+   pw_thread_loop_signal(mic->pw->thread_loop, false);
 }
 
-static void pipewire_free(void *data);
-
-static void stream_state_changed_cb(void *data,
-      enum pw_stream_state old, enum pw_stream_state state, const char *error)
-{
-   pipewire_audio_t *audio = (pipewire_audio_t*)data;
-
-   RARCH_DBG("[Audio] [PipeWire]: Stream state changed %s -> %s\n",
-             pw_stream_state_as_string(old),
-             pw_stream_state_as_string(state));
-
-   pw_thread_loop_signal(audio->pw->thread_loop, false);
-}
-
-static const struct pw_stream_events playback_stream_events = {
+static const struct pw_stream_events capture_stream_events = {
       PW_VERSION_STREAM_EVENTS,
-      .destroy = stream_destroy_cb,
-      .process = playback_process_cb,
-      .state_changed = stream_state_changed_cb,
+      pwire_stream_destroy_cb,
+      pwire_mic_stream_state_changed_cb,
+      NULL,          /* control_info */
+      NULL,          /* io_changed */
+      NULL,          /* param_changed */
+      NULL,          /* add_buffer */
+      NULL,          /* remove_buffer */
+      pwire_capture_process_cb
 };
 
-static void registry_event_global(void *data, uint32_t id,
-                uint32_t permissions, const char *type, uint32_t version,
-                const struct spa_dict *props)
+static void pwire_mic_registry_event_global(void *data, uint32_t id,
+      uint32_t permissions, const char *type, uint32_t version,
+      const struct spa_dict *props)
 {
    union string_list_elem_attr attr;
    const struct spa_dict_item *item;
    pipewire_core_t              *pw = (pipewire_core_t*)data;
    const char                 *sink = NULL;
 
-   if (spa_streq(type, PW_TYPE_INTERFACE_Node)
-      && spa_streq("Audio/Sink", spa_dict_lookup(props, PW_KEY_MEDIA_CLASS)))
+   if (!pw)
+      return;
+
+   if (   spa_streq(type, PW_TYPE_INTERFACE_Node)
+       && spa_streq("Audio/Source", spa_dict_lookup(props, PW_KEY_MEDIA_CLASS)))
    {
       sink = spa_dict_lookup(props, PW_KEY_NODE_NAME);
       if (sink && pw->devicelist)
       {
          attr.i = id;
          string_list_append(pw->devicelist, sink, attr);
-         RARCH_LOG("[Audio] [PipeWire]: Found Sink Node: %s\n", sink);
+         RARCH_LOG("[Microphone] [PipeWire] Found Source Node: %s.\n", sink);
       }
 
-      RARCH_DBG("[Audio] [PipeWire]: Object: id:%u Type:%s/%d\n", id, type, version);
+      RARCH_DBG("[Microphone] [PipeWire] Object: id:%u Type:%s/%d\n", id, type, version);
       spa_dict_for_each(item, props)
-         RARCH_DBG("[Audio] [PipeWire]: \t\t%s: \"%s\"\n", item->key, item->value);
+         RARCH_DBG("[Microphone] [PipeWire] \t\t%s: \"%s\"\n", item->key, item->value);
    }
 }
 
-static const struct pw_registry_events registry_events = {
+static const struct pw_registry_events pwire_mic_registry_events = {
       PW_VERSION_REGISTRY_EVENTS,
-      .global = registry_event_global,
+      pwire_mic_registry_event_global
 };
 
-static void *pipewire_init(const char *device, unsigned rate,
-      unsigned latency,
-      unsigned block_frames,
-      unsigned *new_rate)
+static void pwire_microphone_free(void *driver_context)
 {
-   int                         res;
-   uint64_t            buf_samples;
+   pipewire_core_deinit((pipewire_core_t*)driver_context);
+}
+
+static void *pwire_microphone_init(void)
+{
+   pipewire_core_t *pw = NULL;
+
+   if (!pipewire_core_init(&pw, "microphone_driver", &pwire_mic_registry_events))
+      goto error;
+
+   if (!pipewire_core_wait_resync(pw))
+   {
+      pw_thread_loop_unlock(pw->thread_loop);
+      goto error;
+   }
+   pw_thread_loop_unlock(pw->thread_loop);
+
+   return pw;
+
+error:
+   RARCH_ERR("[Microphone] [PipeWire] Failed to initialize microphone.\n");
+   pwire_microphone_free(pw);
+   return NULL;
+}
+
+static void pwire_microphone_close_mic(void *driver_context, void *mic_context)
+{
+   pipewire_core_t        *pw = (pipewire_core_t*)driver_context;
+   pipewire_microphone_t *mic = (pipewire_microphone_t*)mic_context;
+
+   if (pw && mic)
+   {
+      size_t xruns;
+      /* A failed open closes before the stream exists, and
+       * pw_stream_destroy() does not take NULL. */
+      if (mic->stream)
+      {
+         pw_thread_loop_lock(pw->thread_loop);
+         pw_stream_destroy(mic->stream);
+         mic->stream = NULL;
+         pw_thread_loop_unlock(pw->thread_loop);
+      }
+      xruns = retro_atomic_load_acquire_size(&mic->xruns);
+      if (xruns)
+         RARCH_WARN("[Microphone] [PipeWire] %lu capture cycles overran, underran or found no buffer.\n",
+               (unsigned long)xruns);
+      free(mic);
+   }
+}
+
+/* Sleeps until the capture ring holds len bytes, then says how many it
+ * holds. The same wait pwire_microphone_read() does, without the copy:
+ * one PIPEWIRE_STREAM_WAIT_MS bound on the thread loop, so a graph that
+ * has stopped delivering returns what it has - possibly nothing - and
+ * the caller comes back later rather than parking here. */
+static size_t pwire_microphone_wait_readable(void *driver_context,
+      void *mic_context, size_t len)
+{
+   uint32_t idx;
+   int32_t  readable;
+   const char            *error = NULL;
+   pipewire_core_t          *pw = (pipewire_core_t*)driver_context;
+   pipewire_microphone_t   *mic = (pipewire_microphone_t*)mic_context;
+
+   if (!pw || !mic)
+      return 0;
+   if (pw_stream_get_state(mic->stream, &error) != PW_STREAM_STATE_STREAMING)
+      return 0;
+
+   pw_thread_loop_lock(pw->thread_loop);
+
+   for (;;)
+   {
+      readable = spa_ringbuffer_get_read_index(&mic->ring, &idx);
+      if (readable >= (int32_t)len)
+         break;
+      if (!pipewire_loop_wait_ms(pw->thread_loop, PIPEWIRE_STREAM_WAIT_MS))
+         break;
+      if (pw_stream_get_state(mic->stream, &error) != PW_STREAM_STATE_STREAMING)
+      {
+         pw_thread_loop_unlock(pw->thread_loop);
+         return 0;
+      }
+   }
+
+   pw_thread_loop_unlock(pw->thread_loop);
+   return readable > 0 ? (size_t)readable : 0;
+}
+
+static int pwire_microphone_read(void *driver_context, void *mic_context, void *s, size_t len)
+{
+   uint32_t idx;
+   int32_t readable;
+   const char          *error = NULL;
+   pipewire_core_t        *pw = (pipewire_core_t*)driver_context;
+   pipewire_microphone_t *mic = (pipewire_microphone_t*)mic_context;
+
+   if (pw_stream_get_state(mic->stream, &error) != PW_STREAM_STATE_STREAMING)
+      return -1;
+
+   pw_thread_loop_lock(pw->thread_loop);
+
+   for (;;)
+   {
+      /* get no of available bytes to read data from buffer */
+      readable = spa_ringbuffer_get_read_index(&mic->ring, &idx);
+
+      if (readable < (int32_t)len)
+      {
+         if (pw->nonblock)
+         {
+            len = readable;
+            break;
+         }
+
+         if (!pipewire_loop_wait_ms(pw->thread_loop, PIPEWIRE_STREAM_WAIT_MS))
+         {
+            /* No capture cycle within the bound: read nothing this
+             * call rather than hold the caller. */
+            len = readable;
+            break;
+         }
+         if (pw_stream_get_state(mic->stream, &error) != PW_STREAM_STATE_STREAMING)
+         {
+            pw_thread_loop_unlock(mic->pw->thread_loop);
+            return -1;
+         }
+      }
+      else
+         break;
+   }
+
+   spa_ringbuffer_read_data(&mic->ring,
+         mic->buffer, RINGBUFFER_SIZE,
+         idx & RINGBUFFER_MASK, s, len);
+   idx += len;
+   spa_ringbuffer_read_update(&mic->ring, idx);
+   pw_thread_loop_unlock(pw->thread_loop);
+
+   return len;
+}
+
+static bool pwire_microphone_mic_alive(const void *driver_context, const void *mic_context)
+{
+   const char          *error = NULL;
+   pipewire_microphone_t *mic = (pipewire_microphone_t*)mic_context;
+   if (!mic)
+      return false;
+   return pw_stream_get_state(mic->stream, &error) == PW_STREAM_STATE_STREAMING;
+}
+
+static struct string_list *pwire_microphone_device_list_new(const void *driver_context)
+{
+   pipewire_core_t *pw = (pipewire_core_t*)driver_context;
+
+   if (pw && pw->devicelist)
+      return string_list_clone(pw->devicelist);
+
+   return NULL;
+}
+
+static void pwire_microphone_device_list_free(const void *driver_context, struct string_list *devices)
+{
+   if (devices)
+      string_list_free(devices);
+}
+
+static void *pwire_microphone_open_mic(void *driver_context,
+   const char *device, unsigned rate, unsigned latency,
+   unsigned *new_rate)
+{
+   int res;
+   uint64_t buf_samples;
+   uint8_t buffer[1024];
    const struct spa_pod *params[1];
-   uint8_t             buffer[1024];
-   struct pw_properties     *props = NULL;
-   const char               *error = NULL;
-   pipewire_audio_t         *audio = (pipewire_audio_t*)calloc(1, sizeof(*audio));
-   struct spa_pod_builder        b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+   struct pw_properties *props = NULL;
+   struct spa_pod_builder    b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+   pipewire_microphone_t   *mic = NULL;
 
-   if (!audio)
+   if (!driver_context || (mic = calloc(1, sizeof(pipewire_microphone_t))) == NULL)
       goto error;
 
-   if (!pipewire_core_init(&audio->pw, "audio_driver", &registry_events))
-      goto error;
+   mic->pw = (pipewire_core_t*)driver_context;
+   mic->highwater_mark = 0;
 
-   /* unlock, run the loop and wait, this will trigger the callbacks */
-   pipewire_core_wait_resync(audio->pw);
+   pw_thread_loop_lock(mic->pw->thread_loop);
 
-   audio->info.format = is_little_endian() ? SPA_AUDIO_FORMAT_F32_LE : SPA_AUDIO_FORMAT_F32_BE;
-   audio->info.channels = DEFAULT_CHANNELS;
-   pipewire_set_position(DEFAULT_CHANNELS, audio->info.position);
-   audio->info.rate = rate;
-   audio->frame_size = pipewire_calc_frame_size(audio->info.format, DEFAULT_CHANNELS);
+   /* Honour the audio format-negotiation hint, as the ALSA and SDL capture
+    * paths do. The libretro microphone interface is int16 only, so asking
+    * PipeWire for S16 keeps the whole capture path integer rather than
+    * handing us float that gets converted back down. PipeWire converts
+    * server-side when the source is a different format, and the capture
+    * ring buffer here is byte-oriented, so neither format is special. */
+   if (config_get_ptr()->uints.audio_format_negotiation
+         == AUDIO_FORMAT_NEGOTIATION_INT16)
+      mic->info.format = is_little_endian()
+            ? SPA_AUDIO_FORMAT_S16_LE : SPA_AUDIO_FORMAT_S16_BE;
+   else
+      mic->info.format = is_little_endian()
+            ? SPA_AUDIO_FORMAT_F32_LE : SPA_AUDIO_FORMAT_F32_BE;
+   mic->info.channels = MIC_DEFAULT_CHANNELS;
+   pwire_set_position(MIC_DEFAULT_CHANNELS, mic->info.position);
+   mic->info.rate     = rate;
+   mic->frame_size    = pwire_calc_frame_size(mic->info.format, MIC_DEFAULT_CHANNELS);
 
    props = pw_properties_new(PW_KEY_MEDIA_TYPE,          PW_RARCH_MEDIA_TYPE_AUDIO,
-                             PW_KEY_MEDIA_CATEGORY,      PW_RARCH_MEDIA_CATEGORY_PLAYBACK,
+                             PW_KEY_MEDIA_CATEGORY,      PW_RARCH_MEDIA_CATEGORY_RECORD,
                              PW_KEY_MEDIA_ROLE,          PW_RARCH_MEDIA_ROLE,
                              PW_KEY_NODE_NAME,           PW_RARCH_APPNAME,
                              PW_KEY_NODE_DESCRIPTION,    PW_RARCH_APPNAME,
@@ -204,12 +494,392 @@ static void *pipewire_init(const char *device, unsigned rate,
    buf_samples = latency * rate / 1000;
    pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%" PRIu64 "/%u", buf_samples, rate);
    pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%d", rate);
+
+   if (!(mic->stream = pw_stream_new(mic->pw->core, PW_RARCH_APPNAME, props)))
+      goto unlock_error;
+
+   pw_stream_add_listener(mic->stream, &mic->stream_listener, &capture_stream_events, mic);
+
+   params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &mic->info);
+
+   /* Now connect this stream. We ask that our process function is
+    * called in a realtime thread. */
+   res = pw_stream_connect(mic->stream, PW_DIRECTION_INPUT, PW_ID_ANY,
+           PW_STREAM_FLAG_AUTOCONNECT
+         | PW_STREAM_FLAG_INACTIVE
+         | PW_STREAM_FLAG_MAP_BUFFERS
+         | PW_STREAM_FLAG_RT_PROCESS,
+         params, 1);
+
+   if (res < 0)
+      goto unlock_error;
+
+   /* As for playback: wait for the stream to connect or fail, and
+    * fail the open at the bound if the daemon never gets it there. */
+   {
+      unsigned waited_ms = 0;
+      enum pw_stream_state st;
+      const char *err = NULL;
+      for (;;)
+      {
+         st = pw_stream_get_state(mic->stream, &err);
+         if (st != PW_STREAM_STATE_CONNECTING && st != PW_STREAM_STATE_UNCONNECTED)
+            break;
+         if (pipewire_loop_wait_ms(mic->pw->thread_loop, PIPEWIRE_LOOP_WAIT_STEP_MS))
+            continue;
+         waited_ms += PIPEWIRE_LOOP_WAIT_STEP_MS;
+         if (waited_ms >= PIPEWIRE_SYNC_WAIT_MS)
+         {
+            RARCH_ERR("[PipeWire] Capture stream did not connect within %u ms.\n",
+                  PIPEWIRE_SYNC_WAIT_MS);
+            goto unlock_error;
+         }
+      }
+      if (st == PW_STREAM_STATE_ERROR)
+      {
+         RARCH_ERR("[PipeWire] Capture stream failed to connect: %s.\n", err ? err : "?");
+         goto unlock_error;
+      }
+   }
+   pw_thread_loop_unlock(mic->pw->thread_loop);
+
+   *new_rate = mic->info.rate;
+
+   return mic;
+
+unlock_error:
+   pw_thread_loop_unlock(mic->pw->thread_loop);
+error:
+   RARCH_ERR("[Microphone] [PipeWire] Failed to initialize microphone.\n");
+   /* mic is NULL when there was no driver context or the calloc failed */
+   if (mic)
+      pwire_microphone_close_mic(mic->pw, mic);
+   return NULL;
+}
+
+static bool pwire_microphone_start_mic(void *driver_context, void *mic_context)
+{
+   pipewire_core_t        *pw = (pipewire_core_t*)driver_context;
+   pipewire_microphone_t *mic = (pipewire_microphone_t*)mic_context;
+
+   if (pw && mic)
+   {
+      const char *error = NULL;
+      enum pw_stream_state st = pw_stream_get_state(mic->stream, &error);
+      switch (st)
+      {
+         case PW_STREAM_STATE_STREAMING:
+            return true;
+         case PW_STREAM_STATE_PAUSED:
+            return pipewire_stream_set_active(pw->thread_loop, mic->stream, true);
+         default:
+            break;
+      }
+   }
+
+   return false;
+}
+
+static bool pwire_microphone_stop_mic(void *driver_context, void *mic_context)
+{
+   pipewire_core_t       *pw = (pipewire_core_t*)driver_context;
+   pipewire_microphone_t *mic = (pipewire_microphone_t*)mic_context;
+   const char          *error = NULL;
+   bool                   res = false;
+
+   if (!pw || !mic)
+      return false;
+
+   if (pw_stream_get_state(mic->stream, &error) == PW_STREAM_STATE_STREAMING)
+      res = pipewire_stream_set_active(pw->thread_loop, mic->stream, false);
+   else
+      /* For other states we assume that the stream is inactive */
+      res = true;
+
+   spa_ringbuffer_read_update(&mic->ring, 0);
+   spa_ringbuffer_write_update(&mic->ring, 0);
+
+   return res;
+}
+
+static bool pwire_microphone_mic_use_float(const void *a, const void *b)
+{
+   const pipewire_microphone_t *mic = (const pipewire_microphone_t*)b;
+   /* Report the format actually requested for this stream rather than a
+    * hardcoded true; the frontend uses this to decide whether it can keep
+    * the flush in the integer domain. */
+   if (!mic)
+      return false;
+   return    (mic->info.format == SPA_AUDIO_FORMAT_F32_LE)
+          || (mic->info.format == SPA_AUDIO_FORMAT_F32_BE);
+}
+
+microphone_driver_t microphone_pipewire = {
+      pwire_microphone_init,
+      pwire_microphone_free,
+      pwire_microphone_read,
+      "pipewire",
+      pwire_microphone_device_list_new,
+      pwire_microphone_device_list_free,
+      pwire_microphone_open_mic,
+      pwire_microphone_close_mic,
+      pwire_microphone_mic_alive,
+      pwire_microphone_start_mic,
+      pwire_microphone_stop_mic,
+      pwire_microphone_mic_use_float,
+      pwire_microphone_wait_readable
+};
+#endif
+
+#define DEFAULT_CHANNELS   2
+
+static void pwire_stream_destroy_cb(void *data)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   spa_hook_remove(&audio->stream_listener);
+   audio->stream = NULL;
+}
+
+static void pwire_playback_process_cb(void *data)
+{
+   void *p;
+   int32_t avail;
+   struct pw_buffer *b;
+   struct spa_buffer *buf;
+   uint32_t idx, n_bytes;
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+
+   /* Out of buffers: counted on the graph's thread and logged in the
+    * total when the driver is freed. */
+   if ((b = pw_stream_dequeue_buffer(audio->stream)) == NULL)
+   {
+      retro_atomic_fetch_add_size(&audio->xruns, 1);
+      pw_thread_loop_signal(audio->pw->thread_loop, false);
+      return;
+   }
+
+   buf = b->buffer;
+   if ((p = buf->datas[0].data) == NULL)
+   {
+      pw_thread_loop_signal(audio->pw->thread_loop, false);
+      return;
+   }
+
+   /* calculate the total no of bytes to read data from buffer */
+   n_bytes = buf->datas[0].maxsize;
+   if (b->requested)
+      n_bytes = MIN(b->requested * audio->frame_size, n_bytes);
+
+   avail = spa_ringbuffer_get_read_index(&audio->ring, &idx);
+
+   if (avail <= 0)
+   {
+      /* fill rest buffer with silence */
+      memset(p, 0x00, n_bytes);
+      retro_atomic_fetch_add_size(&audio->underruns, 1);
+   }
+   else
+   {
+      if (avail < (int32_t)n_bytes)
+         n_bytes = avail;
+
+      spa_ringbuffer_read_data(&audio->ring,
+            audio->buffer, RINGBUFFER_SIZE,
+            idx & RINGBUFFER_MASK, p, n_bytes);
+
+      idx += n_bytes;
+      spa_ringbuffer_read_update(&audio->ring, idx);
+   }
+
+   buf->datas[0].chunk->offset = 0;
+   buf->datas[0].chunk->stride = audio->frame_size;
+   buf->datas[0].chunk->size   = n_bytes;
+
+   if (audio->frame_size)
+      retro_atomic_fetch_add_size(&audio->consumed,
+            (size_t)(n_bytes / audio->frame_size));
+
+   pw_stream_queue_buffer(audio->stream, b);
+   pw_thread_loop_signal(audio->pw->thread_loop, false);
+}
+
+/* Frames the graph has taken since the stream started. The process
+ * callback is the graph asking for a quantum, so counting what it takes
+ * counts device time - JACK's shape rather than ALSA's, with no queue
+ * to subtract. */
+/* The graph clock, for the statistics overlay. */
+static bool pwire_device_clock_ppm(void *data, double *ppm)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   if (!audio || !audio->clk_valid)
+      return false;
+   *ppm = (double)audio->clk_ppm;
+   return true;
+}
+
+static size_t pwire_frames_consumed(void *data)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   if (!audio)
+      return 0;
+   return retro_atomic_load_acquire_size(&audio->consumed);
+}
+
+static void pwire_free(void *data);
+
+static void pwire_stream_state_changed_cb(void *data,
+      enum pw_stream_state old, enum pw_stream_state state, const char *error)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+
+   RARCH_DBG("[PipeWire] Stream state changed %s -> %s.\n",
+             pw_stream_state_as_string(old),
+             pw_stream_state_as_string(state));
+
+   pw_thread_loop_signal(audio->pw->thread_loop, false);
+}
+
+static const struct pw_stream_events pwire_playback_stream_events = {
+      PW_VERSION_STREAM_EVENTS,
+      pwire_stream_destroy_cb,
+      pwire_stream_state_changed_cb,
+      NULL,          /* control_info */
+      NULL,          /* io_changed */
+      NULL,          /* param_changed */
+      NULL,          /* add_buffer */
+      NULL,          /* remove_buffer */
+      pwire_playback_process_cb
+};
+
+static void pwire_registry_event_global(void *data, uint32_t id,
+      uint32_t permissions, const char *type, uint32_t version,
+      const struct spa_dict *props)
+{
+   union string_list_elem_attr attr;
+   const struct spa_dict_item *item;
+   pipewire_core_t              *pw = (pipewire_core_t*)data;
+   const char                 *sink = NULL;
+
+   if (spa_streq(type, PW_TYPE_INTERFACE_Node)
+      && spa_streq("Audio/Sink", spa_dict_lookup(props, PW_KEY_MEDIA_CLASS)))
+   {
+      sink = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+      if (sink && pw->devicelist)
+      {
+         attr.i = id;
+         string_list_append(pw->devicelist, sink, attr);
+         RARCH_LOG("[PipeWire] Found Sink Node: %s.\n", sink);
+      }
+
+      RARCH_DBG("[PipeWire] Object: id:%u Type:%s/%d.\n", id, type, version);
+      spa_dict_for_each(item, props)
+         RARCH_DBG("[PipeWire] \t\t%s: \"%s\".\n", item->key, item->value);
+   }
+}
+
+static const struct pw_registry_events pwire_registry_events = {
+      PW_VERSION_REGISTRY_EVENTS,
+      pwire_registry_event_global
+};
+
+/* Context-free enumeration: bring up a throwaway core with the same
+ * registry listener the driver uses, wait for the registry to sync so
+ * every existing Audio/Sink node has been reported, take the list, tear
+ * the core down. Used when there is no driver instance. */
+static struct string_list *pwire_enumerate_sinks(void)
+{
+   pipewire_core_t     *pw = NULL;
+   struct string_list  *sl = NULL;
+
+   if (!pipewire_core_init(&pw, "audio_enum", &pwire_registry_events))
+   {
+      pipewire_core_deinit(pw);
+      return NULL;
+   }
+
+   /* pipewire_core_init() returns holding the loop lock; wait_resync
+    * releases it while it waits and reacquires, as in pwire_init(). */
+   /* A daemon that does not answer has enumerated nothing; the list
+    * is whatever the registry delivered before the deadline. */
+   pipewire_core_wait_resync(pw);
+   if (pw->devicelist)
+      sl = string_list_clone(pw->devicelist);
+   pw_thread_loop_unlock(pw->thread_loop);
+
+   pipewire_core_deinit(pw);
+   return sl;
+}
+
+
+static void *pwire_init(const char *device, unsigned rate,
+      unsigned latency,
+      unsigned *new_rate)
+{
+   int                         res;
+   uint64_t            buf_samples;
+   const struct spa_pod *params[1];
+   uint8_t             buffer[1024];
+   struct pw_properties     *props = NULL;
+   pipewire_audio_t         *audio = (pipewire_audio_t*)calloc(1, sizeof(*audio));
+   struct spa_pod_builder        b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+
+   if (!audio)
+      return NULL;
+
+   if (!pipewire_core_init(&audio->pw, "audio_driver", &pwire_registry_events))
+      goto error;
+
+   /* unlock, run the loop and wait, this will trigger the callbacks */
+   if (!pipewire_core_wait_resync(audio->pw))
+      goto unlock_error;
+
+   /* The layout the frontend asked for, with its positions: PipeWire
+    * routes each to the sink's channel of that position, or mixes
+    * where the sink lacks one, so what is asked is what is carried. */
+   audio->layout        = audio_driver_requested_layout();
+   audio->info.format   = is_little_endian() ? SPA_AUDIO_FORMAT_F32_LE : SPA_AUDIO_FORMAT_F32_BE;
+   audio->info.channels = audio_layout_channels(audio->layout);
+   pwire_set_position_layout(audio->layout, audio->info.position);
+   audio->info.rate     = rate;
+   audio->frame_size    = pwire_calc_frame_size(audio->info.format, audio->info.channels);
+
+   props = pw_properties_new(PW_KEY_MEDIA_TYPE,          PW_RARCH_MEDIA_TYPE_AUDIO,
+                             PW_KEY_MEDIA_CATEGORY,      PW_RARCH_MEDIA_CATEGORY_PLAYBACK,
+                             PW_KEY_MEDIA_ROLE,          PW_RARCH_MEDIA_ROLE,
+                             PW_KEY_NODE_NAME,           PW_RARCH_APPNAME,
+                             PW_KEY_NODE_DESCRIPTION,    PW_RARCH_APPNAME,
+                             PW_KEY_APP_NAME,            PW_RARCH_APPNAME,
+                             PW_KEY_APP_ID,              PW_RARCH_APPNAME,
+                             PW_KEY_APP_ICON_NAME,       PW_RARCH_APPNAME,
+                             NULL);
+   if (!props)
+      goto unlock_error;
+
+   if (device)
+      pw_properties_set(props, PW_KEY_TARGET_OBJECT, device);
+
+   /* Two stages: the ring here, which the writer fills and rate control
+    * measures and holds half full, and the graph's own lead of a
+    * quantum or more behind it, which the process callback pulls a
+    * quantum of from the ring each cycle. The quantum asked for is a
+    * quarter of the setting, floored at 128 frames; the ring, sized
+    * below, holds the setting and is what is reported. Asking for a
+    * quantum of the whole setting, as was done, had each cycle drain
+    * the whole ring - rate control sampling a full-scale sawtooth - and
+    * put a whole setting's worth in the graph on top of the ring. The
+    * quantum is a request; the graph may hold to its own. */
+   buf_samples = (uint64_t)latency * rate / 4000;
+   if (buf_samples < 128)
+      buf_samples = 128;
+   pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%" PRIu64 "/%u", buf_samples, rate);
+   pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%d", rate);
    audio->stream = pw_stream_new(audio->pw->core, PW_RARCH_APPNAME, props);
 
    if (!audio->stream)
       goto unlock_error;
 
-   pw_stream_add_listener(audio->stream, &audio->stream_listener, &playback_stream_events, audio);
+   pw_stream_add_listener(audio->stream, &audio->stream_listener,
+         &pwire_playback_stream_events, audio);
 
    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &audio->info);
 
@@ -218,17 +888,54 @@ static void *pipewire_init(const char *device, unsigned rate,
    res = pw_stream_connect(audio->stream,
                            PW_DIRECTION_OUTPUT,
                            PW_ID_ANY,
-                           PW_STREAM_FLAG_AUTOCONNECT |
-                           PW_STREAM_FLAG_MAP_BUFFERS |
-                           PW_STREAM_FLAG_RT_PROCESS,
+                             PW_STREAM_FLAG_AUTOCONNECT
+                           | PW_STREAM_FLAG_MAP_BUFFERS
+                           | PW_STREAM_FLAG_RT_PROCESS,
                            params, 1);
    if (res < 0)
       goto unlock_error;
 
    audio->highwater_mark = MIN(RINGBUFFER_SIZE,
-                               latency * (uint64_t)rate / 1000 * audio->frame_size);
+         latency * (uint64_t)rate / 1000 * audio->frame_size);
+   /* The ring holds at least two quanta, so a cycle's pull never finds
+    * it short of one. */
+   if (audio->highwater_mark < buf_samples * 2 * audio->frame_size)
+      audio->highwater_mark = (uint32_t)(buf_samples * 2 * audio->frame_size);
+   RARCH_LOG("[PipeWire] %u ms setting: a %u-byte ring (%u ms, rate control holds it about half full) in front of a requested %" PRIu64 "-frame quantum (%u ms); about %u ms from write to the graph, which adds a quantum or more of its own.\n",
+         latency, (unsigned)audio->highwater_mark,
+         (unsigned)(audio->highwater_mark / audio->frame_size * 1000 / rate),
+         buf_samples, (unsigned)(buf_samples * 1000 / rate),
+         (unsigned)(audio->highwater_mark / audio->frame_size * 1000 / rate / 2
+            + buf_samples * 1000 / rate));
 
-   pw_thread_loop_wait(audio->pw->thread_loop);
+   /* The state callback signals once the stream has connected (to
+    * paused) or failed. A daemon that never gets it there fails the
+    * init at the bound instead of holding the thread that opened it. */
+   {
+      unsigned waited_ms = 0;
+      enum pw_stream_state st;
+      const char *err = NULL;
+      for (;;)
+      {
+         st = pw_stream_get_state(audio->stream, &err);
+         if (st != PW_STREAM_STATE_CONNECTING && st != PW_STREAM_STATE_UNCONNECTED)
+            break;
+         if (pipewire_loop_wait_ms(audio->pw->thread_loop, PIPEWIRE_LOOP_WAIT_STEP_MS))
+            continue;
+         waited_ms += PIPEWIRE_LOOP_WAIT_STEP_MS;
+         if (waited_ms >= PIPEWIRE_SYNC_WAIT_MS)
+         {
+            RARCH_ERR("[PipeWire] Stream did not connect within %u ms.\n",
+                  PIPEWIRE_SYNC_WAIT_MS);
+            goto unlock_error;
+         }
+      }
+      if (st == PW_STREAM_STATE_ERROR)
+      {
+         RARCH_ERR("[PipeWire] Stream failed to connect: %s.\n", err ? err : "?");
+         goto unlock_error;
+      }
+   }
    pw_thread_loop_unlock(audio->pw->thread_loop);
 
    *new_rate = audio->info.rate;
@@ -238,82 +945,117 @@ static void *pipewire_init(const char *device, unsigned rate,
 unlock_error:
    pw_thread_loop_unlock(audio->pw->thread_loop);
 error:
-   RARCH_ERR("[Audio] [PipeWire]: Failed to initialize audio\n");
-   pipewire_free(audio);
+   RARCH_ERR("[PipeWire] Failed to initialize audio.\n");
+   pwire_free(audio);
    return NULL;
 }
 
-static ssize_t pipewire_write(void *data, const void *buf_, size_t len)
+static ssize_t pwire_write(void *data, const void *buf_, size_t len)
 {
-   int32_t   filled, avail;
-   uint32_t            idx;
+   size_t written          = 0;
+   const uint8_t *buf      = (const uint8_t*)buf_;
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
    const char       *error = NULL;
 
    if (pw_stream_get_state(audio->stream, &error) != PW_STREAM_STATE_STREAMING)
       return 0;  /* wait for stream to become ready */
 
-   if (len > audio->highwater_mark)
-   {
-      RARCH_ERR("[Audio] [PipeWire]: Buffer too small! Please try increasing the latency.\n");
-      return 0;
-   }
+   if (audio->frame_size)
+      len -= len % audio->frame_size;
 
    pw_thread_loop_lock(audio->pw->thread_loop);
 
-   for (;;)
+   /* As much as the ring has room for, in whole frames; blocking, the
+    * rest as the graph frees room, a write longer than the ring going
+    * in parts. */
+   while (written < len)
    {
-      filled = spa_ringbuffer_get_write_index(&audio->ring, &idx);
-      avail = audio->highwater_mark - filled;
+      uint32_t idx;
+      size_t   n;
+      int32_t  filled = spa_ringbuffer_get_write_index(&audio->ring, &idx);
+      size_t   avail  = (filled >= 0 && (uint32_t)filled < audio->highwater_mark)
+            ? audio->highwater_mark - (uint32_t)filled : 0;
 
-#if 0  /* Useful for tracing */
-      RARCH_DBG("[Audio] [PipeWire]: Ringbuffer utilization: filled %d, avail %d, index %d, size %d\n",
-                filled, avail, idx, len);
-#endif
+      if (audio->frame_size)
+         avail -= avail % audio->frame_size;
 
-      /* in non-blocking mode we play as much as we can
-       * in blocking mode we expect a freed buffer of at least the given size */
-      if (len > (size_t)avail)
+      if (!avail)
       {
          if (audio->pw->nonblock)
-         {
-            len = avail;
             break;
-         }
 
-         pw_thread_loop_wait(audio->pw->thread_loop);
+         /* The process callback signals every cycle. A graph that has
+          * stopped scheduling the stream while it still reads as
+          * streaming signals nothing; the bound turns that into a
+          * write of what went rather than a thread held inside the
+          * driver. */
+         if (!pipewire_loop_wait_ms(audio->pw->thread_loop, PIPEWIRE_STREAM_WAIT_MS))
+            break;
          if (pw_stream_get_state(audio->stream, &error) != PW_STREAM_STATE_STREAMING)
          {
             pw_thread_loop_unlock(audio->pw->thread_loop);
-            return -1;
+            return written ? (ssize_t)written : -1;
          }
+         continue;
       }
-      else
-         break;
-   }
 
-   if (filled < 0)
-      RARCH_ERR("[Audio] [Pipewire]: %p: underrun write:%u filled:%d\n", audio, idx, filled);
-   else
-   {
-      if ((uint32_t) filled + len > RINGBUFFER_SIZE)
-      {
-         RARCH_ERR("[Audio] [PipeWire]: %p: overrun write:%u filled:%d + size:%zu > max:%u\n",
-         audio, idx, filled, len, RINGBUFFER_SIZE);
-      }
-   }
+      n = len - written;
+      if (n > avail)
+         n = avail;
 
-   spa_ringbuffer_write_data(&audio->ring,
-                             audio->buffer, RINGBUFFER_SIZE,
-                             idx & RINGBUFFER_MASK, buf_, len);
-   idx += len;
-   spa_ringbuffer_write_update(&audio->ring, idx);
+      spa_ringbuffer_write_data(&audio->ring,
+            audio->buffer, RINGBUFFER_SIZE,
+            idx & RINGBUFFER_MASK, buf + written, (uint32_t)n);
+      idx += (uint32_t)n;
+      spa_ringbuffer_write_update(&audio->ring, idx);
+      written += n;
+   }
 
    pw_thread_loop_unlock(audio->pw->thread_loop);
-   return len;
+   return (ssize_t)written;
 }
 
-static bool pipewire_stop(void *data)
+/* The lend pair: the ring the process callback drains, handed out to
+ * its wrap. spa_ringbuffer is single-producer, single-consumer, so the
+ * lend takes no loop lock; write() takes it only for its wait. */
+static size_t pwire_write_begin(void *data, size_t len, void **region)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   const char       *error = NULL;
+   uint32_t idx;
+   int32_t  filled;
+   size_t   span;
+   *region = NULL;
+   if (     !audio || !audio->stream || !audio->frame_size
+         || pw_stream_get_state(audio->stream, &error) != PW_STREAM_STATE_STREAMING)
+      return 0;
+   filled = spa_ringbuffer_get_write_index(&audio->ring, &idx);
+   if (filled < 0 || (uint32_t)filled >= audio->highwater_mark)
+      return 0;
+   span = audio->highwater_mark - (uint32_t)filled;
+   if (span > RINGBUFFER_SIZE - (idx & RINGBUFFER_MASK))
+      span = RINGBUFFER_SIZE - (idx & RINGBUFFER_MASK);
+   if (span > len)
+      span = len;
+   span -= span % audio->frame_size;
+   if (!span)
+      return 0;
+   audio->lend_idx = idx;
+   *region         = audio->buffer + (idx & RINGBUFFER_MASK);
+   return span;
+}
+
+static ssize_t pwire_write_end(void *data, size_t len)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   len -= len % audio->frame_size;
+   if (len)
+      spa_ringbuffer_write_update(&audio->ring,
+            audio->lend_idx + (uint32_t)len);
+   return (ssize_t)len;
+}
+
+static bool pwire_stop(void *data)
 {
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
    const char       *error = NULL;
@@ -334,33 +1076,29 @@ static bool pipewire_stop(void *data)
    return res;
 }
 
-static bool pipewire_start(void *data, bool is_shutdown)
+static bool pwire_start(void *data, bool is_shutdown)
 {
-   enum pw_stream_state st;
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
-   const char       *error = NULL;
-   bool                res = false;
 
-   if (!audio || !audio->pw)
-      return false;
-
-   st = pw_stream_get_state(audio->stream, &error);
-   switch (st)
+   if (audio && audio->pw)
    {
-      case PW_STREAM_STATE_STREAMING:
-         res = true;
-         break;
-      case PW_STREAM_STATE_PAUSED:
-         res = pipewire_stream_set_active(audio->pw->thread_loop, audio->stream, true);
-         break;
-      default:
-         break;
+      const char *error = NULL;
+      enum pw_stream_state st = pw_stream_get_state(audio->stream, &error);
+      switch (st)
+      {
+         case PW_STREAM_STATE_STREAMING:
+            return true;
+         case PW_STREAM_STATE_PAUSED:
+            return pipewire_stream_set_active(audio->pw->thread_loop, audio->stream, true);
+         default:
+            break;
+      }
    }
 
-   return res;
+   return false;
 }
 
-static bool pipewire_alive(void *data)
+static bool pwire_alive(void *data)
 {
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
    const char       *error = NULL;
@@ -371,19 +1109,38 @@ static bool pipewire_alive(void *data)
    return pw_stream_get_state(audio->stream, &error) == PW_STREAM_STATE_STREAMING;
 }
 
-static void pipewire_set_nonblock_state(void *data, bool state)
+static void pwire_set_nonblock_state(void *data, bool state)
 {
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
    if (audio && audio->pw)
       audio->pw->nonblock = state;
 }
 
-static void pipewire_free(void *data)
+static void pwire_free(void *data)
 {
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
 
    if (!audio)
       return;
+
+   /* What the graph's clock was doing against the wall. Logged, not
+    * acted on: until these have been read off a range of hardware
+    * they are measurements, and a clock estimate that is wrong is
+    * worse than one that is absent. Note this is the graph's clock -
+    * with a device driving it that is the device, and with something
+    * else driving it, it is that. */
+   if (audio->clk_valid)
+      RARCH_LOG("[PipeWire] Graph clock, fitted from the time report:"
+            " %+d ppm.\n", audio->clk_ppm);
+   else
+      RARCH_LOG("[PipeWire] Graph clock: not enough usable time reports"
+            " to fit one.\n");
+   {
+      size_t xruns = retro_atomic_load_acquire_size(&audio->xruns);
+      if (xruns)
+         RARCH_WARN("[PipeWire] %lu playback cycles found no buffer.\n",
+               (unsigned long)xruns);
+   }
 
    if (audio->stream)
    {
@@ -396,19 +1153,28 @@ static void pipewire_free(void *data)
    free(audio);
 }
 
-static bool pipewire_use_float(void *data) { return true; }
+static bool pwire_use_float(void *data) { return true; }
 
-static void *pipewire_device_list_new(void *data)
+static uint32_t pwire_layout(void *data)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   return audio ? audio->layout : AUDIO_LAYOUT_STEREO;
+}
+
+static struct string_list *pwire_enumerate_sinks(void);
+
+static void *pwire_device_list_new(void *data)
 {
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
 
+   /* A live driver already holds the list its registry built. */
    if (audio && audio->pw && audio->pw->devicelist)
       return string_list_clone(audio->pw->devicelist);
 
-   return NULL;
+   return pwire_enumerate_sinks();
 }
 
-static void pipewire_device_list_free(void *data, void *array_list_data)
+static void pwire_device_list_free(void *data, void *array_list_data)
 {
    struct string_list *s = (struct string_list*)array_list_data;
 
@@ -416,44 +1182,164 @@ static void pipewire_device_list_free(void *data, void *array_list_data)
       string_list_free(s);
 }
 
-static size_t pipewire_write_avail(void *data)
+static size_t pwire_write_avail(void *data)
 {
    uint32_t idx, written, length;
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
    const char       *error = NULL;
 
-   retro_assert(audio->pw);
-   retro_assert(audio->stream);
-
    if (pw_stream_get_state(audio->stream, &error) != PW_STREAM_STATE_STREAMING)
-      return  0;  /* wait for stream to become ready */
+      return 0;  /* wait for stream to become ready */
 
    pw_thread_loop_lock(audio->pw->thread_loop);
    written = spa_ringbuffer_get_write_index(&audio->ring, &idx);
-   length = audio->highwater_mark - written;
+   length  = audio->highwater_mark - written;
+   {
+      /* The graph's stage behind the ring, for the statistics overlay:
+       * pw_time.delay is the frames between the stream seeing a sample
+       * and the device, in units of pw_time.rate, which is 1/rate for
+       * an audio stream. It settles once the graph is running, so it
+       * is read here, each time, rather than once at init. */
+      struct pw_time t;
+      int rc;
+      memset(&t, 0, sizeof(t));
+#if PW_CHECK_VERSION(0, 3, 50)
+      rc = pw_stream_get_time_n(audio->stream, &t, sizeof(t));
+#else
+      rc = pw_stream_get_time(audio->stream, &t);
+#endif
+      if (rc == 0 && t.rate.denom && t.delay > 0 && audio->info.rate)
+         audio_driver_set_device_latency((size_t)
+               ((uint64_t)t.delay * t.rate.num * audio->info.rate / t.rate.denom));
+
+      /* And the clock, from the same report - see the note on the
+       * fields. ticks are in units of t.rate, which for an audio
+       * stream is 1/samplerate, so both axes are seconds and the
+       * slope is the ratio. */
+      if (rc == 0 && t.rate.denom && t.now > 0 && t.ticks)
+      {
+         if (!audio->clk_have_anchor)
+         {
+            audio->clk_anchor_now   = t.now;
+            audio->clk_anchor_ticks = t.ticks;
+            audio->clk_have_anchor  = 1;
+            audio->clk_sx = audio->clk_sy = audio->clk_sxx = 0.0;
+            audio->clk_sxy = audio->clk_n = 0.0;
+         }
+         else if (     t.now   > audio->clk_anchor_now
+                    && t.ticks >= audio->clk_anchor_ticks)
+         {
+            double x = (double)(t.now - audio->clk_anchor_now) / 1000000000.0;
+            double y = (double)(t.ticks - audio->clk_anchor_ticks)
+               * (double)t.rate.num / (double)t.rate.denom;
+            double d;
+
+            audio->clk_sx  += x;
+            audio->clk_sy  += y;
+            audio->clk_sxx += x * x;
+            audio->clk_sxy += x * y;
+            audio->clk_n   += 1.0;
+
+            d = audio->clk_n * audio->clk_sxx - audio->clk_sx * audio->clk_sx;
+            if (x >= 1.0 && d > 0.0)
+            {
+               double slope = (audio->clk_n * audio->clk_sxy
+                     - audio->clk_sx * audio->clk_sy) / d;
+               double ppm   = (slope - 1.0) * 1000000.0;
+               if (ppm > -100000.0 && ppm < 100000.0)
+               {
+                  audio->clk_ppm   = (int)ppm;
+                  audio->clk_valid = 1;
+               }
+            }
+         }
+         else
+         {
+            audio->clk_anchor_now   = t.now;
+            audio->clk_anchor_ticks = t.ticks;
+            audio->clk_sx = audio->clk_sy = audio->clk_sxx = 0.0;
+            audio->clk_sxy = audio->clk_n = 0.0;
+         }
+      }
+   }
    pw_thread_loop_unlock(audio->pw->thread_loop);
 
    return length;
 }
 
-static size_t pipewire_buffer_size(void *data)
+static size_t pwire_buffer_size(void *data)
 {
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
    return audio->highwater_mark;
 }
 
+/* Sleep on the thread loop, which the process callback signals after
+ * every cycle, until at least len bytes fit below the high-water mark,
+ * capped at half of it so the wait always ends. Returns the free space
+ * then, or 0 once the stream has left the streaming state. */
+static size_t pwire_wait_writable(void *data, size_t len)
+{
+   uint32_t idx;
+   int32_t  filled, avail;
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   const char       *error = NULL;
+
+   if (len > audio->highwater_mark / 2)
+      len = audio->highwater_mark / 2;
+
+   pw_thread_loop_lock(audio->pw->thread_loop);
+   for (;;)
+   {
+      if (pw_stream_get_state(audio->stream, &error) != PW_STREAM_STATE_STREAMING)
+      {
+         pw_thread_loop_unlock(audio->pw->thread_loop);
+         return 0;
+      }
+      filled = spa_ringbuffer_get_write_index(&audio->ring, &idx);
+      avail  = audio->highwater_mark - filled;
+      if (avail >= (int32_t)len)
+         break;
+      /* As in pwire_write(): no cycle within the bound means no space
+       * is coming from this call, which the pipeline treats as a pass
+       * to skip, not a device gone. */
+      if (!pipewire_loop_wait_ms(audio->pw->thread_loop, PIPEWIRE_STREAM_WAIT_MS))
+      {
+         pw_thread_loop_unlock(audio->pw->thread_loop);
+         return 0;
+      }
+   }
+   pw_thread_loop_unlock(audio->pw->thread_loop);
+   return (size_t)avail;
+}
+
+static size_t pwire_underruns(void *data)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   return audio ? retro_atomic_load_acquire_size(&audio->underruns) : 0;
+}
+
 audio_driver_t audio_pipewire = {
-      pipewire_init,
-      pipewire_write,
-      pipewire_stop,
-      pipewire_start,
-      pipewire_alive,
-      pipewire_set_nonblock_state,
-      pipewire_free,
-      pipewire_use_float,
+      pwire_init,
+      pwire_write,
+      pwire_stop,
+      pwire_start,
+      pwire_alive,
+      pwire_set_nonblock_state,
+      pwire_free,
+      pwire_use_float,
       "pipewire",
-      pipewire_device_list_new,
-      pipewire_device_list_free,
-      pipewire_write_avail,
-      pipewire_buffer_size,
+      pwire_device_list_new,
+      pwire_device_list_free,
+      pwire_write_avail,
+      pwire_buffer_size,
+      NULL, /* write_raw */
+      pwire_wait_writable,
+      pwire_frames_consumed,
+      pwire_underruns,
+      pwire_layout,
+      NULL, /* frames_consumed_fallback */
+      pwire_device_clock_ppm,
+      NULL, /* thread_grant */
+      pwire_write_begin,
+      pwire_write_end
 };

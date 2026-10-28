@@ -15,6 +15,12 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
+
+#include <compat/strl.h>
+#include <retro_atomic.h>
+#include <queues/mpsc_stack.h>
+
 #include "../gfx_widgets.h"
 #include "../gfx_animation.h"
 #include "../gfx_display.h"
@@ -25,16 +31,13 @@
 
 struct gfx_widget_screenshot_state
 {
-   uintptr_t texture;
-   gfx_animation_t *p_anim;
+   gfx_surface_t *texture;
 
-   unsigned texture_width;
-   unsigned texture_height;
+   unsigned video_height;
+   unsigned texture_dims;
 
-   unsigned height;
-   unsigned width;
-   unsigned thumbnail_width;
-   unsigned thumbnail_height;
+   unsigned dims;
+   unsigned thumbnail_dims;
    unsigned shotname_length;
 
    float scale_factor;
@@ -45,34 +48,41 @@ struct gfx_widget_screenshot_state
    char shotname[256];
    char filename[256];
    bool loaded;
+   bool state_slot;
+
+   /* The flash-speed and duration settings, latched here on the main
+    * thread at the widget's two entry points. The fadeout and end
+    * animation callbacks fire on the draw thread and must not read
+    * the live settings there; they read these instead. Staleness
+    * across a settings change costs one animation's timing. */
+   retro_atomic_int_t flash_mode;
+   retro_atomic_int_t show_duration;
 };
 
 typedef struct gfx_widget_screenshot_state gfx_widget_screenshot_state_t;
 
 static gfx_widget_screenshot_state_t p_w_screenshot_st = {
    0,             /* texture */
-   NULL,          /* p_anim */
-   0,             /* texture_width */
-   0,             /* texture_height */
-   0,             /* height */
-   0,             /* width */
-   0,             /* thumbnail_width */
-   0,             /* thumbnail_height */
+   0,             /* video_height */
+   0,             /* texture_dims */
+   0,             /* dims */
+   0,             /* thumbnail_dims */
    0,             /* shotname_length */
    0.0f,          /* scale_factor */
    0.0f,          /* y */
    0.0f,          /* alpha */
    0.0f,          /* timer */
-
    {0},           /* shotname */
    {0},           /* filename */
-   false          /* loaded */
+   false,         /* loaded */
+   false          /* state_slot */
 };
 
+/* Animation callback: the draw thread. Settings come from the latch,
+ * never live. */
 static void gfx_widget_screenshot_fadeout(void *userdata)
 {
    gfx_animation_ctx_entry_t entry;
-   settings_t *settings                 = config_get_ptr();
    dispgfx_widget_t *p_dispwidget       = (dispgfx_widget_t*)userdata;
    gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
 
@@ -83,7 +93,7 @@ static void gfx_widget_screenshot_fadeout(void *userdata)
    entry.target_value   = 0.0f;
    entry.userdata       = NULL;
 
-   switch (settings->uints.notification_show_screenshot_flash)
+   switch (retro_atomic_load_relaxed_int(&state->flash_mode))
    {
       case NOTIFICATION_SHOW_SCREENSHOT_FLASH_FAST:
          entry.duration = SCREENSHOT_DURATION_OUT/2;
@@ -94,13 +104,21 @@ static void gfx_widget_screenshot_fadeout(void *userdata)
          break;
    }
 
-   gfx_animation_push(&entry);
+   gfx_animation_push_widget(&entry);
 }
 
-static void gfx_widgets_play_screenshot_flash(void *data)
+static void gfx_widget_screenshot_dispose(void *userdata)
+{
+   gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
+
+   state->loaded  = false;
+   gfx_surface_free(state->texture);
+   state->texture = NULL;
+}
+
+static void gfx_widgets_play_screenshot_flash(void *data, unsigned flash_mode)
 {
    gfx_animation_ctx_entry_t entry;
-   settings_t *settings                 = config_get_ptr();
    dispgfx_widget_t *p_dispwidget       = (dispgfx_widget_t*)data;
    gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
 
@@ -108,10 +126,10 @@ static void gfx_widgets_play_screenshot_flash(void *data)
    entry.easing_enum    = EASING_IN_QUAD;
    entry.subject        = &state->alpha;
    entry.tag            = p_dispwidget->gfx_widgets_generic_tag;
-   entry.target_value   = 1.0f;
+   entry.target_value   = 0.5f;
    entry.userdata       = p_dispwidget;
 
-   switch (settings->uints.notification_show_screenshot_flash)
+   switch (flash_mode)
    {
       case NOTIFICATION_SHOW_SCREENSHOT_FLASH_FAST:
          entry.duration = SCREENSHOT_DURATION_IN/2;
@@ -122,51 +140,116 @@ static void gfx_widgets_play_screenshot_flash(void *data)
          break;
    }
 
-   gfx_animation_push(&entry);
+   gfx_animation_push_widget(&entry);
+}
+
+/* A screenshot or a state slot shown, from any thread, with the
+ * settings it was taken under; applied by the widgets' owner in
+ * iterate() */
+struct screenshot_cmd
+{
+   mpsc_stack_node_t link;  /* first: the stack's, from push to drain */
+   void    *data;
+   unsigned flash_mode;
+   unsigned show_duration;
+   bool     state_slot;
+   bool     show;           /* the names are to be shown */
+   char     shotname[256];
+   char     filename[256];
+};
+
+static mpsc_stack_t screenshot_pending;
+
+static void gfx_widget_screenshot_push(void *data, bool state_slot,
+      const char *shotname, const char *filename)
+{
+   settings_t *settings       = config_get_ptr();
+   struct screenshot_cmd *cmd = (struct screenshot_cmd*)
+      malloc(sizeof(*cmd));
+   if (!cmd)
+      return;
+   cmd->data          = data;
+   cmd->flash_mode    = settings->uints.notification_show_screenshot_flash;
+   cmd->show_duration = settings->uints.notification_show_screenshot_duration;
+   cmd->state_slot    = state_slot;
+   cmd->show          = shotname && filename && (state_slot
+         || settings->bools.notification_show_screenshot);
+   cmd->shotname[0]   = '\0';
+   cmd->filename[0]   = '\0';
+   if (cmd->show)
+   {
+      strlcpy(cmd->shotname, shotname, sizeof(cmd->shotname));
+      strlcpy(cmd->filename, filename, sizeof(cmd->filename));
+   }
+   mpsc_stack_push(&screenshot_pending, &cmd->link);
+}
+
+static void gfx_widget_screenshot_apply(const struct screenshot_cmd *cmd)
+{
+   gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
+
+   retro_atomic_store_relaxed_int(&state->flash_mode,
+         (int)cmd->flash_mode);
+   retro_atomic_store_relaxed_int(&state->show_duration,
+         (int)cmd->show_duration);
+   state->state_slot = cmd->state_slot;
+
+   if (cmd->state_slot)
+   {
+      if (!cmd->show)
+      {
+         gfx_widget_screenshot_dispose(NULL);
+         return;
+      }
+   }
+   else if (cmd->flash_mode != NOTIFICATION_SHOW_SCREENSHOT_FLASH_OFF)
+      gfx_widgets_play_screenshot_flash(cmd->data, cmd->flash_mode);
+
+   if (cmd->show)
+   {
+      strlcpy(state->filename, cmd->filename, sizeof(state->filename));
+      strlcpy(state->shotname, cmd->shotname, sizeof(state->shotname));
+   }
+}
+
+void gfx_widget_state_slot_show(
+      void *data,
+      const char *shotname, const char *filename)
+{
+   gfx_widget_screenshot_push(data, true, shotname, filename);
 }
 
 void gfx_widget_screenshot_taken(
       void *data,
       const char *shotname, const char *filename)
 {
-   settings_t *settings                 = config_get_ptr();
-   dispgfx_widget_t *p_dispwidget       = (dispgfx_widget_t*)data;
-   gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
-
-   if (settings->uints.notification_show_screenshot_flash != NOTIFICATION_SHOW_SCREENSHOT_FLASH_OFF)
-      gfx_widgets_play_screenshot_flash(p_dispwidget);
-
-   if (settings->bools.notification_show_screenshot)
-   {
-      strlcpy(state->filename, filename, sizeof(state->filename));
-      strlcpy(state->shotname, shotname, sizeof(state->shotname));
-   }
+   gfx_widget_screenshot_push(data, false, shotname, filename);
 }
 
-static void gfx_widget_screenshot_dispose(void *userdata)
-{
-   gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
-
-   state->loaded  = false;
-   video_driver_texture_unload(&state->texture);
-   state->texture = 0;
-}
-
+/* Animation callback: the draw thread. Settings come from the latch,
+ * never live. */
 static void gfx_widget_screenshot_end(void *userdata)
 {
    gfx_animation_ctx_entry_t entry;
-   settings_t *settings                 = config_get_ptr();
    dispgfx_widget_t *p_dispwidget       = (dispgfx_widget_t*)userdata;
    gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
+   unsigned duration                    = (unsigned)
+         retro_atomic_load_relaxed_int(&state->show_duration);
 
    entry.cb             = gfx_widget_screenshot_dispose;
    entry.easing_enum    = EASING_OUT_QUAD;
    entry.subject        = &state->y;
    entry.tag            = p_dispwidget->gfx_widgets_generic_tag;
-   entry.target_value   = -((float)state->height);
+   entry.target_value   = -((float)VIDEO_SCALE_H(state->dims));
    entry.userdata       = NULL;
 
-   switch (settings->uints.notification_show_screenshot_duration)
+   if (state->state_slot)
+   {
+      entry.target_value = (float)state->video_height;
+      duration           = NOTIFICATION_SHOW_SCREENSHOT_DURATION_FAST;
+   }
+
+   switch (duration)
    {
       case NOTIFICATION_SHOW_SCREENSHOT_DURATION_FAST:
          entry.duration = MSG_QUEUE_ANIMATION_DURATION/1.25;
@@ -181,12 +264,20 @@ static void gfx_widget_screenshot_end(void *userdata)
          break;
    }
 
-   gfx_animation_push(&entry);
+   gfx_animation_push_widget(&entry);
 }
 
 static void gfx_widget_screenshot_free(void)
 {
    gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
+   mpsc_stack_node_t *link              = mpsc_stack_drain(&screenshot_pending);
+
+   while (link)
+   {
+      mpsc_stack_node_t *next = link->next;
+      free(link);
+      link                    = next;
+   }
 
    state->alpha         = 0.0f;
    gfx_widget_screenshot_dispose(NULL);
@@ -199,7 +290,7 @@ static void gfx_widget_screenshot_context_destroy(void)
 
 static void gfx_widget_screenshot_frame(void* data, void *user_data)
 {
-   static float pure_white[16]          = {
+   float pure_white[16]          = {
       1.00, 1.00, 1.00, 1.00,
       1.00, 1.00, 1.00, 1.00,
       1.00, 1.00, 1.00, 1.00,
@@ -207,14 +298,15 @@ static void gfx_widget_screenshot_frame(void* data, void *user_data)
    };
    video_frame_info_t *video_info       = (video_frame_info_t*)data;
    void *userdata                       = video_info->userdata;
-   unsigned video_width                 = video_info->width;
-   unsigned video_height                = video_info->height;
    dispgfx_widget_t *p_dispwidget       = (dispgfx_widget_t*)user_data;
    gfx_display_t            *p_disp     = (gfx_display_t*)video_info->disp_userdata;
    gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
-   gfx_animation_t          *p_anim     = state->p_anim;
+   /* Not cached at init: the instance changes when the threaded
+    * video worker takes the widgets over */
+   gfx_animation_t          *p_anim     = anim_widgets_get_ptr();
    gfx_widget_font_data_t* font_regular = &p_dispwidget->gfx_widget_fonts.regular;
-   int padding                          = (state->height - (font_regular->line_height * 2.0f)) / 2.0f;
+   int padding                          = (VIDEO_SCALE_H(state->dims)
+         - (font_regular->line_height * 2.0f)) / 2.0f;
 
    /* Screenshot */
    if (state->loaded)
@@ -227,36 +319,63 @@ static void gfx_widget_screenshot_frame(void* data, void *user_data)
       gfx_display_draw_quad(
             p_disp,
             userdata,
-            video_width, video_height,
+            video_info->dims,
             0, state->y,
-            state->width, state->height,
-            video_width, video_height,
+            state->dims,
+            video_info->dims,
             p_dispwidget->backdrop_orig,
             NULL
             );
 
-      gfx_display_set_alpha(pure_white, 1.0f);
-      gfx_widgets_draw_icon(
-            userdata,
-            p_disp,
-            video_width,
-            video_height,
-            state->thumbnail_width,
-            state->thumbnail_height,
-            state->texture,
-            0,
-            state->y,
-            0.0f, /* rad */
-            1.0f, /* cos(rad)   = cos(0)  = 1.0f */
-            0.0f, /* sine(rad)  = sine(0) = 0.0f */
-            pure_white
-            );
+      gfx_display_set_alpha(pure_white, 0.5f);
+
+      state->video_height = VIDEO_SCALE_H(video_info->dims);
+
+      if (GFX_SURFACE_HANDLE(state->texture))
+      {
+         gfx_widgets_draw_icon(
+               userdata,
+               p_disp,
+               video_info->dims,
+               state->thumbnail_dims,
+               GFX_SURFACE_HANDLE(state->texture),
+               0,
+               state->y,
+               0.0f, /* rad */
+               1.0f, /* cos(rad)   = cos(0)  = 1.0f */
+               0.0f, /* sine(rad)  = sine(0) = 0.0f */
+               pure_white
+               );
+      }
+      else
+      {
+         float background_color[16]        = {
+               0.0f, 0.0f, 0.0f, 1.0f,
+               0.0f, 0.0f, 0.0f, 1.0f,
+               0.0f, 0.0f, 0.0f, 1.0f,
+               0.0f, 0.0f, 0.0f, 1.0f,
+         };
+
+         /* Darken background */
+         gfx_display_draw_quad(
+               p_disp,
+               userdata,
+               video_info->dims,
+               0,
+               state->y,
+               state->thumbnail_dims,
+               video_info->dims,
+               background_color,
+               NULL);
+      }
 
       gfx_widgets_draw_text(font_regular,
-            msg_hash_to_str(MSG_SCREENSHOT_SAVED),
-            state->thumbnail_width + padding,
+            (state->state_slot)
+                  ? msg_hash_to_str(MSG_STATE_SLOT)
+                  : msg_hash_to_str(MSG_SCREENSHOT_SAVED),
+            VIDEO_SCALE_W(state->thumbnail_dims) + padding,
             padding + font_regular->line_ascender + state->y,
-            video_width, video_height,
+            video_info->dims,
             TEXT_COLOR_FAINT,
             TEXT_ALIGN_LEFT,
             true);
@@ -264,17 +383,19 @@ static void gfx_widget_screenshot_frame(void* data, void *user_data)
       ticker.idx        = p_anim->ticker_idx;
       ticker.len        = state->shotname_length;
       ticker.s          = shotname;
+      ticker.s_len      = sizeof(shotname);
       ticker.selected   = true;
       ticker.str        = state->shotname;
       ticker.spacer     = NULL;
 
-      gfx_animation_ticker(&ticker);
+      gfx_animation_ticker_widget(&ticker);
 
       gfx_widgets_draw_text(font_regular,
             shotname,
-            state->thumbnail_width + padding,
-            state->height - padding - font_regular->line_descender + state->y,
-            video_width, video_height,
+            VIDEO_SCALE_W(state->thumbnail_dims) + padding,
+            VIDEO_SCALE_H(state->dims) - padding
+               - font_regular->line_descender + state->y,
+            video_info->dims,
             TEXT_COLOR_INFO,
             TEXT_ALIGN_LEFT,
             true);
@@ -287,11 +408,10 @@ static void gfx_widget_screenshot_frame(void* data, void *user_data)
       gfx_display_draw_quad(
             p_disp,
             userdata,
-            video_width,
-            video_height,
+            video_info->dims,
             0, 0,
-            video_width, video_height,
-            video_width, video_height,
+            video_info->dims,
+            video_info->dims,
             pure_white,
             NULL
             );
@@ -300,48 +420,82 @@ static void gfx_widget_screenshot_frame(void* data, void *user_data)
 
 static void gfx_widget_screenshot_iterate(
       void *user_data,
-      unsigned width,
-      unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       bool is_threaded)
 {
    settings_t *settings = config_get_ptr();
    dispgfx_widget_t *p_dispwidget       = (dispgfx_widget_t*)user_data;
    gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
-   unsigned padding                     = p_dispwidget->simple_widget_padding;
    gfx_widget_font_data_t* font_regular = &p_dispwidget->gfx_widget_fonts.regular;
+   unsigned padding                     = p_dispwidget->simple_widget_padding;
+   unsigned duration                    = settings->uints.notification_show_screenshot_duration;
+   mpsc_stack_node_t *link              =
+         mpsc_stack_reverse(mpsc_stack_drain(&screenshot_pending));
+
+   while (link)
+   {
+      struct screenshot_cmd *cmd = (struct screenshot_cmd*)link;
+      link                       = link->next;
+      gfx_widget_screenshot_apply(cmd);
+      free(cmd);
+   }
 
    /* Load screenshot and start its animation */
    if (state->filename[0] != '\0')
    {
+      video_driver_state_t *video_st = video_state_get_ptr();
       gfx_timer_ctx_entry_t timer;
 
-      video_driver_texture_unload(&state->texture);
+      gfx_surface_free(state->texture);
+      state->texture = gfx_surface_new_still(
+            gfx_display_texture_filter_latched());
+      state->y       = 0.0f;
 
-      state->texture = 0;
+      gfx_surface_submit_file(state->texture, state->filename,
+            gfx_surface_wants_rgba());
+      state->texture_dims = state->texture ? state->texture->dims : 0;
 
-      gfx_display_reset_textures_list(state->filename,
-            "", &state->texture, TEXTURE_FILTER_MIPMAP_LINEAR,
-            &state->texture_width, &state->texture_height);
-
-      state->height = font_regular->line_height * 4;
-      state->width  = width;
+      state->dims   = VIDEO_SCALE_PACK(VIDEO_SCALE_W(dims),
+            font_regular->line_height * 4);
 
       state->scale_factor = gfx_widgets_get_thumbnail_scale_factor(
-         width, state->height,
-         state->texture_width, state->texture_height
-      );
+            state->dims, state->texture_dims);
 
-      state->thumbnail_width  = state->texture_width * state->scale_factor;
-      state->thumbnail_height = state->texture_height * state->scale_factor;
+      /* State slot is double size and at the bottom */
+      if (state->state_slot)
+      {
+         VIDEO_SCALE_PUT_H(state->dims, VIDEO_SCALE_H(state->dims) * 2);
+         state->scale_factor *= 2;
+         state->y             = VIDEO_SCALE_H(dims)
+                              - VIDEO_SCALE_H(state->dims);
+         duration             = NOTIFICATION_SHOW_SCREENSHOT_DURATION_FAST;
+      }
 
-      state->shotname_length  = (width - state->thumbnail_width - padding*2) / font_regular->glyph_width;
+      state->thumbnail_dims   = VIDEO_SCALE_PACK(
+            VIDEO_SCALE_W(state->texture_dims) * state->scale_factor,
+            VIDEO_SCALE_H(state->texture_dims) * state->scale_factor);
 
-      state->y = 0.0f;
+      /* Set image aspect ratio according to core geometry */
+      if (video_st && video_st->av_info.geometry.aspect_ratio > 0)
+      {
+         float thumbnail_aspect = (float)VIDEO_SCALE_W(state->texture_dims)
+            / (float)VIDEO_SCALE_H(state->texture_dims);
+         float core_aspect      = video_st->av_info.geometry.aspect_ratio;
 
-      timer.cb       = gfx_widget_screenshot_end;
+         VIDEO_SCALE_PUT_W(state->thumbnail_dims,
+               VIDEO_SCALE_W(state->thumbnail_dims)
+               / (thumbnail_aspect / core_aspect));
+      }
 
-      switch (settings->uints.notification_show_screenshot_duration)
+      state->shotname_length  = (VIDEO_SCALE_W(dims)
+            - VIDEO_SCALE_W(state->thumbnail_dims) - padding*2)
+            / font_regular->glyph_width;
+
+      timer.cb                = gfx_widget_screenshot_end;
+      timer.userdata          = p_dispwidget;
+
+      switch (duration)
       {
          case NOTIFICATION_SHOW_SCREENSHOT_DURATION_FAST:
             timer.duration = 2000;
@@ -354,13 +508,11 @@ static void gfx_widget_screenshot_iterate(
             break;
          case NOTIFICATION_SHOW_SCREENSHOT_DURATION_NORMAL:
          default:
-            timer.duration = 6000;
+            timer.duration = 5000;
             break;
       }
 
-      timer.userdata = p_dispwidget;
-
-      gfx_animation_timer_start(&state->timer, &timer);
+      gfx_animation_timer_start_widget(&state->timer, &timer);
 
       state->loaded       = true;
       state->filename[0]  = '\0';
@@ -372,11 +524,13 @@ static bool gfx_widget_screenshot_init(
       gfx_animation_t *p_anim,
       bool video_is_threaded, bool fullscreen)
 {
-   gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
-
-   state->p_anim = p_anim;
-
    return false;
+}
+
+static bool gfx_widget_screenshot_visible(void)
+{
+   gfx_widget_screenshot_state_t *state = &p_w_screenshot_st;
+   return state->loaded || state->alpha > 0.0f;
 }
 
 const gfx_widget_t gfx_widget_screenshot = {
@@ -386,5 +540,6 @@ const gfx_widget_t gfx_widget_screenshot = {
    gfx_widget_screenshot_context_destroy,
    NULL, /* layout */
    gfx_widget_screenshot_iterate,
-   gfx_widget_screenshot_frame
+   gfx_widget_screenshot_frame,
+   gfx_widget_screenshot_visible
 };

@@ -18,15 +18,36 @@
 #ifndef __RARCH_LAKKA_H
 #define __RARCH_LAKKA_H
 
-#define LAKKA_SSH_PATH       "/storage/.cache/services/sshd.conf"
-#define LAKKA_SAMBA_PATH     "/storage/.cache/services/samba.conf"
-#define LAKKA_BLUETOOTH_PATH "/storage/.cache/services/bluez.conf"
-#define LAKKA_UPDATE_DIR     "/storage/.update/"
-#define LAKKA_CONNMAN_DIR    "/storage/.cache/connman/"
-#define LAKKA_LOCALAP_PATH   "/storage/.cache/services/localap.conf"
-#define LAKKA_TIMEZONE_PATH  "/storage/.cache/timezone"
+#include <boolean.h>
+#include <retro_common_api.h>
+
+#define LAKKA_SSH_PATH                 "/storage/.cache/services/sshd.conf"
+#define LAKKA_SAMBA_PATH               "/storage/.cache/services/samba.conf"
+#define LAKKA_SAMBA_DISABLED_FILE_PATH "/storage/.cache/services/samba.disabled"
+#define LAKKA_BLUETOOTH_PATH           "/storage/.cache/services/bluez.conf"
+#ifdef HAVE_RETROFLAG
+#define LAKKA_SAFESHUTDOWN_PATH        "/storage/.cache/services/safeshutdown.conf"
+#endif
+#define LAKKA_UPDATE_DIR               "/storage/.update/"
+#define LAKKA_CONNMAN_DIR              "/storage/.cache/connman/"
+#define LAKKA_LOCALAP_PATH             "/storage/.cache/services/localap.conf"
+#define LAKKA_TIMEZONE_PATH            "/storage/.cache/timezone"
 
 #define DEFAULT_TIMEZONE "UTC"
 #define TIMEZONE_LENGTH 255
+
+RETRO_BEGIN_DECLS
+
+/* Looks in LAKKA_UPDATE_DIR for an update image the Lakka initramfs
+ * check_update step installs on the next boot (*.tar, *.img.gz, *.img)
+ * and keeps the answer for lakka_update_pending(). Reads a directory:
+ * called when the menu builds the main list and before a reboot, never
+ * per frame. */
+void lakka_update_check(void);
+
+/* Whether the last lakka_update_check() found an update staged. */
+bool lakka_update_pending(void);
+
+RETRO_END_DECLS
 
 #endif

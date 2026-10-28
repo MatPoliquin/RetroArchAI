@@ -19,75 +19,236 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Check Out Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Download ares-cli-rs
-        uses: robinraju/release-downloader@v1.11
-        with:
-          repository: "webosbrew/ares-cli-rs"
-          latest: true
-          fileName: "ares-package_*.deb"
-          out-file-path: "temp"
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
 
-      - name: Download Manifest Generator
-        uses: robinraju/release-downloader@v1.9
+      - name: Test webOS dependency fetcher
+        run: sh .github/workflows/scripts/webos-deps-test.sh
+
+      - name: Resolve webOS tools and NDKs
+        id: webos-deps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "key=$(sh .github/workflows/scripts/webos-deps.sh key)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore webOS tools and NDKs
+        id: webos-deps-cache
+        uses: actions/cache/restore@v4
         with:
-          repository: "webosbrew/dev-toolbox-cli"
-          latest: true
-          fileName: "webosbrew-toolbox-gen-manifest_*.deb"
-          out-file-path: "temp"
+          path: /tmp/webos-deps
+          key: webos-deps-${{ steps.webos-deps.outputs.key }}
+          restore-keys: |
+            webos-deps-
+
+      - name: Fetch webOS tools and NDKs
+        if: steps.webos-deps-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh .github/workflows/scripts/webos-deps.sh fetch
+
+      - name: Save webOS tools and NDKs
+        if: >-
+          steps.webos-deps-cache.outputs.cache-hit != 'true' &&
+          steps.webos-deps.outputs.key != 'unresolved' &&
+          github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/webos-deps
+          key: webos-deps-${{ steps.webos-deps.outputs.key }}
 
       - name: Update packages
-        run: sudo apt-get -yq update
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            sudo timeout 90 apt-get -yq update \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
+            echo "apt-get update failed (attempt $i); retrying in 10s"
+            sleep 10
+          done
 
       - name: Install webOS CLI
-        run: sudo apt-get -yq install ./temp/*.deb
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -yq install \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+            /tmp/webos-deps/webosbrew_ares-cli-rs/ares-package_*_amd64.deb \
+            /tmp/webos-deps/webosbrew_dev-toolbox-cli/webosbrew-toolbox-gen-manifest_*.deb
 
-      - name: Download webOS NDK
-        uses: robinraju/release-downloader@v1.11
-        with:
-          repository: "openlgtv/buildroot-nc4"
-          latest: true
-          fileName: "arm-webos-linux-gnueabi_sdk-buildroot.tar.gz"
-          out-file-path: "/tmp"
-
-      - name: Extract webOS NDK
+      - name: Extract webOS NDKs
         shell: bash
         working-directory: /tmp
         run: |
-          tar xzf arm-webos-linux-gnueabi_sdk-buildroot.tar.gz
+          tar xzf /tmp/webos-deps/openlgtv_buildroot-nc4/arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz
           ./arm-webos-linux-gnueabi_sdk-buildroot/relocate-sdk.sh
+          tar xzf /tmp/webos-deps/cscd98_buildroot-nc4/aarch64-webos-linux-gnu_sdk-buildroot-x86_64.tar.gz
+          ./aarch64-webos-linux-gnu_sdk-buildroot/relocate-sdk.sh
 
-      - name: Compile RA
+      - name: Load RARCH_VERSION from version.all
+        id: version
+        shell: bash
+        run: |
+          RARCH_VERSION=$(grep -Po '(?<=#define PACKAGE_VERSION ")[^"]+' version.all)
+          echo "RARCH_VERSION=$RARCH_VERSION" >> "$GITHUB_ENV"
+
+      - name: Resolve SDL2 prebuilt archive
+        id: sdl2
+        shell: bash
+        run: |
+          URL=$(sed -n 's/^SDL2_PREBUILT_ARCHIVE *?= *//p' Makefile.webos)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$URL")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache SDL2 prebuilt
+        id: sdl2-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sdl2-prebuilt
+          key: sdl2-prebuilt-${{ steps.sdl2.outputs.name }}
+
+      - name: Download SDL2 prebuilt
+        if: steps.sdl2-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          SDL2_URL: ${{ steps.sdl2.outputs.url }}
+          SDL2_NAME: ${{ steps.sdl2.outputs.name }}
+        run: |
+          mkdir -p /tmp/sdl2-prebuilt
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 30 -o "/tmp/sdl2-prebuilt/$SDL2_NAME" "$SDL2_URL"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Set up ccache
+        run: |
+          # Best effort: without ccache, ccache-make.sh runs plain make.
+          command -v ccache > /dev/null || {
+            s=$(command -v sudo || true)
+            for i in 1 2 3; do
+              $s timeout 90 apt-get -yq update \
+                -o Acquire::Retries=3 -o Acquire::http::Timeout=30 &&
+              $s timeout 120 apt-get -yq install --no-install-recommends \
+                ccache > /dev/null && break
+              echo "installing ccache failed (attempt $i); retrying in 10s"
+              sleep 10
+            done
+          }
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=250M" >> "$GITHUB_ENV"
+          if command -v ccache > /dev/null; then
+            CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" ccache -z
+          fi
+
+      - name: Compile RA (GLES2, no wayland legacy variant)
         shell: bash
         run: |
           . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
-          make -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} ADD_SDL2_LIB=1 -j$(getconf _NPROCESSORS_ONLN)
+          export SDK_PATH=/tmp/arm-webos-linux-gnueabi_sdk-buildroot
+          make -f Makefile.webos clean
+          bash .github/workflows/scripts/ccache-make.sh -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} ADD_SDL2_LIB=1 \
+          SDL2_PREBUILT_ARCHIVE="file:///tmp/sdl2-prebuilt/${SDL2_NAME}" \
+          -j"$(getconf _NPROCESSORS_ONLN)"
+          mkdir -p webos/arm
+          mv webos/com.retroarch.webos_${RARCH_VERSION}_arm.ipk \
+             webos/arm/com.retroarch.webos-legacy-gles2-no-wayland_${RARCH_VERSION}_arm.ipk
+        env:
+          DEBUG: ${{ github.event_name == 'release' && '0' || '1' }}
+          SDL2_NAME: ${{ steps.sdl2.outputs.name }}
 
-      - name: Get short SHA
-        id: slug
-        run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload GLES2 artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: com.retroarch.webos_${{ steps.slug.outputs.sha8 }}_arm.ipk
-          path: |
-            webos/*.ipk
+          name: com.retroarch.webos-legacy-gles2-no-wayland_${{ env.RARCH_VERSION }}_${{ github.sha }}_arm.ipk
+          path: webos/arm/com.retroarch.webos-legacy-gles2-no-wayland_${{ env.RARCH_VERSION }}_arm.ipk
+          archive: false
 
-      - name: Generate Manifest
+      - name: Compile RA (default)
         shell: bash
         run: |
-          . version.all
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          export SDK_PATH=/tmp/arm-webos-linux-gnueabi_sdk-buildroot
+          make -f Makefile.webos clean
+          bash gfx/common/wayland/generate_wayland_protos.sh
+          bash .github/workflows/scripts/ccache-make.sh -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} ADD_SDL2_LIB=1 \
+          SDL2_PREBUILT_ARCHIVE="file:///tmp/sdl2-prebuilt/${SDL2_NAME}" \
+          HAVE_XKBCOMMON=1 HAVE_USERLAND=1 HAVE_EGL=1 HAVE_WAYLAND=1 \
+          HAVE_OPENGLES3=1 HAVE_OPENGLES3_1=1 HAVE_OPENGLES3_2=1 -j"$(getconf _NPROCESSORS_ONLN)"
+          mkdir -p webos/arm
+          mv webos/com.retroarch.webos_${RARCH_VERSION}_arm.ipk \
+            webos/arm/com.retroarch.webos_${RARCH_VERSION}_arm.ipk
+        env:
+          DEBUG: ${{ github.event_name == 'release' && '0' || '1' }}
+          SDL2_NAME: ${{ steps.sdl2.outputs.name }}
+
+      - name: Upload default artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: com.retroarch.webos_${{ env.RARCH_VERSION }}_${{ github.sha }}_arm.ipk
+          path: webos/arm/com.retroarch.webos_${{ env.RARCH_VERSION }}_arm.ipk
+          archive: false
+
+      - name: Generate Manifest (default only)
+        if: github.repository == 'webosbrew/Retroarch'
+        shell: bash
+        run: |
           webosbrew-gen-manifest -o webos/${PACKAGE_NAME}.manifest.json \
-              -p webos/${PACKAGE_NAME}_${RARCH_VERSION}_arm.ipk \
+              -p webos/arm/${PACKAGE_NAME}_${RARCH_VERSION}_arm.ipk \
               -i https://github.com/webosbrew/RetroArch/raw/webos/webos/icon160.png \
               -l https://github.com/webosbrew/RetroArch
 
+      - name: Compile RA (aarch64)
+        shell: bash
+        run: |
+          . /tmp/aarch64-webos-linux-gnu_sdk-buildroot/environment-setup
+          export SDK_PATH=/tmp/aarch64-webos-linux-gnu_sdk-buildroot
+          make -f Makefile.webos clean
+          bash gfx/common/wayland/generate_wayland_protos.sh
+          bash .github/workflows/scripts/ccache-make.sh -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} \
+          ADD_SDL2_LIB=0 HAVE_SDL2=0 HAVE_SDL3=1 \
+          HAVE_XKBCOMMON=1 HAVE_USERLAND=1 HAVE_EGL=1 HAVE_WAYLAND=1 \
+          HAVE_OPENGLES3=1 HAVE_OPENGLES3_1=1 HAVE_OPENGLES3_2=1 \
+          HAVE_WAYLAND_BACKPORT=0 HAVE_64TO32BIT_BRIDGE=1 SET_ELF_INTERPRETER=1 HAVE_UDEV=1 \
+          ARES_PACKAGE_ARGS="-A arm" -j"$(getconf _NPROCESSORS_ONLN)"
+          mkdir -p webos/aarch64
+          mv webos/com.retroarch.webos_${{ env.RARCH_VERSION }}_arm.ipk \
+            webos/aarch64/com.retroarch.webos_${{ env.RARCH_VERSION }}_aarch64.ipk
+        env:
+          DEBUG: ${{ github.event_name == 'release' && '0' || '1' }}
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv || ccache -s
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+      - name: Upload aarch64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: com.retroarch.webos_${{ env.RARCH_VERSION }}_${{ github.sha }}_aarch64.ipk
+          path: webos/aarch64/com.retroarch.webos_${{ env.RARCH_VERSION }}_aarch64.ipk
+          archive: false
+
       - name: Release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' && github.repository == 'webosbrew/Retroarch'
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -96,4 +257,8 @@ jobs:
           omitNameDuringUpdate: true
           omitBody: true
           omitPrereleaseDuringUpdate: true
-          artifacts: webos/*.ipk,webos/*.manifest.json
+          artifacts: |
+            webos/arm/com.retroarch.webos_${{ env.RARCH_VERSION }}_arm.ipk
+            webos/arm/com.retroarch.webos-legacy-gles2-no-wayland_${{ env.RARCH_VERSION }}_arm.ipk
+            webos/aarch64/com.retroarch.webos_${{ env.RARCH_VERSION }}_aarch64.ipk
+            webos/${{ env.PACKAGE_NAME }}.manifest.json

@@ -1,0 +1,278 @@
+/* winraw: an absolute mouse report reaches poll as one position.
+ *
+ * The report handler runs on the thread that owns the window and
+ * winraw_poll() on the main thread. A report's x and y are published
+ * together, so poll reads a position one report gave - never one
+ * report's x with the next report's y.
+ *
+ * Deterministic rather than a race: the driver's acquire loads are
+ * routed through a hook here, and the first one poll makes in the
+ * absolute branch delivers a second report before poll's next load.
+ * Whatever poll then settles on must be a position that was reported.
+ *
+ * Also checked: positions round-trip, 0 and the edge of an 8K
+ * viewport included. */
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <retro_atomic.h>
+
+static void (*load_hook)(void);
+
+static int hooked_load_acquire_int(retro_atomic_int_t *p)
+{
+   int v = retro_atomic_load_acquire_int(p);
+   if (load_hook)
+   {
+      void (*hook)(void) = load_hook;
+      load_hook = NULL;
+      hook();
+   }
+   return v;
+}
+#undef  retro_atomic_load_acquire_int
+#define retro_atomic_load_acquire_int(p) hooked_load_acquire_int(p)
+
+#include "input/drivers/winraw_input.c"
+
+/* The frontend, as far as the driver links against it. */
+uint8_t g_win32_flags;
+ui_window_win32_t main_window;
+struct retro_keybind *input_config_binds[MAX_USERS];
+struct retro_keybind *input_autoconf_binds[MAX_USERS];
+enum retro_key rarch_keysym_lut[RETROK_LAST];
+const struct rarch_key_map rarch_key_map_winraw[] = { { 0, RETROK_UNKNOWN } };
+static settings_t stub_settings;
+static struct menu_state stub_menu;
+settings_t *config_get_ptr(void) { return &stub_settings; }
+/* the settings a driver asks for by name, read from the ones above */
+#include "../input_config_stubs.h"
+
+/* A port's keyboard, as the frontend works it out from the port's pin
+ * and number: the rule itself (input/common/input_device_pins.h), fed
+ * from the stub settings each time it is asked. */
+#include "input/common/input_device_pins.h"
+static char     stub_pin_ident[MAX_INPUT_DEVICES][INPUT_PIN_LEN];
+static unsigned stub_pin_listed;
+void input_keyboard_pins_set_devices(const char (*base)[64], unsigned n)
+{
+   memset(stub_pin_ident, 0, sizeof(stub_pin_ident));
+   if (n)
+      input_pins_identities(stub_pin_ident, base, n);
+   stub_pin_listed = n;
+}
+int input_keyboard_port_choice(unsigned port)
+{
+   int8_t choice[MAX_USERS];
+   input_pins_resolve(choice,
+         (const char (*)[INPUT_PIN_LEN])stub_settings.arrays.input_keyboard_device,
+         stub_settings.uints.input_keyboard_index, MAX_USERS,
+         (const char (*)[INPUT_PIN_LEN])stub_pin_ident, stub_pin_listed);
+   return choice[port];
+}
+
+/* and its mouse, the same way */
+static char     stub_mouse_ident[MAX_INPUT_DEVICES][INPUT_PIN_LEN];
+static unsigned stub_mouse_listed;
+void input_mouse_pins_set_devices(const char (*base)[64], unsigned n)
+{
+   memset(stub_mouse_ident, 0, sizeof(stub_mouse_ident));
+   if (n > MAX_INPUT_DEVICES)
+      n = MAX_INPUT_DEVICES;
+   if (n)
+      input_pins_identities(stub_mouse_ident, base, n);
+   stub_mouse_listed = n;
+}
+unsigned input_mouse_port_index(unsigned port)
+{
+   int16_t choice[MAX_USERS];
+   input_pins_resolve_mice(choice,
+         (const char (*)[INPUT_PIN_LEN])stub_settings.arrays.input_mouse_device,
+         stub_settings.uints.input_mouse_index, MAX_USERS,
+         (const char (*)[INPUT_PIN_LEN])stub_mouse_ident, stub_mouse_listed);
+   return choice[port] < 0 ? MAX_INPUT_DEVICES : (unsigned)choice[port];
+}
+struct menu_state *menu_state_get_ptr(void) { return &stub_menu; }
+bool menu_driver_alive(void) { return (stub_menu.flags & MENU_ST_FLAG_ALIVE) != 0; }
+void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
+void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
+void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
+void input_config_set_mouse_display_name(unsigned port, const char *name)
+{ (void)port; (void)name; }
+void input_config_set_keyboard_display_name(unsigned idx, const char *name)
+{ (void)idx; (void)name; }
+void input_config_clear_keyboard_display_names(void) { }
+void input_config_clear_mouse_info(void) { }
+void input_config_set_mouse_device(unsigned idx, const char *device,
+      uint16_t vid, uint16_t pid, bool hidden)
+{ (void)idx; (void)device; (void)vid; (void)pid; (void)hidden; }
+void input_config_set_keyboard_ids(unsigned idx, uint16_t vid, uint16_t pid)
+{ (void)idx; (void)vid; (void)pid; }
+unsigned input_driver_lightgun_id_convert(unsigned id) { return id; }
+bool input_driver_pointer_is_offscreen(int16_t x, int16_t y)
+{ (void)x; (void)y; return false; }
+void input_keyboard_event(bool down, unsigned code, uint32_t character,
+      uint16_t mod, unsigned device)
+{ (void)down; (void)code; (void)character; (void)mod; (void)device; }
+void input_keymaps_init_keyboard_lut(const struct rarch_key_map *map)
+{ (void)map; }
+enum retro_key input_keymaps_translate_keysym_to_rk(unsigned sym)
+{ (void)sym; return RETROK_UNKNOWN; }
+void joypad_driver_reinit(void *data, const char *name)
+{ (void)data; (void)name; }
+retro_task_t *task_init(void) { return NULL; }
+bool task_queue_push(retro_task_t *task) { (void)task; return false; }
+void task_set_flags(retro_task_t *task, uint8_t flags, bool set)
+{ (void)task; (void)flags; (void)set; }
+bool video_driver_get_viewport_info(struct video_viewport *vp)
+{ (void)vp; return false; }
+bool video_driver_translate_coord_viewport(struct video_viewport *vp,
+      int mouse_x, int mouse_y, uint32_t *res_pos, uint32_t *res_screen_pos,
+      bool report_oob)
+{
+   (void)vp; (void)mouse_x; (void)mouse_y; (void)res_pos;
+   (void)res_screen_pos; (void)report_oob;
+   return false;
+}
+/* The driver hands its mice and touches to the frontend at its poll. */
+void input_driver_publish_pointers(const input_pointer_frame_t *frames,
+      unsigned count, unsigned flags)
+{ (void)frames; (void)count; (void)flags; }
+void input_driver_publish_touches(const uint32_t *pos, unsigned count,
+      unsigned present, unsigned down)
+{ (void)pos; (void)count; (void)present; (void)down; }
+unsigned input_driver_pointer_read_as(unsigned i) { (void)i; return 0; }
+uintptr_t video_driver_window_get(void) { return 0; }
+void win32_clip_window(bool grab) { (void)grab; }
+uint16_t win32_get_keyboard_mods(void) { return 0; }
+void winraw_joypad_take_hid(HANDLE device, const BYTE *data,
+      DWORD report_size, DWORD count)
+{ (void)device; (void)data; (void)report_size; (void)count; }
+bool winraw_joypad_survives_video(void) { return true; }
+void win32_hotplug_arm(void) { }
+bool win32_hotplug_due(void) { return false; }
+
+static unsigned failures;
+static winraw_input_t *wr;
+
+static void report(LONG x, LONG y)
+{
+   RAWMOUSE m;
+   memset(&m, 0, sizeof(m));
+   m.usFlags = MOUSE_MOVE_ABSOLUTE;
+   m.lLastX  = x;
+   m.lLastY  = y;
+   winraw_update_mouse_state(wr, &g_mice[0], &m);
+}
+
+static void second_report(void) { report(3000, 4000); }
+
+static void expect(LONG x, LONG y, const char *what)
+{
+   if (VIDEO_POS_X(wr->mice[0].pos) != x || VIDEO_POS_Y(wr->mice[0].pos) != y)
+   {
+      printf("   FAIL %s: poll read (%ld, %ld), want (%ld, %ld)\n", what,
+            (long)VIDEO_POS_X(wr->mice[0].pos), (long)VIDEO_POS_Y(wr->mice[0].pos), (long)x, (long)y);
+      failures++;
+   }
+   else
+      printf("   ok   %s: (%ld, %ld)\n", what, (long)x, (long)y);
+}
+
+static void button_report(USHORT flags, unsigned expected)
+{
+   RAWMOUSE m;
+   memset(&m, 0, sizeof(m));
+   m.usButtonFlags = flags;
+   winraw_update_mouse_state(wr, &g_mice[0], &m);
+   winraw_poll(wr);
+   if (wr->mice[0].flags != expected)
+   {
+      fprintf(stderr, "FAIL buttons: got %u, want %u\n", wr->mice[0].flags, expected);
+      failures++;
+   }
+}
+
+int main(void)
+{
+   static const LONG pos[][2] = {
+      { 0, 0 }, { 1, 2 }, { 640, 360 }, { 7679, 4319 }, { 12, 4319 } };
+   unsigned i;
+   uint32_t cursor_pos;
+
+   printf("winraw absolute position:\n");
+   wr        = (winraw_input_t*)calloc(1, sizeof(*wr));
+   g_mice    = (winraw_mouse_t*)calloc(1, sizeof(*g_mice));
+   wr->mice  = (winraw_mouse_t*)calloc(1, sizeof(*wr->mice));
+   wr->mouse_cnt        = 1;
+   wr->flags           |= WRAW_INP_FLG_MOUSE_XY_MAPPING_READY;
+   wr->view_abs_ratio_x = 1.0;
+   wr->view_abs_ratio_y = 1.0;
+   retro_atomic_store_release_int(&winraw_focus_flag, 1);
+   wr->last_focus       = true;
+
+   for (i = 0; i < sizeof(pos) / sizeof(pos[0]); i++)
+   {
+      report(pos[i][0], pos[i][1]);
+      winraw_poll(wr);
+      expect(pos[i][0], pos[i][1], "round trip");
+   }
+
+   /* A report landing between poll's reads. */
+   report(1000, 2000);
+   load_hook = second_report;
+   winraw_poll(wr);
+   load_hook = NULL;
+   if (   !(VIDEO_POS_X(wr->mice[0].pos) == 1000 && VIDEO_POS_Y(wr->mice[0].pos) == 2000)
+       && !(VIDEO_POS_X(wr->mice[0].pos) == 3000 && VIDEO_POS_Y(wr->mice[0].pos) == 4000))
+   {
+      printf("   FAIL a report during poll: read (%ld, %ld), which no "
+            "report gave\n", (long)VIDEO_POS_X(wr->mice[0].pos), (long)VIDEO_POS_Y(wr->mice[0].pos));
+      failures++;
+   }
+   else
+      printf("   ok   a report during poll: read (%ld, %ld), as reported\n",
+            (long)VIDEO_POS_X(wr->mice[0].pos), (long)VIDEO_POS_Y(wr->mice[0].pos));
+
+   /* And the next poll takes the report that landed. */
+   winraw_poll(wr);
+   expect(3000, 4000, "the next poll");
+
+   report(12, 34);
+   retro_atomic_store_release_int(&g_mice[0].pos_pending, 1);
+   winraw_poll(wr);
+   cursor_pos = wr->mice[0].pos;
+   winraw_poll(wr);
+   if (wr->mice[0].pos != cursor_pos
+         || retro_atomic_load_acquire_int(&g_mice[0].abs_pending))
+   {
+      printf("   FAIL cursor priority left a stale absolute report\n");
+      failures++;
+   }
+
+   button_report(RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN,
+         WRAW_MOUSE_FLG_BTN_L | WRAW_MOUSE_FLG_BTN_R);
+   button_report(RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_BUTTON_4_DOWN,
+         WRAW_MOUSE_FLG_BTN_R | WRAW_MOUSE_FLG_BTN_B4);
+   button_report(RI_MOUSE_RIGHT_BUTTON_UP | RI_MOUSE_BUTTON_4_UP, 0);
+   g_win32_flags |= WIN32_CMN_FLAG_SWAP_MOUSE_BTNS;
+   button_report(RI_MOUSE_LEFT_BUTTON_DOWN, WRAW_MOUSE_FLG_BTN_R);
+   button_report(RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_RIGHT_BUTTON_DOWN,
+         WRAW_MOUSE_FLG_BTN_L);
+   g_win32_flags &= ~WIN32_CMN_FLAG_SWAP_MOUSE_BTNS;
+   retro_atomic_store_release_int(&winraw_focus_flag, 0);
+   button_report(RI_MOUSE_MIDDLE_BUTTON_DOWN, 0);
+   retro_atomic_store_release_int(&winraw_focus_flag, 1);
+   button_report(0, 0);
+   button_report(RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_LEFT_BUTTON_UP,
+         WRAW_MOUSE_FLG_BTN_L);
+   button_report(RI_MOUSE_LEFT_BUTTON_UP, 0);
+
+   if (failures)
+   {
+      printf("winraw absolute position: %u failure(s)\n", failures);
+      return 1;
+   }
+   printf("winraw absolute position: every read is a reported position\n");
+   return 0;
+}

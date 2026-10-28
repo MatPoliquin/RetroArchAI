@@ -17,9 +17,13 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include <retro_inline.h>
 #include <gfx/scaler/scaler.h>
+#include <gfx/scaler/pixconv.h>
+#include <formats/image.h>
+#include <string/stdstring.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -29,13 +33,23 @@
 #include "../common/x11_common.h"
 #endif
 
+#ifdef _WIN32
+#include "../common/win32_common.h"
+#endif
+
 #ifdef HAVE_MENU
 #include "../../menu/menu_driver.h"
+#endif
+
+#ifdef HAVE_GFX_WIDGETS
+#include "../gfx_widgets.h"
 #endif
 
 #include "SDL.h"
 #include "SDL_syswm.h"
 #include "../common/sdl2_common.h"
+
+#include <encodings/utf.h>
 
 #include "../font_driver.h"
 
@@ -49,23 +63,108 @@
 
 static void sdl2_gfx_free(void *data);
 
+#ifdef HAVE_OVERLAY
+static void sdl2_overlay_free(sdl2_video_t *vid);
+static void sdl2_overlays_render(sdl2_video_t *vid);
+#endif
+
 static INLINE void sdl_tex_zero(sdl2_tex_t *t)
 {
    if (t->tex)
       SDL_DestroyTexture(t->tex);
 
    t->tex = NULL;
-   t->w = t->h = t->pitch = 0;
+   t->dims  = 0;
+   t->pitch = 0;
+}
+
+/* Brings the OSD font's texture up to its atlas: made at the atlas's
+ * size at init and whenever it grows, otherwise sent only the region
+ * drawn into since. A texel is the coverage as grey, opaque where
+ * there is any, so additive blending lights the glyphs alone. */
+static void sdl2_font_upload(sdl2_video_t *vid, struct font_atlas *atlas)
+{
+   unsigned x, y, x0, y0, x1, y1, r, rects, xy0, xy1;
+   SDL_Rect rect;
+   bool     whole = false;
+   unsigned dims  = VIDEO_SCALE_PACK(atlas->width, atlas->height);
+   unsigned w     = atlas->width;
+
+   if (!vid->font.tex || vid->font.dims != dims)
+   {
+      if (vid->font.tex)
+      {
+         SDL_DestroyTexture(vid->font.tex);
+         vid->font.tex    = NULL;
+         vid->font.active = false;
+      }
+
+      free(vid->font_staging);
+      if (     !(vid->font_staging = (uint32_t*)malloc(
+                  VIDEO_SCALE_AREA(dims) * sizeof(uint32_t)))
+            || !(vid->font.tex = SDL_CreateTexture(vid->renderer,
+                  SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC,
+                  (int)atlas->width, (int)atlas->height)))
+      {
+         RARCH_WARN("[SDL2] Failed to initialize font texture: %s\n",
+               SDL_GetError());
+         atlas->dirty = false;
+         return;
+      }
+
+      vid->font.dims   = dims;
+      vid->font.active = true;
+      SDL_SetTextureBlendMode(vid->font.tex, SDL_BLENDMODE_ADD);
+      SDL_SetTextureColorMod(vid->font.tex,
+            vid->font_r, vid->font_g, vid->font_b);
+      whole = true;
+   }
+
+   rects = (whole || !atlas->dirty) ? 1 : font_atlas_dirty_rects(atlas);
+   for (r = 0; r < rects; r++)
+   {
+      font_atlas_dirty_rect(atlas, r, &xy0, &xy1);
+      x0 = VIDEO_SCALE_W(xy0);
+      y0 = VIDEO_SCALE_H(xy0);
+      x1 = VIDEO_SCALE_W(xy1);
+      y1 = VIDEO_SCALE_H(xy1);
+      if (     whole
+            || !atlas->dirty
+            || x1 <= x0 || y1 <= y0 || x1 > w || y1 > atlas->height)
+      {
+         x0 = 0;
+         y0 = 0;
+         x1 = w;
+         y1 = atlas->height;
+      }
+
+      for (y = y0; y < y1; y++)
+      {
+         const uint8_t *src = atlas->buffer + (size_t)y * w + x0;
+         uint32_t      *dst = vid->font_staging + (size_t)y * w + x0;
+         for (x = x0; x < x1; x++)
+         {
+            uint32_t c = *src++;
+            *dst++     = c ? (0xFF000000u | (c * 0x010101u)) : 0;
+         }
+      }
+
+      rect.x = (int)x0;
+      rect.y = (int)y0;
+      rect.w = (int)(x1 - x0);
+      rect.h = (int)(y1 - y0);
+      SDL_UpdateTexture(vid->font.tex, &rect,
+            vid->font_staging + (size_t)y0 * w + x0,
+            (int)(w * sizeof(uint32_t)));
+   }
+   atlas->dirty = false;
 }
 
 static void sdl2_init_font(sdl2_video_t *vid, const char *font_path,
       unsigned font_size)
 {
-   int i, r, g, b;
-   SDL_Color colors[256];
-   SDL_Surface               *tmp = NULL;
-   SDL_Palette               *pal = NULL;
-   const struct font_atlas *atlas = NULL;
+   int r, g, b;
+   struct font_atlas      *atlas = NULL;
    settings_t           *settings = config_get_ptr();
    bool video_font_enable         = settings->bools.video_font_enable;
    float msg_color_r              = settings->floats.video_msg_color_r;
@@ -77,9 +176,9 @@ static void sdl2_init_font(sdl2_video_t *vid, const char *font_path,
 
    if (!font_renderer_create_default(
             &vid->font_driver, &vid->font_data,
-            *font_path ? font_path : NULL, font_size))
+            *font_path ? font_path : NULL, font_size, FONT_ATLAS_FORMAT_A8))
    {
-      RARCH_WARN("[SDL]: Could not initialize fonts.\n");
+      RARCH_WARN("[SDL2] Could not initialize fonts.\n");
       return;
    }
 
@@ -95,93 +194,81 @@ static void sdl2_init_font(sdl2_video_t *vid, const char *font_path,
    vid->font_g = g;
    vid->font_b = b;
 
-   atlas       = vid->font_driver->get_atlas(vid->font_data);
-
-   tmp         = SDL_CreateRGBSurfaceFrom(
-         atlas->buffer, atlas->width,
-         atlas->height, 8, atlas->width,
-         0, 0, 0, 0);
-
-   for (i = 0; i < 256; ++i)
-   {
-      colors[i].r = colors[i].g = colors[i].b = i;
-      colors[i].a = 255;
-   }
-
-   pal = SDL_AllocPalette(256);
-   SDL_SetPaletteColors(pal, colors, 0, 256);
-   SDL_SetSurfacePalette(tmp, pal);
-   SDL_SetColorKey(tmp, SDL_TRUE, 0);
-
-   vid->font.tex  = SDL_CreateTextureFromSurface(vid->renderer, tmp);
-
-   if (vid->font.tex)
-   {
-      vid->font.w      = atlas->width;
-      vid->font.h      = atlas->height;
-      vid->font.active = true;
-
-      SDL_SetTextureBlendMode(vid->font.tex, SDL_BLENDMODE_ADD);
-   }
-   else
-      RARCH_WARN("[SDL]: Failed to initialize font texture: %s\n", SDL_GetError());
-
-   SDL_FreePalette(pal);
-   SDL_FreeSurface(tmp);
+   if ((atlas = vid->font_driver->get_atlas(vid->font_data)))
+      sdl2_font_upload(vid, atlas);
 }
 
-static void sdl2_render_msg(sdl2_video_t *vid, const char *msg)
+/* The caller supplies the message position: frame() takes it from the
+ * snapshot it was handed, because it runs on the video thread while
+ * the main thread may be writing the setting; the OSD poke reads the
+ * setting directly, since the wrapper holds the main thread inside
+ * the command while it runs. */
+static void sdl2_render_msg(sdl2_video_t *vid, const char *msg,
+      float msg_pos_x, float msg_pos_y)
 {
-   int delta_x          = 0;
-   int delta_y          = 0;
-   unsigned      width  = vid->vp.width;
-   unsigned      height = vid->vp.height;
-   settings_t *settings = config_get_ptr();
-   float msg_pos_x      = settings->floats.video_msg_pos_x;
-   float msg_pos_y      = settings->floats.video_msg_pos_y;
-   int x                = msg_pos_x * width;
-   int y                = (1.0f - msg_pos_y) * height;
+   int x, y, line_x, line_y;
+   unsigned width, height;
+   size_t msg_len;
+   int line_height                   = 0;
+   struct font_line_metrics *metrics = NULL;
+   struct font_atlas *atlas;
+   const struct font_glyph *(*get_glyph)(void*, uint32_t);
+   void *font_data;
+   const struct font_glyph *glyph_q;
 
-   if (!vid->font_data)
+   /* Legacy bitmap OSD font path.  Used as a fallback for the
+    * yellow-text OSD output when widgets are disabled, and as the
+    * set_osd_msg fallback when the supplied font_data isn't a
+    * sdl2_raster_font.  Anything else (menu / widget text, OSD
+    * with widgets enabled) goes through the proper render_msg
+    * dispatch in sdl2_poke_set_osd_msg. */
+   if (!msg || !*msg || !vid->font_data || !vid->font.tex)
       return;
 
-   SDL_SetTextureColorMod(vid->font.tex,
-         vid->font_r, vid->font_g, vid->font_b);
-
-   for (; *msg; msg++)
+   get_glyph = vid->font_driver->get_glyph;
+   font_data = vid->font_data;
+   if (!(atlas = vid->font_driver->get_atlas(font_data)))
+      return;
+   if (vid->font_driver->get_line_metrics)
    {
-      SDL_Rect src_rect, dst_rect;
-      int off_x, off_y, tex_x, tex_y;
-      const struct font_glyph *gly =
-         vid->font_driver->get_glyph(vid->font_data, (uint8_t)*msg);
-
-      if (!gly)
-         gly = vid->font_driver->get_glyph(vid->font_data, '?');
-
-      if (!gly)
-         continue;
-
-      off_x      = gly->draw_offset_x;
-      off_y      = gly->draw_offset_y;
-      tex_x      = gly->atlas_offset_x;
-      tex_y      = gly->atlas_offset_y;
-
-      src_rect.x = tex_x;
-      src_rect.y = tex_y;
-      src_rect.w = (int)gly->width;
-      src_rect.h = (int)gly->height;
-
-      dst_rect.x = x + delta_x + off_x;
-      dst_rect.y = y + delta_y + off_y;
-      dst_rect.w = (int)gly->width;
-      dst_rect.h = (int)gly->height;
-
-      SDL_RenderCopyEx(vid->renderer, vid->font.tex,
-            &src_rect, &dst_rect, 0, NULL, SDL_FLIP_NONE);
-
-      delta_x += gly->advance_x;
-      delta_y -= gly->advance_y;
+      vid->font_driver->get_line_metrics(font_data, &metrics);
+      if (metrics)
+         line_height = (int)(metrics->height + 0.5f);
    }
+
+   msg_len   = strlen(msg);
+   glyph_q   = get_glyph(font_data, '?');
+   width     = VIDEO_SCALE_W(vid->vp.dims);
+   height    = VIDEO_SCALE_H(vid->vp.dims);
+   x         = (int)(msg_pos_x * width);
+   y         = (int)((1.0f - msg_pos_y) * height);
+   line_x    = x;
+   line_y    = y;
+
+   /* Each line is looked up before it is drawn, so a glyph new to the
+    * atlas is in the texture by the time it is */
+#define FONT_LAYOUT_ALIGNED 1
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+   if (     atlas->dirty \
+         || VIDEO_SCALE_PACK(atlas->width, atlas->height) != vid->font.dims) \
+      sdl2_font_upload(vid, atlas); \
+   line_x = x; \
+   line_y = y + (int)(line) * line_height;
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+   if (vid->font.tex) \
+   { \
+      SDL_Rect src_rect, dst_rect; \
+      src_rect.x = VIDEO_SCALE_W((glyph)->atlas_pos); \
+      src_rect.y = VIDEO_SCALE_H((glyph)->atlas_pos); \
+      src_rect.w = (int)VIDEO_SCALE_W((glyph)->dims); \
+      src_rect.h = (int)VIDEO_SCALE_H((glyph)->dims); \
+      dst_rect.x = line_x + (pen_x) + (glyph)->draw_offset_x; \
+      dst_rect.y = line_y - (pen_y) + (glyph)->draw_offset_y; \
+      dst_rect.w = (int)VIDEO_SCALE_W((glyph)->dims); \
+      dst_rect.h = (int)VIDEO_SCALE_H((glyph)->dims); \
+      SDL_RenderCopy(vid->renderer, vid->font.tex, &src_rect, &dst_rect); \
+   }
+#include "../font_layout.h"
 }
 
 static void sdl2_init_renderer(sdl2_video_t *vid)
@@ -198,7 +285,7 @@ static void sdl2_init_renderer(sdl2_video_t *vid)
 
    if (!vid->renderer)
    {
-      RARCH_ERR("[SDL2]: Failed to initialize renderer: %s", SDL_GetError());
+      RARCH_ERR("[SDL2] Failed to initialize renderer: %s.", SDL_GetError());
       return;
    }
 
@@ -211,40 +298,44 @@ static void sdl_refresh_renderer(sdl2_video_t *vid)
 
    SDL_RenderClear(vid->renderer);
 
-   r.x      = vid->vp.x;
-   r.y      = vid->vp.y;
-   r.w      = (int)vid->vp.width;
-   r.h      = (int)vid->vp.height;
+   r.x      = VIDEO_POS_X(vid->vp.pos);
+   r.y      = VIDEO_POS_Y(vid->vp.pos);
+   r.w      = (int)VIDEO_SCALE_W(vid->vp.dims);
+   r.h      = (int)VIDEO_SCALE_H(vid->vp.dims);
 
    SDL_RenderSetViewport(vid->renderer, &r);
 
    /* breaks int scaling */
 #if 0
-   SDL_RenderSetLogicalSize(vid->renderer, vid->vp.width, vid->vp.height);
+   SDL_RenderSetLogicalSize(vid->renderer, VIDEO_SCALE_W(vid->vp.dims), VIDEO_SCALE_H(vid->vp.dims));
 #endif
 }
 
 static void sdl_refresh_viewport(sdl2_video_t *vid)
 {
    int win_w, win_h;
-   settings_t *settings      = config_get_ptr();
-   bool video_scale_integer  = settings->bools.video_scale_integer;
 
    SDL_GetWindowSize(vid->window, &win_w, &win_h);
 
-   vid->vp.x           = 0;
-   vid->vp.y           = 0;
-   vid->vp.width       = win_w;
-   vid->vp.height      = win_h;
-   vid->vp.full_width  = win_w;
-   vid->vp.full_height = win_h;
+   vid->vp.full_dims   = VIDEO_SCALE_PACK(win_w, win_h);
+   /* The whole window while views draw */
+   video_driver_update_viewport(&vid->vp,
+#ifdef SDL2_VIEWS
+         vid->views.active,
+#else
+         false,
+#endif
+         vid->video.force_aspect, true);
 
-   if (video_scale_integer)
-      video_viewport_get_scaled_integer(&vid->vp,
-            win_w, win_h, video_driver_get_aspect_ratio(),
-            vid->video.force_aspect, true);
-   else if (vid->video.force_aspect)
-      video_viewport_get_scaled_aspect(&vid->vp, win_w, win_h, true);
+   /* Tell the rest of the engine about our actual window dimensions.
+    * Without this, the output size keeps whatever value was
+    * computed from core geometry at init time (eg 320x240 for an
+    * NES-like core), so menu_driver_frame and gfx_widgets_frame
+    * receive a tiny video_height in video_info, position widgets
+    * relative to that tiny coordinate space, and end up drawing into
+    * the top-left corner of the actual SDL framebuffer.  Most other
+    * drivers (vga, gx2, d3d8, d3d9 common) make this call too. */
+   video_driver_set_output_dims(VIDEO_SCALE_PACK(win_w, win_h));
 
    vid->flags &= ~SDL2_FLAG_SHOULD_RESIZE;
 
@@ -252,11 +343,11 @@ static void sdl_refresh_viewport(sdl2_video_t *vid)
 }
 
 static void sdl_refresh_input_size(sdl2_video_t *vid, bool menu, bool rgb32,
-      unsigned width, unsigned height, unsigned pitch)
+      unsigned dims, unsigned pitch)
 {
    sdl2_tex_t *target = menu ? &vid->menu : &vid->frame;
 
-   if (!target->tex || target->w != width || target->h != height
+   if (!target->tex || target->dims != dims
        || target->rgb32 != rgb32 || target->pitch != pitch)
    {
       unsigned format;
@@ -273,11 +364,12 @@ static void sdl_refresh_input_size(sdl2_video_t *vid, bool menu, bool rgb32,
                               SDL_HINT_OVERRIDE);
 
       target->tex = SDL_CreateTexture(vid->renderer, format,
-                                      SDL_TEXTUREACCESS_STREAMING, width, height);
+                                      SDL_TEXTUREACCESS_STREAMING,
+                                      VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
 
       if (!target->tex)
       {
-         RARCH_ERR("[SDL2]: Failed to create %s texture: %s\n", menu ? "menu" : "main",
+         RARCH_ERR("[SDL2] Failed to create %s texture: %s.\n", menu ? "menu" : "main",
                    SDL_GetError());
          return;
       }
@@ -285,8 +377,7 @@ static void sdl_refresh_input_size(sdl2_video_t *vid, bool menu, bool rgb32,
       if (menu)
          SDL_SetTextureBlendMode(target->tex, SDL_BLENDMODE_BLEND);
 
-      target->w = width;
-      target->h = height;
+      target->dims  = dims;
       target->pitch = pitch;
       target->rgb32 = rgb32;
 
@@ -298,8 +389,7 @@ static void sdl_refresh_input_size(sdl2_video_t *vid, bool menu, bool rgb32,
    }
 }
 
-static void *sdl2_gfx_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *sdl2_gfx_init(const video_info_t *video)
 {
    int i;
    unsigned flags;
@@ -330,40 +420,103 @@ static void *sdl2_gfx_init(const video_info_t *video,
    if (!vid)
       return NULL;
 
-   RARCH_LOG("[SDL2]: Available renderers (change with $SDL_RENDER_DRIVER):\n");
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+   /* SDL2 internally uses RegisterRawInputDevices and drains the raw
+    * input buffer via GetRawInputBuffer() to feed its own keyboard /
+    * mouse APIs.  This consumes the WM_INPUT stream that the winraw
+    * input driver's hidden HWND_MESSAGE window depends on, so its
+    * keyboard / mouse polling stops receiving events.
+    *
+    * Unlike the d3d8 / d3d9 / d3d11 / d3d12 drivers - which create
+    * their main window with a winraw-aware WndProc
+    * (win32_window_proc, see gfx/common/win32_common.c) - the SDL2
+    * window's WndProc is owned by SDL and we cannot replace it.
+    *
+    * Warn loudly so users hitting silent broken-input understand
+    * what to change instead of assuming the driver is broken. */
+   if (string_is_equal(settings->arrays.input_driver, "raw"))
+   {
+      RARCH_WARN("[SDL2] The 'raw' (winraw) input driver is "
+            "incompatible with the SDL2 video driver - SDL2 consumes "
+            "Windows raw input internally.\n");
+      RARCH_WARN("[SDL2] Mouse and keyboard input will not work.  "
+            "Switch the input driver to 'dinput' under "
+            "Settings -> Drivers -> Input.\n");
+   }
+#endif
+
+   RARCH_LOG("[SDL2] Available renderers (change with $SDL_RENDER_DRIVER):\n");
    for (i = 0; i < SDL_GetNumRenderDrivers(); ++i)
    {
       SDL_RendererInfo renderer;
       if (SDL_GetRenderDriverInfo(i, &renderer) == 0)
-         RARCH_LOG("\t%s\n", renderer.name);
+         RARCH_LOG("[SDL2] \t%s\n", renderer.name);
    }
 
-   RARCH_LOG("[SDL2]: Available displays:\n");
-   for (i = 0; i < SDL_GetNumVideoDisplays(); ++i)
+   RARCH_LOG("[SDL2] Available displays:\n");
    {
-      SDL_DisplayMode mode;
+      bool any_refresh = false;
 
-      if (SDL_GetCurrentDisplayMode(i, &mode) < 0)
-         RARCH_LOG("\tDisplay #%i mode: unknown.\n", i);
-      else
-         RARCH_LOG("\tDisplay #%i mode: %ix%i@%ihz.\n", i, mode.w, mode.h,
-                   mode.refresh_rate);
+      for (i = 0; i < SDL_GetNumVideoDisplays(); ++i)
+      {
+         SDL_DisplayMode mode;
+
+         if (SDL_GetCurrentDisplayMode(i, &mode) < 0)
+            RARCH_LOG("[SDL2] \tDisplay #%i mode: unknown.\n", i);
+         else
+         {
+            RARCH_LOG("[SDL2] \tDisplay #%i mode: %ix%i@%ihz.\n", i, mode.w, mode.h,
+                      mode.refresh_rate);
+            if (mode.refresh_rate > 0)
+               any_refresh = true;
+         }
+      }
+
+      /* A display that reports no refresh rate has no vertical blank to
+       * present against - an offscreen or dummy video driver, or a
+       * remote session. SDL still grants SDL_RENDERER_PRESENTVSYNC on
+       * one, and SDL_GetRendererInfo still reports it as granted, so
+       * nothing in the flags gives this away: the present simply
+       * returns immediately and the frontend runs as fast as the
+       * machine allows while believing the display is pacing it. Said
+       * here because it cannot be inferred later; the statistics
+       * overlay's Pacing line shows the measured rate beside the claim
+       * for the same reason. */
+      if (video->vsync && !any_refresh)
+         RARCH_WARN("[SDL2] Vsync was requested but no display reports a "
+               "refresh rate; presentation will not pace the frontend.\n");
    }
 
    if (!video->fullscreen)
-      RARCH_LOG("[SDL]: Creating window @ %ux%u\n", video->width, video->height);
+      RARCH_LOG("[SDL2] Creating window @ %ux%u.\n", VIDEO_SCALE_W(video->dims), VIDEO_SCALE_H(video->dims));
 
    if (video->fullscreen)
       flags = settings->bools.video_windowed_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_FULLSCREEN;
    else
       flags = SDL_WINDOW_RESIZABLE;
 
-   vid->window = SDL_CreateWindow("", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                  video->width, video->height, flags);
+   {
+      int win_w = (int)VIDEO_SCALE_W(video->dims);
+      int win_h = (int)VIDEO_SCALE_H(video->dims);
+      /* Made at the desktop's size: a window made smaller is only grown
+       * by a window manager, and without one its drawable keeps the
+       * size it was made at while SDL renders to the desktop's. */
+      if (flags == SDL_WINDOW_FULLSCREEN_DESKTOP)
+      {
+         SDL_DisplayMode mode;
+         if (SDL_GetDesktopDisplayMode(0, &mode) == 0)
+         {
+            win_w = mode.w;
+            win_h = mode.h;
+         }
+      }
+      vid->window = SDL_CreateWindow("", SDL_WINDOWPOS_CENTERED,
+            SDL_WINDOWPOS_CENTERED, win_w, win_h, flags);
+   }
 
    if (!vid->window)
    {
-      RARCH_ERR("[SDL2]: Failed to init SDL window: %s\n", SDL_GetError());
+      RARCH_ERR("[SDL2] Failed to init SDL window: %s.\n", SDL_GetError());
       goto error;
    }
 
@@ -384,6 +537,10 @@ static void *sdl2_gfx_init(const video_info_t *video,
 
 #if defined(_WIN32)
    sdl2_set_handles(vid->window, RARCH_DISPLAY_WIN32);
+   {
+      WNDCLASSEX wndclass = {0};
+      win32_window_init(&wndclass, true, NULL);
+   }
 #elif defined(HAVE_COCOA)
    sdl2_set_handles(vid->window, RARCH_DISPLAY_OSX);
 #else
@@ -405,8 +562,23 @@ static void *sdl2_gfx_init(const video_info_t *video,
 
    sdl_refresh_viewport(vid);
 
-   *input      = NULL;
-   *input_data = NULL;
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+   /* Set up the global OSD font (video_font_driver) using our
+    * sdl2_raster_font.  Required for the "Display Statistics"
+    * overlay - the central video_driver_frame path renders that
+    * via font_driver_render_msg(driver_data, stat_text, video_info->stat_text_len, params, NULL),
+    * and font_driver_render_msg falls through to video_font_driver
+    * when font_data is NULL.  Without this, video_font_driver stays
+    * NULL on SDL2 and statistics never render.
+    *
+    * We also gain a working render_msg path for any other RA
+    * subsystem that calls font_driver_render_msg with NULL font -
+    * this is the same wiring every other modern driver does. */
+#endif
+
+#ifdef SDL2_VIEWS
+   retro_atomic_store_release_int(&vid->views.allowed, 1);
+#endif
 
    return vid;
 
@@ -432,6 +604,9 @@ static void check_window(sdl2_video_t *vid)
          case SDL_WINDOWEVENT:
             if (event.window.event == SDL_WINDOWEVENT_RESIZED)
                vid->flags |= SDL2_FLAG_SHOULD_RESIZE;
+            /* It may be on another display now */
+            else if (event.window.event == SDL_WINDOWEVENT_MOVED)
+               video_driver_window_output_changed();
             break;
          default:
             break;
@@ -439,8 +614,408 @@ static void check_window(sdl2_video_t *vid)
    }
 }
 
-static bool sdl2_gfx_frame(void *data, const void *frame, unsigned width,
-      unsigned height, uint64_t frame_count,
+/* Draw the current core frame into the game viewport, honouring
+ * rotation. Also used by the viewport readback, which redraws rather
+ * than read the presented backbuffer (undefined after
+ * SDL_RenderPresent on several backends). */
+static void sdl2_blit_frame(sdl2_video_t *vid)
+{
+   {
+      /* For 90/270 degree rotation the frame must not be clipped by the
+       * aspect-corrected game viewport.  SDL_RenderCopyEx() scales the
+       * texture to the destination then rotates it about the centre, so
+       * a NULL dst (== the viewport) leaves the rotated frame overflowing
+       * the viewport, which clips it to the smaller dimension: the output
+       * collapses towards square and the aspect ratio is wrong for
+       * vertical ("tate") games (issue #17893).  Render into the full
+       * window with an explicit dst rect whose width/height are the
+       * viewport's swapped, centred on the game area.  Even rotations
+       * keep the existing (viewport, NULL dst) path. */
+      int deg = ((int)vid->rotation) % 360;
+      if (deg < 0)
+         deg += 360;
+      if (deg == 90 || deg == 270)
+      {
+         SDL_Rect dst;
+         SDL_Rect game_vp;
+         dst.w     = (int)VIDEO_SCALE_H(vid->vp.dims);
+         dst.h     = (int)VIDEO_SCALE_W(vid->vp.dims);
+         dst.x     = VIDEO_POS_X(vid->vp.pos) + ((int)VIDEO_SCALE_W(vid->vp.dims)  - dst.w) / 2;
+         dst.y     = VIDEO_POS_Y(vid->vp.pos) + ((int)VIDEO_SCALE_H(vid->vp.dims) - dst.h) / 2;
+         SDL_RenderSetViewport(vid->renderer, NULL);
+         SDL_RenderCopyEx(vid->renderer, vid->frame.tex, NULL, &dst,
+               vid->rotation, NULL, SDL_FLIP_NONE);
+         /* Restore the game viewport for the menu/widget/overlay passes,
+          * which save and restore vid->vp. */
+         game_vp.x = VIDEO_POS_X(vid->vp.pos);
+         game_vp.y = VIDEO_POS_Y(vid->vp.pos);
+         game_vp.w = (int)VIDEO_SCALE_W(vid->vp.dims);
+         game_vp.h = (int)VIDEO_SCALE_H(vid->vp.dims);
+         SDL_RenderSetViewport(vid->renderer, &game_vp);
+      }
+      else
+         SDL_RenderCopyEx(vid->renderer, vid->frame.tex, NULL, NULL,
+               vid->rotation, NULL, SDL_FLIP_NONE);
+   }
+}
+
+#ifdef SDL2_VIEWS
+/* What a frame's placement draws read */
+struct sdl2_views_draw
+{
+   const video_views_map_t *map;
+};
+
+static void sdl2_views_draw_direct(sdl2_video_t *vid,
+      const struct sdl2_views_draw *d, unsigned view,
+      const video_views_rect_t *dst, const video_views_rect_t *cut);
+static bool sdl2_views_target_make(sdl2_video_t *vid, SDL_Texture **t,
+      unsigned dims);
+static bool sdl2_views_target_retire(sdl2_video_t *vid, SDL_Texture **t);
+
+/* The views compositor, with these calls bound in. SDL2 takes no
+ * preset: every view is drawn straight from its texture, its chain the
+ * driver itself. */
+#define VV_FN(name)                     sdl2_vv_##name
+#define VV_DRV                          sdl2_video_t
+#define VV_CHAIN                        void
+#define VV_CREATE_STOCK(drv)            ((void*)(drv))
+#define VV_SYNC_PARAMS(drv, c)          ((void)0)
+#define VV_DRAW                         struct sdl2_views_draw
+#define VV_DIRECT(p, d, v, r, c)        sdl2_views_draw_direct(p, d, v, r, c)
+#define VV_PASS(p, d, f, r, c, a)       ((void)0)
+#define VV_TARGET                       SDL_Texture *
+#define VV_TARGET_MAKE(drv, t, dims)    sdl2_views_target_make(drv, t, dims)
+#define VV_TARGET_RETIRE(drv, t)        sdl2_views_target_retire(drv, t)
+#include "../video_views_draw.h"
+
+/* Render targets and the premultiplied blend, found on first use: most
+ * sessions never draw views */
+static void sdl2_views_init(sdl2_video_t *vid)
+{
+   SDL_Texture *probe;
+   vid->views.tried         = true;
+   vid->views.targets       = SDL_RenderTargetSupported(vid->renderer)
+      == SDL_TRUE;
+   vid->views.premultiplied = SDL_ComposeCustomBlendMode(
+         SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+         SDL_BLENDOPERATION_ADD,
+         SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+         SDL_BLENDOPERATION_ADD);
+   if (!vid->views.targets)
+   {
+      RARCH_LOG("[SDL2] Views drawn without the canvas and UI layer: the "
+            "renderer draws into no textures.\n");
+      return;
+   }
+   if ((probe = SDL_CreateTexture(vid->renderer, SDL_PIXELFORMAT_ARGB8888,
+               SDL_TEXTUREACCESS_TARGET, 1, 1)))
+   {
+      vid->views.layer = SDL_SetTextureBlendMode(probe,
+            vid->views.premultiplied) == 0;
+      SDL_DestroyTexture(probe);
+   }
+   if (!vid->views.layer)
+      RARCH_LOG("[SDL2] Views drawn without the UI layer: the renderer "
+            "blends no premultiplied colour.\n");
+}
+
+static bool sdl2_views_target_retire(sdl2_video_t *vid, SDL_Texture **t)
+{
+   if (*t)
+      SDL_DestroyTexture(*t);
+   *t = NULL;
+   return true;
+}
+
+/* A render target of ARGB8 sized @dims */
+static bool sdl2_views_target_make(sdl2_video_t *vid, SDL_Texture **t,
+      unsigned dims)
+{
+   if (!vid->views.targets)
+      return false;
+   if ((*t = SDL_CreateTexture(vid->renderer, SDL_PIXELFORMAT_ARGB8888,
+               SDL_TEXTUREACCESS_TARGET, (int)VIDEO_SCALE_W(dims),
+               (int)VIDEO_SCALE_H(dims))))
+      return true;
+   RARCH_WARN("[SDL2] Views can't draw into a %ux%u image. "
+         "Drawing without it.\n", VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
+   return false;
+}
+
+static void sdl2_views_release(sdl2_video_t *vid)
+{
+   unsigned i;
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      if (vid->views.tex[i])
+         SDL_DestroyTexture(vid->views.tex[i]);
+      vid->views.tex[i]      = NULL;
+      vid->views.tex_dims[i] = 0;
+   }
+   sdl2_vv_target_drop(vid, &vid->views.canvas_target, &vid->views.canvas);
+   sdl2_vv_target_drop(vid, &vid->views.ui_target, &vid->views.ui);
+}
+
+/* An SDL rectangle from a top-left one */
+static void sdl2_views_rect(const video_views_rect_t *r, SDL_Rect *out)
+{
+   out->x = VIDEO_POS_X(r->pos);
+   out->y = VIDEO_POS_Y(r->pos);
+   out->w = (int)VIDEO_SCALE_W(r->dims);
+   out->h = (int)VIDEO_SCALE_H(r->dims);
+}
+
+/* View @view over @dst, cut to @cut, from its texture, turned as the
+ * frame is: about @dst's centre, the turned view filling it */
+static void sdl2_views_draw_direct(sdl2_video_t *vid,
+      const struct sdl2_views_draw *d, unsigned view,
+      const video_views_rect_t *dst, const video_views_rect_t *cut)
+{
+   SDL_Rect r, c;
+   int deg = ((int)vid->rotation) % 360;
+   if (!vid->views.tex[view])
+      return;
+   if (deg < 0)
+      deg += 360;
+   sdl2_views_rect(dst, &r);
+   sdl2_views_rect(cut, &c);
+   if (deg == 90 || deg == 270)
+   {
+      int w = r.w;
+      r.x  += (r.w - r.h) / 2;
+      r.y  += (r.h - w) / 2;
+      r.w   = r.h;
+      r.h   = w;
+   }
+   SDL_RenderSetClipRect(vid->renderer, &c);
+   SDL_RenderCopyEx(vid->renderer, vid->views.tex[view], NULL, &r,
+         vid->rotation, NULL, SDL_FLIP_NONE);
+   SDL_RenderSetClipRect(vid->renderer, NULL);
+}
+
+/* Whether this frame draws its views, with each drawn view's chain
+ * picked and the rectangle its first placement takes, and in *blend
+ * whether into the canvas. Drawn whole for anaglyph, whose colours no
+ * blend makes, and when the stereo mode or the UI would need a canvas
+ * or layer the renderer can't make. */
+static bool sdl2_views_setup(sdl2_video_t *vid,
+      video_frame_info_t *video_info, const char *msg, bool *blend,
+      void **chains, video_views_rect_t *rects)
+{
+   bool views, per_eye, ui;
+   const video_views_layout_t *layout = &video_info->views_layout;
+   bool offscreen = video_info->views.num_views && layout->offscreen;
+
+   if (video_info->views.num_views && !vid->views.tried)
+      sdl2_views_init(vid);
+   *blend = offscreen
+      && layout->stereo_mode == VIDEO_STEREO_MODE_INTERLACED
+      && sdl2_vv_target_ensure(vid, &vid->views.canvas_target,
+            &vid->views.canvas, layout->canvas_dims);
+   /* A frame without the blend modes frees the canvas. */
+   if (!offscreen)
+      sdl2_vv_target_drop(vid, &vid->views.canvas_target,
+            &vid->views.canvas);
+   per_eye = video_views_ui_per_eye(&video_info->views, layout, true);
+   /* No directive inside the macro's arguments: MSVC's preprocessor
+    * takes it as tokens. */
+#ifdef HAVE_GFX_WIDGETS
+   ui = VIDEO_VIEWS_UI_WANTED(per_eye, vid->menu.active, msg,
+         video_info->statistics_show,
+         video_info->widgets_active && gfx_widgets_visible(video_info));
+#else
+   ui = VIDEO_VIEWS_UI_WANTED(per_eye, vid->menu.active, msg,
+         video_info->statistics_show, false);
+#endif
+#ifdef HAVE_MENU
+   ui = ui || (per_eye
+         && (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE));
+#endif
+   views = video_info->views.num_views
+      && (!offscreen || *blend)
+      && (!ui || vid->views.layer)
+      && video_views_fit_frame(&video_info->views, vid->views.frame_dims)
+      && sdl2_vv_pick_chains(vid, &vid->views.chains, &video_info->views,
+            layout, true, *blend || !layout->offscreen,
+            *blend ? layout->canvas_dims : video_info->dims, chains, rects);
+   *blend = views && *blend;
+   if (views && !vid->views.direct_seen)
+   {
+      vid->views.direct_seen = true;
+      RARCH_LOG("[SDL2] Views drawn straight from the frame.\n");
+   }
+   return views;
+}
+
+/* Each drawn view of the frame at @frame, @pitch bytes a row, written
+ * straight into its own texture: no copy. An RGB565 view is widened on
+ * the way in, its bits repeated as every other driver's are, and not by
+ * SDL's own conversion, which falls short of full brightness. */
+static void sdl2_views_write(sdl2_video_t *vid, const video_views_map_t *map,
+      void *const *chains, const void *frame, unsigned pitch)
+{
+   unsigned i;
+   bool rgb32  = vid->video.rgb32;
+   size_t bpp  = rgb32 ? 4 : 2;
+   for (i = 0; i < map->num_views; i++)
+   {
+      const struct retro_video_view *v = &map->views[i];
+      unsigned dims = VIDEO_SCALE_PACK(v->width, v->height);
+      if (!chains[i])
+         continue;
+      if (     !vid->views.tex[i] || vid->views.tex_dims[i] != dims
+            || vid->views.tex_rgb32[i] != rgb32)
+      {
+         if (vid->views.tex[i])
+            SDL_DestroyTexture(vid->views.tex[i]);
+         vid->views.tex_dims[i]  = 0;
+         if (!(vid->views.tex[i] = SDL_CreateTexture(vid->renderer,
+                     SDL_PIXELFORMAT_ARGB8888,
+                     SDL_TEXTUREACCESS_STREAMING, (int)v->width,
+                     (int)v->height)))
+            continue;
+         SDL_SetTextureScaleMode(vid->views.tex[i], vid->video.smooth
+               ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+         vid->views.tex_dims[i]  = dims;
+         vid->views.tex_rgb32[i] = rgb32;
+      }
+      if (rgb32)
+         SDL_UpdateTexture(vid->views.tex[i], NULL, (const uint8_t*)frame
+               + (size_t)v->y * pitch + (size_t)v->x * bpp, (int)pitch);
+      else
+      {
+         void *pixels;
+         int out_pitch;
+         if (SDL_LockTexture(vid->views.tex[i], NULL, &pixels,
+                  &out_pitch) != 0)
+            continue;
+         conv_rgb565_argb8888(pixels, (const uint8_t*)frame
+               + (size_t)v->y * pitch + (size_t)v->x * bpp,
+               (int)v->width, (int)v->height, out_pitch, (int)pitch);
+         SDL_UnlockTexture(vid->views.tex[i]);
+      }
+   }
+}
+
+/* Draws the last frame's views into the window, or with a canvas into
+ * that, whose halves then go to the window's even and odd rows */
+static void sdl2_views_render(sdl2_video_t *vid)
+{
+   struct sdl2_views_draw d;
+   const video_views_layout_t *layout = &vid->views.layout;
+   bool blend    = vid->views.blend;
+   unsigned dims = blend ? layout->canvas_dims : vid->views.dims;
+
+   d.map = &vid->views.map;
+   if (blend)
+   {
+      SDL_SetRenderTarget(vid->renderer, vid->views.canvas);
+      SDL_SetRenderDrawColor(vid->renderer, 0, 0, 0, 255);
+      SDL_RenderClear(vid->renderer);
+   }
+   else
+      SDL_RenderSetViewport(vid->renderer, NULL);
+   sdl2_vv_draw_placements(vid, &d, layout, vid->views.drawn,
+         blend || !layout->offscreen, dims, true);
+   if (blend)
+   {
+      SDL_Rect src, dst;
+      int y, w = (int)VIDEO_SCALE_W(vid->views.dims);
+      int h    = (int)VIDEO_SCALE_H(vid->views.dims);
+      SDL_SetRenderTarget(vid->renderer, NULL);
+      SDL_RenderSetViewport(vid->renderer, NULL);
+      SDL_SetTextureBlendMode(vid->views.canvas, SDL_BLENDMODE_NONE);
+      SDL_SetTextureScaleMode(vid->views.canvas, SDL_ScaleModeNearest);
+      /* Even rows from the left half, odd from the right, from the top */
+      src.x = 0;
+      src.y = 0;
+      src.w = w;
+      src.h = h;
+      SDL_RenderCopy(vid->renderer, vid->views.canvas, &src, &src);
+      src.x = w;
+      src.h = 1;
+      dst.x = 0;
+      dst.w = w;
+      dst.h = 1;
+      for (y = 1; y < h; y += 2)
+      {
+         src.y = dst.y = y;
+         SDL_RenderCopy(vid->renderer, vid->views.canvas, &src, &dst);
+      }
+   }
+}
+
+/* Moves UI drawing into the UI layer, laid out at one eye's size */
+static void sdl2_views_ui_begin(sdl2_video_t *vid,
+      video_frame_info_t *video_info)
+{
+   SDL_SetRenderTarget(vid->renderer, vid->views.ui);
+   SDL_SetRenderDrawColor(vid->renderer, 0, 0, 0, 0);
+   SDL_RenderClear(vid->renderer);
+   SDL_SetRenderDrawColor(vid->renderer, 0, 0, 0, 255);
+   /* Menus and widgets size from video_info->dims, fonts and the
+    * passes below from vp.full_dims. */
+   video_views_ui_enter(&vid->views.saved, &video_info->dims,
+         &vid->vp.full_dims, video_info->views_layout.ui_dims);
+   vid->views.vp_dims = vid->vp.dims;
+   vid->vp.dims       = video_info->views_layout.ui_dims;
+}
+
+/* Back onto the window, and the UI layer into each eye's area. It was
+ * drawn over transparent black, so its colour is premultiplied. */
+static void sdl2_views_ui_end(sdl2_video_t *vid,
+      video_frame_info_t *video_info)
+{
+   unsigned a;
+   const video_views_layout_t *layout = &video_info->views_layout;
+   video_views_ui_leave(&vid->views.saved, &video_info->dims,
+         &vid->vp.full_dims);
+   vid->vp.dims = vid->views.vp_dims;
+   SDL_SetRenderTarget(vid->renderer, NULL);
+   SDL_RenderSetViewport(vid->renderer, NULL);
+   SDL_SetTextureBlendMode(vid->views.ui, vid->views.premultiplied);
+   /* Only full side by side places it unscaled. */
+   SDL_SetTextureScaleMode(vid->views.ui,
+         (layout->stereo_mode == VIDEO_STEREO_MODE_SBS_FULL)
+         ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
+   for (a = 0; a < layout->num_areas; a++)
+   {
+      SDL_Rect r;
+      sdl2_views_rect(&layout->areas[a], &r);
+      SDL_RenderCopy(vid->renderer, vid->views.ui, NULL, &r);
+   }
+}
+
+/* Where a menu texture not drawn full screen goes while views draw:
+ * fitted to its target, of @dims, as the game viewport would be */
+static void sdl2_views_menu_rect(sdl2_video_t *vid, unsigned dims,
+      SDL_Rect *out)
+{
+   struct video_viewport vp;
+   memset(&vp, 0, sizeof(vp));
+   vp.full_dims = dims;
+   video_driver_update_viewport(&vp, false, vid->video.force_aspect, true);
+   out->x = VIDEO_POS_X(vp.pos);
+   out->y = VIDEO_POS_Y(vp.pos);
+   out->w = (int)VIDEO_SCALE_W(vp.dims);
+   out->h = (int)VIDEO_SCALE_H(vp.dims);
+}
+
+static void sdl2_set_view_count(void *data, unsigned count)
+{
+   unsigned i;
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid)
+      return;
+   vid->views.chains.count = MIN(count, RETRO_VIDEO_VIEWS_MAX);
+   for (i = vid->views.chains.count; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      vid->views.chains.stock[i] = NULL;
+}
+#endif
+
+static bool sdl2_gfx_frame(void *data, const void *frame,
+      unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info)
 {
    char title[128];
@@ -448,28 +1023,265 @@ static bool sdl2_gfx_frame(void *data, const void *frame, unsigned width,
 #ifdef HAVE_MENU
    bool menu_is_alive = (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE) ? true : false;
 #endif
+   bool views_per_eye = false;
+#ifdef SDL2_VIEWS
+   void *view_chains[RETRO_VIDEO_VIEWS_MAX];
+   video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
+   bool views         = false;
+   bool views_blend   = false;
+   bool views_ui      = false;
+
+   if (frame)
+      vid->views.frame_dims = dims;
+   views = sdl2_views_setup(vid, video_info, msg, &views_blend,
+         view_chains, view_rects);
+   /* vid->vp is the whole window while views draw. */
+   if (views != vid->views.active)
+   {
+      vid->views.active = views;
+      vid->flags       |= SDL2_FLAG_SHOULD_RESIZE;
+   }
+   retro_atomic_store_release_int(&vid->views.fallback,
+         (video_info->views.num_views && !views) ? 1 : 0);
+#endif
 
    if (vid->flags & SDL2_FLAG_SHOULD_RESIZE)
       sdl_refresh_viewport(vid);
 
-   if (frame)
+#ifdef SDL2_VIEWS
+   if (views)
    {
+      /* Kept for the viewport readback to draw again */
+      unsigned i;
+      vid->views.map    = video_info->views;
+      vid->views.layout = video_info->views_layout;
+      vid->views.dims   = video_info->dims;
+      vid->views.blend  = views_blend;
+      for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+         vid->views.drawn[i] = view_chains[i];
       SDL_RenderClear(vid->renderer);
-      sdl_refresh_input_size(vid, false, vid->video.rgb32, width, height, pitch);
-      SDL_UpdateTexture(vid->frame.tex, NULL, frame, pitch);
+      if (frame)
+         sdl2_views_write(vid, &video_info->views, view_chains, frame,
+               pitch);
+      sdl2_views_render(vid);
+   }
+   else
+#endif
+   {
+      if (frame)
+      {
+         SDL_RenderClear(vid->renderer);
+         sdl_refresh_input_size(vid, false, vid->video.rgb32, dims, pitch);
+         SDL_UpdateTexture(vid->frame.tex, NULL, frame, pitch);
+      }
+
+      sdl2_blit_frame(vid);
    }
 
-   SDL_RenderCopyEx(vid->renderer, vid->frame.tex, NULL, NULL, vid->rotation, NULL, SDL_FLIP_NONE);
+#ifdef SDL2_VIEWS
+   /* As the main thread laid the UI out, also in a frame drawn whole:
+    * it lays out later frames whole once it reads the fallback. */
+   views_per_eye = video_views_ui_per_eye(&video_info->views,
+         &video_info->views_layout, true);
+   if (!views_per_eye)
+      sdl2_vv_target_drop(vid, &vid->views.ui_target, &vid->views.ui);
+   /* Drawn and composited only when there is UI; overlays are hidden.
+    * No directive inside the macro's arguments: MSVC's preprocessor
+    * takes it as tokens. */
+#ifdef HAVE_GFX_WIDGETS
+   views_ui = VIDEO_VIEWS_UI_WANTED(views_per_eye, vid->menu.active, msg,
+         video_info->statistics_show,
+         video_info->widgets_active && gfx_widgets_visible(video_info));
+#else
+   views_ui = VIDEO_VIEWS_UI_WANTED(views_per_eye, vid->menu.active, msg,
+         video_info->statistics_show, false);
+#endif
+#ifdef HAVE_MENU
+   views_ui = views_ui || (views_per_eye && menu_is_alive);
+#endif
+   views_ui = views_ui && vid->views.layer
+      && sdl2_vv_target_ensure(vid, &vid->views.ui_target,
+            &vid->views.ui, video_info->views_layout.ui_dims);
+   if (views_ui)
+      sdl2_views_ui_begin(vid, video_info);
+#endif
 
 #ifdef HAVE_MENU
-   menu_driver_frame(menu_is_alive, video_info);
+   {
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+      /* Non-RGUI menus (XMB / Ozone / MaterialUI) issue gfx_display
+       * draw calls during menu_driver_frame and need the full-window
+       * viewport for the same reason widgets do (see widget block
+       * below).  RGUI doesn't care - it renders into vid->menu.tex
+       * and is composited via SDL_RenderCopy after - but setting the
+       * viewport unconditionally is harmless for RGUI and saves a
+       * branch on whether the active menu is RGUI or not. */
+      SDL_Rect screen_vp_menu;
+      SDL_Rect saved_vp_menu;
+      SDL_RenderGetViewport(vid->renderer, &saved_vp_menu);
+      screen_vp_menu.x = 0;
+      screen_vp_menu.y = 0;
+      screen_vp_menu.w = (int)VIDEO_SCALE_W(vid->vp.full_dims);
+      screen_vp_menu.h = (int)VIDEO_SCALE_H(vid->vp.full_dims);
+      SDL_RenderSetViewport(vid->renderer, &screen_vp_menu);
+
+      menu_driver_frame(menu_is_alive, video_info);
+
+      SDL_RenderSetViewport(vid->renderer, &saved_vp_menu);
+#else
+      menu_driver_frame(menu_is_alive, video_info);
+#endif
+   }
 #endif
 
    if (vid->menu.active)
+   {
+#ifdef SDL2_VIEWS
+      /* Its viewport is the whole target while views draw. */
+      if (views || views_ui)
+      {
+         SDL_Rect menu_rect;
+         SDL_Rect saved_vp_menu;
+         SDL_RenderGetViewport(vid->renderer, &saved_vp_menu);
+         SDL_RenderSetViewport(vid->renderer, NULL);
+         sdl2_views_menu_rect(vid, video_info->dims, &menu_rect);
+         SDL_RenderCopy(vid->renderer, vid->menu.tex, NULL, &menu_rect);
+         SDL_RenderSetViewport(vid->renderer, &saved_vp_menu);
+      }
+      else
+#endif
       SDL_RenderCopy(vid->renderer, vid->menu.tex, NULL, NULL);
+   }
+
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+   /* "Display Statistics" overlay (Settings -> Onscreen Notifications
+    * -> Display Statistics).  Rendered between the menu composite
+    * and widgets, matching gdi/d3d8/d3d9 order so widget toasts can
+    * still paint over the stats block in the rare case they overlap.
+    *
+    * Suppressed while the menu is alive - the menu drivers
+    * (XMB/Ozone/MaterialUI) own the screen and the overlay would
+    * just bleed under their UI.  RGUI is software-rendered into
+    * vid->menu.tex which is composited above, so it would actually
+    * cover the stats; suppressing here keeps the behaviour
+    * symmetric across menu drivers.
+    *
+    * Needs the full-window viewport for the same reason widgets do
+    * - OSD font math is done against VIDEO_SCALE_W(video_info->dims)/height. */
+   {
+      const char *stat_text          = video_info->stat_text;
+      struct font_params *osd_params = (struct font_params*)
+            &video_info->osd_stat_params;
+      bool show_stats                = video_info->statistics_show
+            && stat_text && stat_text[0] != '\0'
+#ifdef HAVE_MENU
+            && !menu_is_alive
+#endif
+            ;
+      if (show_stats)
+      {
+         SDL_Rect screen_vp_stats;
+         SDL_Rect saved_vp_stats;
+         SDL_RenderGetViewport(vid->renderer, &saved_vp_stats);
+         screen_vp_stats.x = 0;
+         screen_vp_stats.y = 0;
+         screen_vp_stats.w = (int)VIDEO_SCALE_W(vid->vp.full_dims);
+         screen_vp_stats.h = (int)VIDEO_SCALE_H(vid->vp.full_dims);
+         SDL_RenderSetViewport(vid->renderer, &screen_vp_stats);
+
+         font_driver_render_msg(vid, stat_text, video_info->stat_text_len, osd_params, NULL);
+
+         SDL_RenderSetViewport(vid->renderer, &saved_vp_stats);
+      }
+   }
+#endif
+
+#ifdef HAVE_OVERLAY
+   /* Input overlay (touch / virtual gamepad images).  Rendered
+    * between stats and widgets so a widget toast can paint on top
+    * of a button if they overlap (rare in practice — widgets land
+    * in their own corner — but keeping the order consistent across
+    * backends means an overlay-on-d3d9 config carries over here
+    * unchanged).
+    *
+    * Needs the full-window viewport (the same one widgets use):
+    * fullscreen overlays span the whole window including
+    * letterbox bars, and even non-fullscreen overlays compute
+    * against vid->vp.x/y/width/height which are also window-space
+    * pixel coordinates.  Going through the game viewport (the
+    * default sdl_refresh_renderer state) would clip overlay
+    * buttons drawn on the pillar/letter bars. */
+   /* Touch overlays would straddle both eyes. */
+   if (     vid->overlays_enabled && vid->overlays && vid->overlays_size
+         && !views_per_eye)
+   {
+      SDL_Rect screen_vp_ov;
+      SDL_Rect saved_vp_ov;
+      SDL_RenderGetViewport(vid->renderer, &saved_vp_ov);
+      screen_vp_ov.x = 0;
+      screen_vp_ov.y = 0;
+      screen_vp_ov.w = (int)VIDEO_SCALE_W(vid->vp.full_dims);
+      screen_vp_ov.h = (int)VIDEO_SCALE_H(vid->vp.full_dims);
+      SDL_RenderSetViewport(vid->renderer, &screen_vp_ov);
+
+      sdl2_overlays_render(vid);
+
+      SDL_RenderSetViewport(vid->renderer, &saved_vp_ov);
+   }
+#endif
+
+#if defined(HAVE_GFX_WIDGETS) && SDL_VERSION_ATLEAST(2, 0, 18)
+   /* Widgets composite over the framebuffer (and over the menu, if
+    * the menu is active). gfx_widgets_frame ultimately calls back
+    * into gfx_display_sdl2_draw and sdl2_raster_font_render_msg,
+    * so the SDL_Renderer must already be in a state where its
+    * draw color/blend won't poison the widget submissions. The
+    * blend_begin/blend_end callbacks in our gfx_display backend
+    * handle that on a per-call basis.
+    *
+    * Critically, sdl_refresh_renderer set a viewport equal to
+    * vid->vp (the aspect-corrected GAME area, not the window).
+    * Widgets compute coords against VIDEO_SCALE_W(video_info->dims)/height which
+    * are the full window dimensions, so without a full-window
+    * viewport reset here the widget would draw in the wrong place
+    * (or be clipped entirely - at 4K with a 4:3 game, the widget's
+    * bottom-of-screen position lands outside vid->vp's bottom edge
+    * and SDL clips it to nothing).
+    *
+    * Same hazard exists for menu_driver_frame above when XMB / Ozone
+    * etc. issue gfx_display draws, but the existing sdl2 driver only
+    * ever supported RGUI (drawn into vid->menu.tex via SDL_RenderCopy
+    * which doesn't care about viewport), so that path was implicitly
+    * fine.  Now that we accept arbitrary menus, set the viewport for
+    * the menu pass too. */
+   if (video_info->widgets_active)
+   {
+      SDL_Rect screen_vp;
+      SDL_Rect saved_vp;
+      SDL_RenderGetViewport(vid->renderer, &saved_vp);
+
+      screen_vp.x = 0;
+      screen_vp.y = 0;
+      screen_vp.w = (int)VIDEO_SCALE_W(vid->vp.full_dims);
+      screen_vp.h = (int)VIDEO_SCALE_H(vid->vp.full_dims);
+      SDL_RenderSetViewport(vid->renderer, &screen_vp);
+
+      gfx_widgets_frame(video_info);
+
+      /* Restore the game viewport so the next frame's core blit
+       * lands in the right place. */
+      SDL_RenderSetViewport(vid->renderer, &saved_vp);
+   }
+#endif
 
    if (msg)
-      sdl2_render_msg(vid, msg);
+      sdl2_render_msg(vid, msg, video_info->font_msg_pos_x,
+            video_info->font_msg_pos_y);
+
+#ifdef SDL2_VIEWS
+   if (views_ui)
+      sdl2_views_ui_end(vid, video_info);
+#endif
 
    SDL_RenderPresent(vid->renderer);
 
@@ -520,6 +1332,28 @@ static void sdl2_gfx_free(void *data)
    if (!vid)
       return;
 
+   /* The OSD font owns SDL_Textures created against vid->renderer and
+    * must go before SDL_DestroyRenderer below. It does:
+    * video_driver_free_internal() releases it before calling this. */
+
+#ifdef HAVE_OVERLAY
+   /* Same constraint - overlay textures are owned by vid->renderer.
+    * Drop them before SDL_DestroyRenderer below. */
+   sdl2_overlay_free(vid);
+
+   free(vid->display_verts);
+   free(vid->display_indices);
+   vid->display_verts       = NULL;
+   vid->display_indices     = NULL;
+   vid->display_verts_cap   = 0;
+   vid->display_indices_cap = 0;
+#endif
+
+#ifdef SDL2_VIEWS
+   if (vid->renderer)
+      sdl2_views_release(vid);
+#endif
+
    if (vid->renderer)
       SDL_DestroyRenderer(vid->renderer);
 
@@ -528,6 +1362,7 @@ static void sdl2_gfx_free(void *data)
 
    if (vid->font_data)
       vid->font_driver->free(vid->font_data);
+   free(vid->font_staging);
 
    free(vid);
 }
@@ -546,26 +1381,90 @@ static void sdl2_gfx_viewport_info(void *data, struct video_viewport *vp)
    *vp = vid->vp;
 }
 
-static bool sdl2_gfx_read_viewport(void *data, uint8_t *buffer, bool is_idle)
+/* Redraw the last core frame into the game viewport and read it back.
+ * bgrx: 32-bit B,G,R,X, top row first; otherwise BGR24 bottom row
+ * first, as read_viewport() callers expect. Menu, widget and OSD
+ * passes are not replayed. Nothing is presented; the next frame
+ * redraws. */
+static bool sdl2_capture_viewport(sdl2_video_t *vid, uint8_t *buffer,
+      bool bgrx)
 {
-   SDL_Surface *surf = NULL, *bgr24 = NULL;
-   sdl2_video_t *vid = (sdl2_video_t*)data;
+   SDL_Rect saved_vp, game_vp;
+   int pitch;
+   bool ok;
+#if SDL_VERSION_ATLEAST(2, 0, 5)
+   Uint32 fmt = bgrx ? SDL_PIXELFORMAT_BGRA32 : SDL_PIXELFORMAT_BGR24;
+#else
+   Uint32 fmt = bgrx ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_BGR24;
+#endif
 
-   if (!is_idle)
-      video_driver_cached_frame();
+   if (!vid || !vid->renderer
+         || !VIDEO_SCALE_W(vid->vp.dims) || !VIDEO_SCALE_H(vid->vp.dims))
+      return false;
+#ifdef SDL2_VIEWS
+   if (!vid->views.active)
+#endif
+   if (!vid->frame.tex)
+      return false;
 
-   surf  = SDL_GetWindowSurface(vid->window);
-   bgr24 = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_BGR24, 0);
+   pitch     = (int)VIDEO_SCALE_W(vid->vp.dims) * (bgrx ? 4 : 3);
+   game_vp.x = VIDEO_POS_X(vid->vp.pos);
+   game_vp.y = VIDEO_POS_Y(vid->vp.pos);
+   game_vp.w = (int)VIDEO_SCALE_W(vid->vp.dims);
+   game_vp.h = (int)VIDEO_SCALE_H(vid->vp.dims);
 
-   if (!bgr24)
+   SDL_RenderGetViewport(vid->renderer, &saved_vp);
+   SDL_RenderSetViewport(vid->renderer, &game_vp);
+   SDL_RenderClear(vid->renderer);
+#ifdef SDL2_VIEWS
+   if (vid->views.active)
    {
-      RARCH_WARN("Failed to convert viewport data to BGR24: %s", SDL_GetError());
+      sdl2_views_render(vid);
+      SDL_RenderSetViewport(vid->renderer, &game_vp);
+   }
+   else
+#endif
+   sdl2_blit_frame(vid);
+   /* NULL rect: the current viewport, the size of the caller's buffer. */
+   ok = SDL_RenderReadPixels(vid->renderer, NULL, fmt, buffer, pitch) == 0;
+   SDL_RenderSetViewport(vid->renderer, &saved_vp);
+
+   if (!ok)
+   {
+      RARCH_WARN("[SDL2] Failed to read viewport: %s.\n", SDL_GetError());
       return false;
    }
 
-   memcpy(buffer, bgr24->pixels, bgr24->h * bgr24->pitch);
+   if (!bgrx)
+   {
+      unsigned y, h = VIDEO_SCALE_H(vid->vp.dims);
+      uint8_t *tmp  = (uint8_t*)malloc((size_t)pitch);
+      if (!tmp)
+         return false;
+      for (y = 0; y < h / 2; y++)
+      {
+         uint8_t *a = buffer + (size_t)y * pitch;
+         uint8_t *b = buffer + (size_t)(h - 1 - y) * pitch;
+         memcpy(tmp, a, pitch);
+         memcpy(a, b, pitch);
+         memcpy(b, tmp, pitch);
+      }
+      free(tmp);
+   }
 
    return true;
+}
+
+static bool sdl2_gfx_read_viewport(void *data, uint8_t *buffer, bool is_idle)
+{
+   return sdl2_capture_viewport((sdl2_video_t*)data, buffer, false);
+}
+
+static bool sdl2_gfx_read_viewport_bgrx(void *data, uint8_t *buffer,
+      bool is_idle, bool *bottom_up)
+{
+   *bottom_up = false;
+   return sdl2_capture_viewport((sdl2_video_t*)data, buffer, true);
 }
 
 static void sdl2_poke_set_filtering(void *data, unsigned index, bool smooth, bool ctx_scaling)
@@ -574,6 +1473,15 @@ static void sdl2_poke_set_filtering(void *data, unsigned index, bool smooth, boo
    vid->video.smooth = smooth;
 
    sdl_tex_zero(&vid->frame);
+#ifdef SDL2_VIEWS
+   {
+      unsigned i;
+      for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+         if (vid->views.tex[i])
+            SDL_SetTextureScaleMode(vid->views.tex[i], smooth
+                  ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+   }
+#endif
 }
 
 static void sdl2_poke_set_aspect_ratio(void *data, unsigned aspect_ratio_idx)
@@ -596,14 +1504,14 @@ static void sdl2_poke_apply_state_changes(void *data)
 
 static void sdl2_poke_set_texture_frame(void *data,
       const void *frame, bool rgb32,
-      unsigned width, unsigned height, float alpha)
+      unsigned dims, float alpha)
 {
    if (frame)
    {
       sdl2_video_t *vid = (sdl2_video_t*)data;
 
-      sdl_refresh_input_size(vid, true, rgb32, width, height,
-            width * (rgb32 ? 4 : 2));
+      sdl_refresh_input_size(vid, true, rgb32, dims,
+            VIDEO_SCALE_W(dims) * (rgb32 ? 4 : 2));
 
       SDL_UpdateTexture(vid->menu.tex, NULL, frame, (int)vid->menu.pitch);
    }
@@ -620,11 +1528,44 @@ static void sdl2_poke_texture_enable(void *data,
    vid->menu.active = enable;
 }
 
-static void sdl2_poke_set_osd_msg(void *data, const char *msg,
+static void sdl2_poke_set_osd_msg(void *data, const char *msg, size_t msg_len,
       const struct font_params *params, void *font)
 {
    sdl2_video_t *vid = (sdl2_video_t*)data;
-   sdl2_render_msg(vid, msg);
+
+   /* The poke->set_osd_msg API is dual-purpose:
+    *
+    * 1. Real OSD path (called from video_driver_frame with msg arg).
+    *    `font` is NULL and we render via sdl2_render_msg's bitmap
+    *    font - this is the legacy yellow-text OSD output.
+    *
+    * 2. gfx_display_draw_text path (used by all menu drivers and
+    *    by widgets via gfx_widgets_draw_text).  `font` is a valid
+    *    font_data_t* whose renderer was selected via
+    *    sdl2_raster_font as the font backend.  We
+    *    must dispatch to that font driver's render_msg, otherwise
+    *    every menu/widget text call falls through to the OSD font
+    *    and lands in the wrong place with the wrong glyphs.
+    *
+    * The original sdl2 driver only supported RGUI (which renders
+    * text into vid->menu.tex itself, never via gfx_display_draw_text)
+    * so this branch never had a non-NULL font_data and the bug was
+    * masked. */
+   if (font && params)
+   {
+      const font_data_t *fd = (const font_data_t*)font;
+      if (fd->renderer && fd->renderer->render_msg)
+      {
+         fd->renderer->render_msg(vid, fd->renderer_data, msg, msg_len, params);
+         return;
+      }
+   }
+
+   {
+      settings_t *settings = config_get_ptr();
+      sdl2_render_msg(vid, msg, settings->floats.video_msg_pos_x,
+            settings->floats.video_msg_pos_y);
+   }
 }
 
 static void sdl2_show_mouse(void *data, bool state) { SDL_ShowCursor(state); }
@@ -633,12 +1574,104 @@ static void sdl2_grab_mouse_toggle(void *data)
    sdl2_video_t *vid = (sdl2_video_t*)data;
    SDL_SetWindowGrab(vid->window, SDL_GetWindowGrab(vid->window));
 }
-static uint32_t sdl2_get_flags(void *data) { return 0; }
+/* The viewport readback redraws the core's frame alone, so a GPU
+ * recording never holds the menu or messages. */
+static uint32_t sdl2_get_flags(void *data)
+{
+   uint32_t flags = 0;
+#ifdef SDL2_VIEWS
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+#endif
+   BIT32_SET(flags, GFX_CTX_FLAGS_RECORD_GAME_ONLY);
+#ifdef SDL2_VIEWS
+   if (vid && retro_atomic_load_acquire_int(&vid->views.allowed))
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS);
+   if (vid && retro_atomic_load_acquire_int(&vid->views.fallback))
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+#endif
+   return flags;
+}
+
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+/* Texture upload hook for menu icons and any other gfx_display-driven
+ * texture loads.
+ *
+ * Pixel format: sdl2_get_flags returns 0 (no VIDEO_FLAG_USE_RGBA),
+ * so the image task gives us pixels in BGRA byte order packed into
+ * uint32. On little-endian that maps to native-uint32 0xAARRGGBB,
+ * which is SDL_PIXELFORMAT_ARGB8888. On big-endian SDL_BYTEORDER
+ * matches and the same format constant resolves correctly. */
+static uintptr_t sdl2_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type)
+{
+   sdl2_video_t          *vid = (sdl2_video_t*)video_data;
+   struct texture_image  *ti  = (struct texture_image*)data;
+   SDL_Texture           *tex = NULL;
+
+   if (!vid || !vid->renderer || !ti || !ti->pixels || !ti->width || !ti->height)
+      return 0;
+
+   tex = SDL_CreateTexture(vid->renderer,
+         SDL_PIXELFORMAT_ARGB8888,
+         SDL_TEXTUREACCESS_STATIC,
+         ti->width, ti->height);
+   if (!tex)
+      return 0;
+
+   SDL_UpdateTexture(tex, NULL, ti->pixels, ti->width * sizeof(uint32_t));
+   SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+
+   /* filter_type maps loosely; SDL_Renderer doesn't expose mipmaps,
+    * and the only meaningful distinction is nearest vs linear. */
+   if (filter_type == TEXTURE_FILTER_NEAREST
+    || filter_type == TEXTURE_FILTER_MIPMAP_NEAREST)
+      SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+   else
+      SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
+
+   return (uintptr_t)tex;
+}
+
+static void sdl2_unload_texture(void *data,
+      bool threaded, uintptr_t id)
+{
+   SDL_Texture *tex = (SDL_Texture*)id;
+   (void)data;
+   (void)threaded;
+   if (tex)
+      SDL_DestroyTexture(tex);
+}
+
+/* Same-size contents into a texture sdl2_load_texture made: the
+ * texture stays, SDL_UpdateTexture rewrites it. Called on the thread
+ * the loads run on, as the load is. */
+static enum video_texture_update sdl2_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   SDL_Texture *tex = (SDL_Texture*)id;
+   int w = 0, h = 0;
+   (void)video_data;
+   (void)threaded;
+   /* The textures hold 8 bits a channel and nothing wider */
+   if (     !tex || !ti || !ti->pixels || ti->pix10 || ti->fp16
+         || SDL_QueryTexture(tex, NULL, NULL, &w, &h) != 0
+         || (unsigned)w != ti->width || (unsigned)h != ti->height
+         || SDL_UpdateTexture(tex, NULL, ti->pixels,
+               (int)(ti->width * sizeof(uint32_t))) != 0)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   return VIDEO_TEXTURE_UPDATE_DONE;
+}
+#endif
 
 static video_poke_interface_t sdl2_video_poke_interface = {
    sdl2_get_flags,
-   NULL, /* load_texture */
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+   sdl2_load_texture,
+   sdl2_unload_texture,
+#else
+   NULL, /* load_texture - menus/widgets need SDL_RenderGeometry */
    NULL, /* unload_texture */
+#endif
    NULL, /* set_video_mode */
    NULL, /* get_refresh_rate */
    sdl2_poke_set_filtering,
@@ -657,10 +1690,38 @@ static video_poke_interface_t sdl2_video_poke_interface = {
    NULL, /* get_current_shader */
    NULL, /* get_current_software_framebuffer */
    NULL, /* get_hw_render_interface */
-   NULL, /* set_hdr_max_nits */
+   NULL, /* set_hdr_menu_nits */
    NULL, /* set_hdr_paper_white_nits */
-   NULL, /* set_hdr_contrast */
    NULL, /* set_hdr_expand_gamut */
+   NULL, /* set_hdr_scanlines */
+   NULL, /* set_hdr_subpixel_layout */
+   NULL, /* supports_texture_format */
+   NULL, /* load_texture_compressed */
+   NULL, /* present_last */
+   NULL, /* get_last_present_time */
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+   sdl2_update_texture
+#else
+   NULL  /* update_texture */
+#endif
+#ifdef SDL2_VIEWS
+   ,
+   NULL, /* get_swap_interval_cap */
+   NULL, /* texture_lend */
+   NULL, /* texture_lend_ready */
+   NULL, /* get_last_present_wait */
+   sdl2_set_view_count
+#endif
 };
 
 static void sdl2_gfx_poke_interface(void *data, const video_poke_interface_t **iface)
@@ -677,6 +1738,1211 @@ static bool sdl2_gfx_set_shader(void *data,
    (void)path;
 
    return false;
+}
+
+#if defined(HAVE_GFX_WIDGETS) && SDL_VERSION_ATLEAST(2, 0, 18)
+static bool sdl2_gfx_widgets_enabled(void *data) { (void)data; return true; }
+#endif
+
+/*
+ * gfx_display BACKEND
+ *
+ * Hardware-accelerated menu/widget rendering for SDL2. Built on
+ * SDL_RenderGeometry (added in SDL 2.0.18) so the menu and widget
+ * quads run on the GPU through SDL_Renderer's underlying backend
+ * (D3D9/11, Metal, GL/GLES depending on platform).
+ *
+ * The whole gfx_display backend, font driver, and the
+ * gfx_widgets_enabled hook are gated on SDL >= 2.0.18. Older SDL
+ * builds fall back to the existing rgui-only path (rgui renders
+ * its own software framebuffer that we composite via
+ * SDL_RenderCopy), which check_menu_driver_compatibility allows
+ * unconditionally. The runtime guard is needed because the qb
+ * configure script only requires SDL 2.0.0.
+ */
+
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+
+static void *gfx_display_sdl2_get_default_mvp(void *data)
+{
+   /* SDL_Renderer has no MVP concept; transforms go through
+    * SDL_RenderSetScale / SDL_RenderSetViewport. The menu code
+    * tolerates a NULL here for fixed-function drivers. */
+   (void)data;
+   return NULL;
+}
+
+static void gfx_display_sdl2_blend_begin(void *data)
+{
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid)
+      return;
+   SDL_SetRenderDrawBlendMode(vid->renderer, SDL_BLENDMODE_BLEND);
+}
+
+static void gfx_display_sdl2_blend_end(void *data)
+{
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid)
+      return;
+   SDL_SetRenderDrawBlendMode(vid->renderer, SDL_BLENDMODE_NONE);
+}
+
+static void gfx_display_sdl2_scissor_begin(void *data, unsigned video_dims,
+      int x, int y, unsigned dims)
+{
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
+   unsigned width        = VIDEO_SCALE_W(dims);
+   unsigned height       = VIDEO_SCALE_H(dims);
+   SDL_Rect rect;
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid)
+      return;
+
+   /* gfx_display passes scissor rects in GL convention (origin
+    * bottom-left). SDL_RenderSetClipRect is top-left, so flip. */
+   rect.x = x;
+   rect.y = (int)video_height - y - (int)height;
+   rect.w = (int)width;
+   rect.h = (int)height;
+
+   if (rect.x < 0) { rect.w += rect.x; rect.x = 0; }
+   if (rect.y < 0) { rect.h += rect.y; rect.y = 0; }
+   if (rect.w <= 0 || rect.h <= 0)
+      return;
+
+   SDL_RenderSetClipRect(vid->renderer, &rect);
+}
+
+static void gfx_display_sdl2_scissor_end(void *data, unsigned video_dims)
+{
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   (void)video_width;
+   (void)video_height;
+   if (!vid)
+      return;
+   SDL_RenderSetClipRect(vid->renderer, NULL);
+}
+
+/* All gfx_display draws are triangle strips (see gl1's draw, which
+ * does GL_TRIANGLE_STRIP unconditionally). SDL_RenderGeometry only
+ * does triangle lists, so we expand the strip into indices on the
+ * fly. Most draws are the 4-vertex quad case; we special-case it.
+ *
+ * Two distinct call paths converge here:
+ *
+ * 1. gfx_display_draw_quad - used by widgets and most menu chrome.
+ *    Sets coords->vertex = NULL and coords->tex_coord = NULL, and
+ *    encodes the quad rectangle in the origin draw->pos and the size
+ *    VIDEO_SCALE_H(draw->dims) (pixel coords, Y already flipped to top-left
+ *    origin by the caller). gl1 handles this by substituting a
+ *    static 0..1 vertex array and calling glViewport with the rect,
+ *    but per-quad viewport changes don't make sense for SDL_Renderer
+ *    so we synthesize the four corners directly in pixel space.
+ *
+ * 2. The general path - menu drivers that build their own vertex
+ *    arrays in 0..1 normalized coords (origin bottom-left). We
+ *    scale these to video_width / video_height and flip Y to match
+ *    SDL's top-left origin.
+ *
+ * Without case 1, every widget call to gfx_display_draw_quad gets
+ * silently dropped (vertex pointer is NULL) and the entire widget
+ * system renders as nothing. */
+static bool sdl2_display_geometry_reserve(sdl2_video_t *vid,
+      size_t verts, size_t indices)
+{
+   if (verts > vid->display_verts_cap)
+   {
+      void *p = realloc(vid->display_verts, sizeof(SDL_Vertex) * verts);
+      if (!p)
+         return false;
+      vid->display_verts     = p;
+      vid->display_verts_cap = verts;
+   }
+   if (indices > vid->display_indices_cap)
+   {
+      int *p = (int*)realloc(vid->display_indices, sizeof(int) * indices);
+      if (!p)
+         return false;
+      vid->display_indices     = p;
+      vid->display_indices_cap = indices;
+   }
+   return true;
+}
+
+static void gfx_display_sdl2_draw(gfx_display_ctx_draw_t *draw,
+      void *data, unsigned video_dims)
+{
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
+   sdl2_video_t  *vid    = (sdl2_video_t*)data;
+   SDL_Vertex    *verts  = NULL;
+   int           *indices = NULL;
+   int            quad_idx[6] = { 0, 1, 2, 2, 1, 3 };
+   SDL_Texture   *tex    = NULL;
+   const float   *vtx;
+   const float   *tc;
+   const float   *col;
+   unsigned       n;
+   unsigned       i;
+   unsigned       num_idx;
+
+   if (!vid || !draw || !draw->coords)
+      return;
+
+   n = draw->coords->vertices;
+   if (n < 3)
+      return;
+
+   vtx = draw->coords->vertex;
+   tc  = draw->coords->tex_coord;
+   col = draw->coords->color;
+
+   /* The texture handle is a uintptr_t cast of an SDL_Texture*
+    * registered via sdl2_load_texture (poke->load_texture). A quad
+    * with no texture hands SDL_RenderGeometry NULL: the per-vertex
+    * colour alone, a solid fill. */
+   tex = (SDL_Texture*)(uintptr_t)draw->texture;
+
+   if (!sdl2_display_geometry_reserve(vid, n, (n > 2) ? ((n - 2) * 3) : 6))
+      return;
+   verts = (SDL_Vertex*)vid->display_verts;
+
+   /* Path 1: gfx_display_draw_quad - vtx is NULL, geometry comes
+    * from draw->pos and draw->dims with y bottom-up.  n is always 4.
+    *
+    * COORDINATE CONVENTIONS (cribbed from gdi_gfx.c, the canonical
+    * reference for a top-down-pixel target):
+    *
+    * - draw->pos / draw->dims: pixel coords, y bottom-up
+    *   (gfx_display_draw_quad pre-flips y before packing).
+    *   To put the rect at the right spot in SDL's top-down pixel
+    *   space, re-flip:
+    *      dst_y = video_height - VIDEO_SCALE_H(draw->dims)
+    *              - VIDEO_POS_Y(draw->pos)
+    *
+    * - coords->tex_coord (when non-NULL): 0..1 normalised, TOP-DOWN
+    *   (yes, opposite to the bottom-up vertex convention; this is
+    *   documented in gfx_display.c).  Used directly without flip.
+    *   When NULL we synthesise (0,0)..(1,1).
+    *
+    * Without honouring those conventions, widgets render at the top
+    * of the screen instead of the bottom (Y not flipped), and icons
+    * with sub-rect texcoords - 9-patch slices, achievement badge
+    * sprites - sample from the wrong part of the atlas. */
+   if (!vtx && n == 4)
+   {
+      float x0, x1, y0, y1;
+
+      /* The rect needed a range test here once: gfx_widgets_draw_icon's
+       * coordinate math depends on widget layout values that underflow
+       * in the first few frames after an icon loads, and the float the
+       * descriptor carried took that value as far as SDL_RenderGeometry,
+       * where it became NaN vertex positions and an SDL error that
+       * pollutes the renderer state for every draw after it. The
+       * descriptor's origin is a signed 16-bit pair now and its size an
+       * unsigned 16-bit one, so neither can hold a value this has to
+       * defend against. */
+      x0 = (float)VIDEO_POS_X(draw->pos);
+      x1 = (float)VIDEO_POS_X(draw->pos) + (float)VIDEO_SCALE_W(draw->dims);
+      /* Re-flip Y from bottom-up to SDL top-down. */
+      y0 = (float)VIDEO_POS_FLIP_Y(video_height, draw->pos, draw->dims);
+      y1 = y0 + (float)VIDEO_SCALE_H(draw->dims);
+
+      /* Apply draw->scale_factor (centred scaling around the quad's
+       * midpoint).  XMB sets this on icon draws (node->zoom) to grow
+       * the active tab icon ~2x; without honouring it every icon
+       * renders at base size and the active tab is visually
+       * indistinguishable.  Only the plain-quad path uses
+       * scale_factor; the slice path encodes scaling in
+       * coords->vertex. */
+      if (draw->scale_factor > 0.0f && draw->scale_factor != 1.0f)
+      {
+         float cx = (x0 + x1) * 0.5f;
+         float cy = (y0 + y1) * 0.5f;
+         float hw = (x1 - x0) * 0.5f * draw->scale_factor;
+         float hh = (y1 - y0) * 0.5f * draw->scale_factor;
+         x0 = cx - hw; x1 = cx + hw;
+         y0 = cy - hh; y1 = cy + hh;
+      }
+
+      /* Default texcoords cover the whole texture; tex_coord is
+       * top-down so (0,0)..(1,1) means the upper-left source pixel
+       * maps to the upper-left of the quad. */
+      {
+         float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+         if (tc)
+         {
+            /* tex_coord is 4 (u,v) pairs.  For axis-aligned quads
+             * (everything that hits this path) the bbox IS the
+             * slice, so we don't need to track per-vertex order. */
+            float min_u = tc[0], max_u = tc[0];
+            float min_v = tc[1], max_v = tc[1];
+            unsigned k;
+            for (k = 1; k < 4; k++)
+            {
+               float u = tc[k * 2 + 0];
+               float v = tc[k * 2 + 1];
+               if (u < min_u) min_u = u;
+               if (u > max_u) max_u = u;
+               if (v < min_v) min_v = v;
+               if (v > max_v) max_v = v;
+            }
+            u0 = min_u; v0 = min_v; u1 = max_u; v1 = max_v;
+         }
+
+         /* Vertex order matches gl1_menu_vertexes (the canonical
+          * triangle-strip layout used by every gfx_display caller):
+          *
+          *   vertex 0 -> (x=0, y=0) bottom-left in GL bottom-up coords
+          *   vertex 1 -> (x=1, y=0) bottom-right
+          *   vertex 2 -> (x=0, y=1) top-left
+          *   vertex 3 -> (x=1, y=1) top-right
+          *
+          * After Y is flipped to SDL's top-down screen space, vertex
+          * indices stay the same but the geometric meaning becomes:
+          *
+          *   vertex 0 -> bottom-left in screen space  (high pixel Y)
+          *   vertex 1 -> bottom-right                 (high pixel Y)
+          *   vertex 2 -> top-left                     (low  pixel Y)
+          *   vertex 3 -> top-right                    (low  pixel Y)
+          *
+          * This matters for per-vertex colour interpolation -
+          * gfx_widget_load_content_animation puts an opaque alpha on
+          * vertices 0/1 of its top-shadow gradient, expecting that
+          * pair to be the edge touching the main bar.  If we map
+          * indices 0/1 to the top edge in screen space the gradient
+          * inverts and a visible hard line appears at the bar/shadow
+          * boundary. */
+         verts[0].position.x = x0; verts[0].position.y = y1;
+         verts[0].tex_coord.x = u0; verts[0].tex_coord.y = v1;
+         verts[1].position.x = x1; verts[1].position.y = y1;
+         verts[1].tex_coord.x = u1; verts[1].tex_coord.y = v1;
+         verts[2].position.x = x0; verts[2].position.y = y0;
+         verts[2].tex_coord.x = u0; verts[2].tex_coord.y = v0;
+         verts[3].position.x = x1; verts[3].position.y = y0;
+         verts[3].tex_coord.x = u1; verts[3].tex_coord.y = v0;
+
+         /* Apply 2D rotation around the rect's centre.  Used by
+          * gfx_widgets_draw_icon for the spinning hourglass on
+          * pending tasks - draw->rotation is the angle in radians,
+          * draw->matrix_data also encodes it but rotating the four
+          * corners directly is simpler than multiplying every vertex
+          * by a 4x4.  SDL_RenderGeometry happily takes non-axis-
+          * aligned quads.
+          *
+          * Y axis flips because SDL is top-down: a positive radians
+          * value should rotate clockwise on screen (matching what
+          * gl/d3d produce after their viewport transform), which
+          * means negating sine. */
+         if (draw->rotation != 0.0f)
+         {
+            float cx  = (x0 + x1) * 0.5f;
+            float cy  = (y0 + y1) * 0.5f;
+            float c   = cosf(draw->rotation);
+            float s   = sinf(draw->rotation);
+            unsigned k;
+            for (k = 0; k < 4; k++)
+            {
+               float dx = verts[k].position.x - cx;
+               float dy = verts[k].position.y - cy;
+               verts[k].position.x = cx + dx * c + dy * s;
+               verts[k].position.y = cy - dx * s + dy * c;
+            }
+         }
+      }
+
+      for (i = 0; i < 4; i++)
+      {
+         if (col)
+         {
+            verts[i].color.r = (Uint8)(col[i * 4 + 0] * 255.0f);
+            verts[i].color.g = (Uint8)(col[i * 4 + 1] * 255.0f);
+            verts[i].color.b = (Uint8)(col[i * 4 + 2] * 255.0f);
+            verts[i].color.a = (Uint8)(col[i * 4 + 3] * 255.0f);
+         }
+         else
+         {
+            verts[i].color.r = verts[i].color.g
+                             = verts[i].color.b
+                             = verts[i].color.a = 255;
+         }
+      }
+
+      SDL_RenderGeometry(vid->renderer, tex, verts, 4, quad_idx, 6);
+      return;
+   }
+
+   /* Path 2: caller-supplied vertex array in 0..1 normalised coords
+    * (origin bottom-up).  Convert to SDL pixel coords (top-down) by
+    * scaling and flipping Y.  Texcoords are top-down already - no
+    * flip. */
+   if (!vtx)
+      return;
+
+   for (i = 0; i < n; i++)
+   {
+      float vx = vtx[i * 2 + 0];
+      float vy = vtx[i * 2 + 1];
+
+      verts[i].position.x = vx * (float)video_width;
+      verts[i].position.y = (1.0f - vy) * (float)video_height;
+
+      if (tc)
+      {
+         /* tex_coord is top-down per gfx_display.c convention; no
+          * flip.  Vertex Y was flipped above (bottom-up to top-down)
+          * but tex_coord is already in the same orientation as our
+          * SDL pixel target. */
+         verts[i].tex_coord.x = tc[i * 2 + 0];
+         verts[i].tex_coord.y = tc[i * 2 + 1];
+      }
+      else
+      {
+         verts[i].tex_coord.x = 0.0f;
+         verts[i].tex_coord.y = 0.0f;
+      }
+
+      if (col)
+      {
+         verts[i].color.r = (Uint8)(col[i * 4 + 0] * 255.0f);
+         verts[i].color.g = (Uint8)(col[i * 4 + 1] * 255.0f);
+         verts[i].color.b = (Uint8)(col[i * 4 + 2] * 255.0f);
+         verts[i].color.a = (Uint8)(col[i * 4 + 3] * 255.0f);
+      }
+      else
+      {
+         verts[i].color.r = verts[i].color.g
+                          = verts[i].color.b
+                          = verts[i].color.a = 255;
+      }
+   }
+
+   /* Quad fast path - the common case for menu items. */
+   if (n == 4)
+   {
+      SDL_RenderGeometry(vid->renderer, tex, verts, 4, quad_idx, 6);
+      return;
+   }
+
+   /* General triangle-strip expansion: n verts -> (n-2) triangles. */
+   num_idx = (n - 2) * 3;
+   indices = vid->display_indices;
+   for (i = 0; i < n - 2; i++)
+   {
+      if ((i & 1) == 0)
+      {
+         indices[i * 3 + 0] = (int)i;
+         indices[i * 3 + 1] = (int)i + 1;
+         indices[i * 3 + 2] = (int)i + 2;
+      }
+      else
+      {
+         /* Flip winding on odd triangles to keep the strip
+          * consistent (matches GL_TRIANGLE_STRIP semantics). */
+         indices[i * 3 + 0] = (int)i + 1;
+         indices[i * 3 + 1] = (int)i;
+         indices[i * 3 + 2] = (int)i + 2;
+      }
+   }
+
+   SDL_RenderGeometry(vid->renderer, tex, verts, n, indices, num_idx);
+}
+
+/* Pipeline draws (XMB ribbon, snow, snowflake, bokeh) require a
+ * programmable pipeline. SDL_Renderer does not expose one, so we
+ * leave this as a no-op - the menu still renders, just without the
+ * animated background. Documented as a feature gap. */
+static void gfx_display_sdl2_draw_pipeline(
+      gfx_display_ctx_draw_t *draw,
+      gfx_display_t *p_disp,
+      void *data,
+      unsigned video_dims)
+{
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
+   (void)draw;
+   (void)p_disp;
+   (void)data;
+   (void)video_width;
+   (void)video_height;
+}
+
+/*
+ * FONT DRIVER
+ *
+ * Submits glyph quads through SDL_RenderGeometry so menu/widget text
+ * shares the exact same vertex pipeline (and therefore the same
+ * batched blend state, scissor state, and z-ordering) as the menu
+ * quads emitted by gfx_display_sdl2_draw. The atlas is uploaded as a
+ * single RGBA SDL_Texture; we expand the 8-bit alpha buffer that
+ * font_renderer produces into RGBA so vertex colors can tint it.
+ *
+ * This is independent of the OSD font path (sdl2_init_font /
+ * sdl2_render_msg) which is used for on-screen messages drawn over
+ * the emulated framebuffer. Both can coexist.
+ */
+
+/* A line is built a chunk of glyphs at a time */
+#define SDL2_FONT_MAX_GLYPHS 256
+
+typedef struct
+{
+   sdl2_video_t                  *vid;
+   SDL_Texture                   *tex;
+   const font_renderer_driver_t  *font_driver;
+   void                          *font_data;
+   struct font_atlas             *atlas;
+   /* The atlas expanded to RGBA, the texture's source */
+   uint32_t                      *staging;
+   /* The atlas texture's pixel size, packed. */
+   unsigned                       tex_dims;
+   bool                           atlas_dirty;
+
+   /* The chunk a line is built into before it is handed over. Here
+    * rather than on the stack of the function that fills it: a glyph
+    * is four vertices and six indices, and SDL2_FONT_MAX_GLYPHS of
+    * them is past what this tree allows a frame. One font renders at
+    * a time on the thread that draws. */
+   SDL_Vertex                     verts[SDL2_FONT_MAX_GLYPHS * 4];
+   int                            idx[SDL2_FONT_MAX_GLYPHS * 6];
+} sdl2_raster_t;
+
+static void sdl2_raster_font_upload_atlas(sdl2_raster_t *font)
+{
+   unsigned x, y, x0, y0, x1, y1, tex_w, tex_h, r, rects, xy0, xy1;
+   SDL_Rect rect;
+   bool     whole = false;
+
+   if (!font || !font->atlas)
+      return;
+
+   if (  !font->tex
+       || font->tex_dims != VIDEO_SCALE_PACK(font->atlas->width,
+          font->atlas->height))
+   {
+      if (font->tex)
+      {
+         SDL_DestroyTexture(font->tex);
+         font->tex = NULL;
+      }
+
+      font->tex_dims = VIDEO_SCALE_PACK(font->atlas->width,
+            font->atlas->height);
+
+      font->tex = SDL_CreateTexture(font->vid->renderer,
+            SDL_PIXELFORMAT_ABGR8888,
+            SDL_TEXTUREACCESS_STATIC,
+            VIDEO_SCALE_W(font->tex_dims),
+            VIDEO_SCALE_H(font->tex_dims));
+      if (!font->tex)
+         return;
+
+      SDL_SetTextureBlendMode(font->tex, SDL_BLENDMODE_BLEND);
+
+      free(font->staging);
+      font->staging = (uint32_t*)malloc(
+            VIDEO_SCALE_AREA(font->tex_dims) * sizeof(uint32_t));
+      if (!font->staging)
+      {
+         SDL_DestroyTexture(font->tex);
+         font->tex = NULL;
+         return;
+      }
+      whole = true;
+   }
+
+   /* A texture just made takes all of the atlas; otherwise only the
+    * rectangles drawn into since the last upload change */
+   tex_w = VIDEO_SCALE_W(font->tex_dims);
+   tex_h = VIDEO_SCALE_H(font->tex_dims);
+   rects = (whole || font->atlas_dirty || !font->atlas->dirty)
+      ? 1 : font_atlas_dirty_rects(font->atlas);
+   for (r = 0; r < rects; r++)
+   {
+      font_atlas_dirty_rect(font->atlas, r, &xy0, &xy1);
+      x0    = VIDEO_SCALE_W(xy0);
+      y0    = VIDEO_SCALE_H(xy0);
+      x1    = VIDEO_SCALE_W(xy1);
+      y1    = VIDEO_SCALE_H(xy1);
+      if (     whole
+            || font->atlas_dirty
+            || !font->atlas->dirty
+            || x1 <= x0 || y1 <= y0 || x1 > tex_w || y1 > tex_h)
+      {
+         x0 = 0;
+         y0 = 0;
+         x1 = tex_w;
+         y1 = tex_h;
+      }
+
+      /* Atlas buffer is 8-bit alpha. Expand to white-RGB plus the alpha
+       * value so vertex color modulation produces correctly-tinted
+       * glyphs. SDL_PIXELFORMAT_ABGR8888 is byte order R,G,B,A on
+       * little-endian, packed as 0xAABBGGRR in a uint32_t. */
+      for (y = y0; y < y1; y++)
+      {
+         const uint8_t *src = font->atlas->buffer + (size_t)y * tex_w + x0;
+         uint32_t      *dst = font->staging + (size_t)y * tex_w + x0;
+         for (x = x0; x < x1; x++)
+            *dst++ = ((uint32_t)*src++ << 24) | 0x00FFFFFFu;
+      }
+
+      rect.x = (int)x0;
+      rect.y = (int)y0;
+      rect.w = (int)(x1 - x0);
+      rect.h = (int)(y1 - y0);
+      SDL_UpdateTexture(font->tex, &rect,
+            font->staging + (size_t)y0 * tex_w + x0,
+            (int)(tex_w * sizeof(uint32_t)));
+   }
+
+   font->atlas->dirty = false;
+   font->atlas_dirty  = false;
+}
+
+static void *sdl2_raster_font_init(void *data, const char *font_path,
+      float font_size, bool is_threaded)
+{
+   sdl2_raster_t *font;
+   sdl2_video_t  *vid = (sdl2_video_t*)data;
+
+   if (!vid || !vid->renderer)
+   {
+      RARCH_WARN("[SDL2] sdl2_raster_font_init: no video data or renderer "
+            "(vid=%p, renderer=%p) - widget/menu fonts will be unavailable\n",
+            (void*)vid, vid ? (void*)vid->renderer : NULL);
+      return NULL;
+   }
+
+   font = (sdl2_raster_t*)calloc(1, sizeof(*font));
+   if (!font)
+      return NULL;
+
+   font->vid = vid;
+
+   if (!font_renderer_create_default(
+            &font->font_driver, &font->font_data,
+            font_path, font_size, FONT_ATLAS_FORMAT_A8))
+   {
+      RARCH_WARN("[SDL2] sdl2_raster_font_init: font_renderer_create_default "
+            "failed for path '%s' size %.1f\n",
+            font_path ? font_path : "(default)", font_size);
+      free(font);
+      return NULL;
+   }
+
+   font->atlas = font->font_driver->get_atlas(font->font_data);
+   /* The atlas may grow, up to the largest texture the renderer takes;
+    * the upload remakes the texture when the atlas's size changes */
+   {
+      SDL_RendererInfo info;
+      if (     SDL_GetRendererInfo(vid->renderer, &info) == 0
+            && info.max_texture_width  > 0
+            && info.max_texture_height > 0)
+         font->atlas->max_dims = VIDEO_SCALE_PACK(
+               (unsigned)info.max_texture_width,
+               (unsigned)info.max_texture_height);
+   }
+   sdl2_raster_font_upload_atlas(font);
+
+   if (!font->tex)
+   {
+      RARCH_WARN("[SDL2] sdl2_raster_font_init: atlas upload failed: %s\n",
+            SDL_GetError());
+      font->font_driver->free(font->font_data);
+      free(font);
+      return NULL;
+   }
+
+   return font;
+}
+
+static void sdl2_raster_font_free(void *data, bool is_threaded)
+{
+   sdl2_raster_t *font = (sdl2_raster_t*)data;
+   if (!font)
+      return;
+   if (font->tex)
+      SDL_DestroyTexture(font->tex);
+   if (font->font_driver && font->font_data)
+      font->font_driver->free(font->font_data);
+   free(font->staging);
+   free(font);
+}
+
+static int sdl2_raster_font_get_message_width(void *data, const char *msg,
+      size_t msg_len, float scale)
+{
+   sdl2_raster_t *font = (sdl2_raster_t*)data;
+   if (!font)
+      return 0;
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
+}
+
+/* Lays the text out through gfx/font_layout.h, a line at a time, each
+ * line into SDL_RenderGeometry batches of up to SDL2_FONT_MAX_GLYPHS.
+ * params->x/y come in normalized 0..1 coordinates with the origin
+ * bottom-left, as for GL, and are turned into pixels from the top
+ * left; each later line drops by one line height. */
+static void sdl2_raster_font_render_message(
+      sdl2_raster_t *font, const char *msg, size_t msg_len, float scale,
+      const SDL_Color col, float pos_x, float pos_y,
+      enum text_alignment align, unsigned width, unsigned height)
+{
+   struct font_line_metrics *line_metrics = NULL;
+   float line_height_norm                 = 0.0f;
+   SDL_Vertex *verts                      = font->verts;
+   int        *idx                        = font->idx;
+   int         n_glyphs                   = 0;
+   bool        line_ok                    = false;
+   float       x                          = 0.0f;
+   float       y                          = 0.0f;
+   float       inv_w                      = 0.0f;
+   float       inv_h                      = 0.0f;
+   const struct font_glyph* (*get_glyph)(void*, uint32_t)
+                                          = font->font_driver->get_glyph;
+   void       *font_data                  = font->font_data;
+   const struct font_glyph *glyph_q       = NULL;
+
+   if (font->font_driver->get_line_metrics)
+   {
+      font->font_driver->get_line_metrics(font->font_data, &line_metrics);
+      if (line_metrics && height > 0)
+         line_height_norm = (float)line_metrics->height * scale
+                          / (float)height;
+   }
+
+   /* Looked up before the layout: a right or centred line is measured
+    * before its first glyph is drawn, and the stand-in counts there */
+   glyph_q = get_glyph(font_data, '?');
+
+#define FONT_LAYOUT_ALIGNED (align == TEXT_ALIGN_RIGHT \
+      || align == TEXT_ALIGN_CENTER)
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+   do \
+   { \
+      (void)(count); \
+      line_ok = ((bytes) > 0 && font->tex); \
+      if (!line_ok) \
+         break; \
+      if (font->atlas_dirty || font->atlas->dirty) \
+         sdl2_raster_font_upload_atlas(font); \
+      x = pos_x * (float)width; \
+      y = (1.0f - (pos_y - (float)(line) * line_height_norm)) \
+         * (float)height; \
+      if (align == TEXT_ALIGN_RIGHT) \
+         x -= (int)((float)(line_width) * scale); \
+      else if (align == TEXT_ALIGN_CENTER) \
+         x -= (int)((float)(line_width) * scale) * 0.5f; \
+      inv_w = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims); \
+      inv_h = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims); \
+      n_glyphs = 0; \
+   } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+   do \
+   { \
+      float gx, gy, gw, gh, u0, v0, u1, v1; \
+      int   base; \
+      /* This driver keeps its own pen, in floating point */ \
+      (void)(pen_x); \
+      (void)(pen_y); \
+      if (!line_ok) \
+         break; \
+      gx = x + (glyph)->draw_offset_x * scale; \
+      gy = y + (glyph)->draw_offset_y * scale; \
+      gw = VIDEO_SCALE_W((glyph)->dims) * scale; \
+      gh = VIDEO_SCALE_H((glyph)->dims) * scale; \
+      u0 = (float)VIDEO_SCALE_W((glyph)->atlas_pos) * inv_w; \
+      v0 = (float)VIDEO_SCALE_H((glyph)->atlas_pos) * inv_h; \
+      u1 = u0 + (float)VIDEO_SCALE_W((glyph)->dims) * inv_w; \
+      v1 = v0 + (float)VIDEO_SCALE_H((glyph)->dims) * inv_h; \
+      base = n_glyphs * 4; \
+      verts[base + 0].position.x  = gx; \
+      verts[base + 0].position.y  = gy; \
+      verts[base + 0].tex_coord.x = u0; \
+      verts[base + 0].tex_coord.y = v0; \
+      verts[base + 0].color       = col; \
+      verts[base + 1].position.x  = gx + gw; \
+      verts[base + 1].position.y  = gy; \
+      verts[base + 1].tex_coord.x = u1; \
+      verts[base + 1].tex_coord.y = v0; \
+      verts[base + 1].color       = col; \
+      verts[base + 2].position.x  = gx; \
+      verts[base + 2].position.y  = gy + gh; \
+      verts[base + 2].tex_coord.x = u0; \
+      verts[base + 2].tex_coord.y = v1; \
+      verts[base + 2].color       = col; \
+      verts[base + 3].position.x  = gx + gw; \
+      verts[base + 3].position.y  = gy + gh; \
+      verts[base + 3].tex_coord.x = u1; \
+      verts[base + 3].tex_coord.y = v1; \
+      verts[base + 3].color       = col; \
+      idx[n_glyphs * 6 + 0] = base + 0; \
+      idx[n_glyphs * 6 + 1] = base + 1; \
+      idx[n_glyphs * 6 + 2] = base + 2; \
+      idx[n_glyphs * 6 + 3] = base + 2; \
+      idx[n_glyphs * 6 + 4] = base + 1; \
+      idx[n_glyphs * 6 + 5] = base + 3; \
+      x += (glyph)->advance_x * scale; \
+      if (++n_glyphs >= SDL2_FONT_MAX_GLYPHS) \
+      { \
+         SDL_RenderGeometry(font->vid->renderer, font->tex, \
+               verts, n_glyphs * 4, idx, n_glyphs * 6); \
+         n_glyphs = 0; \
+      } \
+   } while (0)
+#define FONT_LAYOUT_LINE_END() \
+   do \
+   { \
+      if (line_ok && n_glyphs > 0) \
+         SDL_RenderGeometry(font->vid->renderer, font->tex, \
+               verts, n_glyphs * 4, idx, n_glyphs * 6); \
+      n_glyphs = 0; \
+   } while (0)
+#include "../font_layout.h"
+#undef SDL2_FONT_MAX_GLYPHS
+}
+
+static void sdl2_raster_font_render_msg(
+      void *userdata,
+      void *data,
+      const char *msg, size_t msg_len,
+      const struct font_params *params)
+{
+   font_params_resolved_t rp;
+   sdl2_raster_t *font = (sdl2_raster_t*)data;
+   sdl2_video_t  *vid  = (sdl2_video_t*)userdata;
+   SDL_Color      col;
+   SDL_Color      col_drop;
+   float          x, y, scale;
+   int            drop_x, drop_y;
+   float          drop_mod, drop_alpha;
+   enum text_alignment align = TEXT_ALIGN_LEFT;
+   unsigned       width;
+   unsigned       height;
+
+   if (!font || !msg || !*msg || !vid)
+      return;
+
+   /* Asked for before anything is laid out: it may have grown, which
+    * marks it dirty, and each line's upload remakes the texture at its
+    * size before its texture coordinates are taken */
+   if (font->font_driver && font->font_data)
+      font->atlas = font->font_driver->get_atlas(font->font_data);
+
+   width  = VIDEO_SCALE_W(vid->vp.full_dims)  ? VIDEO_SCALE_W(vid->vp.full_dims)  : VIDEO_SCALE_W(vid->video.dims);
+   height = VIDEO_SCALE_H(vid->vp.full_dims) ? VIDEO_SCALE_H(vid->vp.full_dims) : VIDEO_SCALE_H(vid->video.dims);
+   if (!width || !height)
+   {
+      /* viewport not set up yet (very early frames) - skip rather
+       * than divide by zero downstream. */
+      return;
+   }
+
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   align      = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   col.r      = rp.rgba[0];
+   col.g      = rp.rgba[1];
+   col.b      = rp.rgba[2];
+   col.a      = rp.rgba[3];
+   if (col.a == 0)
+      col.a   = 255;
+
+
+   if (drop_x || drop_y)
+   {
+      col_drop.r = (Uint8)(col.r * drop_mod);
+      col_drop.g = (Uint8)(col.g * drop_mod);
+      col_drop.b = (Uint8)(col.b * drop_mod);
+      col_drop.a = (Uint8)(col.a * drop_alpha);
+
+      sdl2_raster_font_render_message(font, msg, msg_len, scale,
+            col_drop,
+            x + scale * drop_x / (float)width,
+            y + scale * drop_y / (float)height,
+            align, width, height);
+   }
+
+   sdl2_raster_font_render_message(font, msg, msg_len, scale,
+         col,
+         x, y, align, width, height);
+}
+
+static const struct font_glyph *sdl2_raster_font_get_glyph(
+      void *data, uint32_t code)
+{
+   sdl2_raster_t *font = (sdl2_raster_t*)data;
+   if (font && font->font_driver)
+      return font->font_driver->get_glyph(font->font_data, code);
+   return NULL;
+}
+
+static bool sdl2_raster_font_get_line_metrics(void *data,
+      struct font_line_metrics **metrics)
+{
+   sdl2_raster_t *font = (sdl2_raster_t*)data;
+   if (font && font->font_driver && font->font_data)
+   {
+      font->font_driver->get_line_metrics(font->font_data, metrics);
+      return true;
+   }
+   return false;
+}
+
+static font_renderer_t sdl2_raster_font = {
+   sdl2_raster_font_init,
+   sdl2_raster_font_free,
+   sdl2_raster_font_render_msg,
+   "sdl2",
+   sdl2_raster_font_get_glyph,
+   NULL, /* bind_block  - no batched render-block support yet  */
+   NULL, /* flush_block - widgets/menu work without it         */
+   sdl2_raster_font_get_message_width,
+   sdl2_raster_font_get_line_metrics
+};
+
+#endif /* SDL_VERSION_ATLEAST(2, 0, 18) */
+
+#ifdef HAVE_OVERLAY
+/*
+ * INPUT OVERLAY DRIVER
+ *
+ * Implements video_overlay_interface_t for SDL2.  The overlay
+ * subsystem (input/input_overlay.c) hands us BGRA32 RGBA images
+ * via load(), tells us where they go in 0..1 normalised space via
+ * vertex_geom() / tex_geom(), and we draw them on top of the game
+ * frame each frame using SDL_RenderCopy with per-texture alpha
+ * modulation.
+ *
+ * Storage: each loaded overlay is uploaded once into a streaming
+ * SDL_Texture at load time, then redrawn every frame from that
+ * texture.  Mirrors the per-load static-texture pattern d3d8 / d3d9
+ * use.
+ *
+ * Coordinate conventions (matching d3d8/d3d9/gl):
+ *   - vert_coords[0..3] = (x, y, w, h) in 0..1 normalised space.
+ *     The setter flips y to (1.0f - y) and negates h, the same
+ *     adjustment d3d8 makes for D3D's y-up convention.  We undo
+ *     that flip at render time so the overlay lands the right way
+ *     up in SDL's y-down space.
+ *   - tex_coords[0..3] = (x, y, w, h) in 0..1 texture space.
+ *     Used to sub-rect the source texture - typical touch overlays
+ *     pack many buttons into one atlas, then split via tex_geom().
+ *   - fullscreen=true: vert_coords span the entire window, including
+ *     letterbox/pillarbox bars.  Touch overlays use this so the
+ *     buttons keep working when the game is letterboxed.
+ *   - fullscreen=false: vert_coords span only the game viewport.
+ */
+static void sdl2_overlay_free(sdl2_video_t *vid)
+{
+   unsigned i;
+   if (!vid || !vid->overlays)
+      return;
+   if (!vid->overlays_borrowed)
+      for (i = 0; i < vid->overlays_size; i++)
+      {
+         if (vid->overlays[i].tex)
+            SDL_DestroyTexture(vid->overlays[i].tex);
+      }
+   free(vid->overlays);
+   vid->overlays          = NULL;
+   vid->overlays_size     = 0;
+   vid->overlays_borrowed = false;
+}
+
+static void sdl2_overlay_defaults(struct sdl2_overlay *o,
+      SDL_Texture *tex, unsigned w, unsigned h)
+{
+   o->tex            = tex;
+   o->tex_w          = w;
+   o->tex_h          = h;
+   o->alpha_mod      = 1.0f;
+   o->fullscreen     = false;
+   /* Default to whole-texture / whole-target until vertex_geom
+    * and tex_geom set the real values. */
+   o->tex_coords[0]  = 0.0f;
+   o->tex_coords[1]  = 0.0f;
+   o->tex_coords[2]  = 1.0f;
+   o->tex_coords[3]  = 1.0f;
+   o->vert_coords[0] = 0.0f;
+   o->vert_coords[1] = 0.0f;
+   o->vert_coords[2] = 1.0f;
+   o->vert_coords[3] = 1.0f;
+}
+
+static bool sdl2_overlay_load(void *data,
+      const void *image_data, unsigned num_images)
+{
+   unsigned i;
+   sdl2_video_t                *vid  = (sdl2_video_t*)data;
+   const struct texture_image  *imgs = (const struct texture_image*)image_data;
+
+   if (!vid)
+      return false;
+
+   /* Drop any prior overlay set first.  load() is the install
+    * point - input_overlay.c calls it once per overlay activation
+    * with the full image array, never incrementally. */
+   sdl2_overlay_free(vid);
+
+   if (num_images == 0 || !imgs)
+      return true;
+
+   vid->overlays = (struct sdl2_overlay*)calloc(num_images,
+         sizeof(*vid->overlays));
+   if (!vid->overlays)
+      return false;
+   vid->overlays_size = num_images;
+
+   for (i = 0; i < num_images; i++)
+   {
+      SDL_Texture *tex;
+      struct sdl2_overlay *o = &vid->overlays[i];
+      unsigned             w = imgs[i].width;
+      unsigned             h = imgs[i].height;
+
+      if (w == 0 || h == 0 || !imgs[i].pixels)
+         continue;
+
+      /* Static so we can SDL_UpdateTexture once at load time;
+       * source pixels are 0xAARRGGBB in memory order, which on
+       * little-endian maps to SDL_PIXELFORMAT_ARGB8888. */
+      tex = SDL_CreateTexture(vid->renderer,
+            SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STATIC,
+            (int)w, (int)h);
+      if (!tex)
+         continue;
+
+      SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+      SDL_UpdateTexture(tex, NULL, imgs[i].pixels, (int)(w * 4));
+
+      sdl2_overlay_defaults(o, tex, w, h);
+   }
+
+   return true;
+}
+
+static bool sdl2_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+
+   if (!vid)
+      return false;
+
+   sdl2_overlay_free(vid);
+
+   if (num_textures == 0 || !textures)
+      return true;
+
+   if (!(vid->overlays = (struct sdl2_overlay*)calloc(num_textures,
+         sizeof(*vid->overlays))))
+      return false;
+   vid->overlays_size     = num_textures;
+   vid->overlays_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      int w = 0, h = 0;
+      SDL_Texture *tex = (SDL_Texture*)textures[i];
+      if (!tex || SDL_QueryTexture(tex, NULL, NULL, &w, &h) != 0)
+         continue;
+      sdl2_overlay_defaults(&vid->overlays[i], tex,
+            (unsigned)w, (unsigned)h);
+   }
+
+   return true;
+}
+
+static void sdl2_overlay_tex_geom(void *data, unsigned index,
+      float x, float y, float w, float h)
+{
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid || index >= vid->overlays_size)
+      return;
+   vid->overlays[index].tex_coords[0] = x;
+   vid->overlays[index].tex_coords[1] = y;
+   vid->overlays[index].tex_coords[2] = w;
+   vid->overlays[index].tex_coords[3] = h;
+}
+
+static void sdl2_overlay_vertex_geom(void *data, unsigned index,
+      float x, float y, float w, float h)
+{
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid || index >= vid->overlays_size)
+      return;
+   /* Overlay descriptor coordinates from input_overlay are already
+    * y-down (y=0 top of screen, y=1 bottom — same convention as
+    * RETRO_DEVICE_POINTER which the hit-test path uses) and (x, y)
+    * names the top-left corner of the rect.  SDL2's render space
+    * (SDL_RenderCopy with y-down SDL_Rect) is also y-down with the
+    * same origin, so we store the values verbatim and the render
+    * path does a direct multiply.
+    *
+    * d3d8 / d3d9 / gl all flip y here (y = 1.0f - y; h = -h;)
+    * because their pipelines emit vertices in y-up clip space and
+    * rely on the viewport transform to flip back to screen.  SDL's
+    * high-level render API has no such pipeline - SDL_RenderCopy
+    * blits straight to pixel space - so the flip is a bug for us,
+    * not a compatibility shim.  Mirrors gdi_overlay_vertex_geom for
+    * the same reason. */
+   vid->overlays[index].vert_coords[0] = x;
+   vid->overlays[index].vert_coords[1] = y;
+   vid->overlays[index].vert_coords[2] = w;
+   vid->overlays[index].vert_coords[3] = h;
+}
+
+static void sdl2_overlay_enable(void *data, bool state)
+{
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid)
+      return;
+   vid->overlays_enabled = state;
+}
+
+static void sdl2_overlay_full_screen(void *data, bool enable)
+{
+   unsigned i;
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid || !vid->overlays)
+      return;
+   for (i = 0; i < vid->overlays_size; i++)
+      vid->overlays[i].fullscreen = enable;
+}
+
+static void sdl2_overlay_set_alpha(void *data, unsigned index, float mod)
+{
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   if (!vid || index >= vid->overlays_size)
+      return;
+   vid->overlays[index].alpha_mod = mod;
+}
+
+/* Render every enabled overlay with the current SDL_Renderer.
+ * Caller is responsible for setting an appropriate viewport before
+ * calling - typically the full-window viewport so fullscreen
+ * overlays cover the entire output, with non-fullscreen overlays
+ * placed in window-relative coords by the caller's choice of
+ * base_x/base_y/base_w/base_h. */
+static void sdl2_overlays_render(sdl2_video_t *vid)
+{
+   unsigned i;
+
+   if (!vid || !vid->overlays || !vid->overlays_enabled)
+      return;
+
+   for (i = 0; i < vid->overlays_size; i++)
+   {
+      SDL_Rect dst;
+      struct sdl2_overlay *o = &vid->overlays[i];
+      float vx, vy, vw, vh;
+      int   base_x, base_y;
+      unsigned base_w, base_h;
+      Uint8 alpha_byte;
+
+      if (!o->tex || o->tex_w == 0 || o->tex_h == 0)
+         continue;
+      if (o->alpha_mod <= 0.0f)
+         continue;
+
+      /* vert_coords are stored verbatim in y-down 0..1 space with
+       * (x, y) = top-left corner of the rect, so a straight multiply
+       * by base_w/base_h gives the destination rect in pixel coords
+       * (no flip).  See sdl2_overlay_vertex_geom for the rationale. */
+      vx = o->vert_coords[0];
+      vy = o->vert_coords[1];
+      vw = o->vert_coords[2];
+      vh = o->vert_coords[3];
+
+      if (o->fullscreen)
+      {
+         base_x = 0;
+         base_y = 0;
+         base_w = VIDEO_SCALE_W(vid->vp.full_dims);
+         base_h = VIDEO_SCALE_H(vid->vp.full_dims);
+      }
+      else
+      {
+         base_x = (int)VIDEO_POS_X(vid->vp.pos);
+         base_y = (int)VIDEO_POS_Y(vid->vp.pos);
+         base_w = VIDEO_SCALE_W(vid->vp.dims);
+         base_h = VIDEO_SCALE_H(vid->vp.dims);
+      }
+
+      dst.x = base_x + (int)(vx * (float)base_w);
+      dst.y = base_y + (int)(vy * (float)base_h);
+      dst.w =          (int)(vw * (float)base_w);
+      dst.h =          (int)(vh * (float)base_h);
+
+      if (dst.w <= 0 || dst.h <= 0)
+         continue;
+
+      alpha_byte = (Uint8)VIDEO_ALPHA_BYTE(o->alpha_mod);
+      SDL_SetTextureAlphaMod(o->tex, alpha_byte);
+
+      /* tex_coords sub-rect into the source texture.  Most touch
+       * overlays use the full image (0,0,1,1) but atlases need this
+       * to pick the right button. */
+      {
+         SDL_Rect src;
+         src.x = (int)(o->tex_coords[0] * (float)o->tex_w);
+         src.y = (int)(o->tex_coords[1] * (float)o->tex_h);
+         src.w = (int)(o->tex_coords[2] * (float)o->tex_w);
+         src.h = (int)(o->tex_coords[3] * (float)o->tex_h);
+         if (src.w <= 0 || src.h <= 0)
+         {
+            src.x = 0; src.y = 0;
+            src.w = (int)o->tex_w; src.h = (int)o->tex_h;
+         }
+         SDL_RenderCopy(vid->renderer, o->tex, &src, &dst);
+      }
+   }
+}
+
+static const video_overlay_interface_t sdl2_overlay_iface = {
+   sdl2_overlay_enable,
+   sdl2_overlay_load,
+   sdl2_overlay_load_textures,
+   sdl2_overlay_tex_geom,
+   sdl2_overlay_vertex_geom,
+   sdl2_overlay_full_screen,
+   sdl2_overlay_set_alpha
+};
+
+static void sdl2_get_overlay_interface(void *data,
+      const video_overlay_interface_t **iface)
+{
+   (void)data;
+   *iface = &sdl2_overlay_iface;
+}
+#endif /* HAVE_OVERLAY */
+
+/* Keeps the pointer in this driver's window, or lets it go: for the SDL2
+ * input driver, which has no window of its own. Nothing happens when
+ * this is not the video driver in use. */
+void sdl2_video_grab_window(bool state)
+{
+   sdl2_video_t *vid;
+
+   if (string_is_not_equal(video_driver_get_ident(), "sdl2"))
+      return;
+
+   if ((vid = (sdl2_video_t*)video_driver_get_ptr()))
+      SDL_SetWindowGrab(vid->window, state ? SDL_TRUE : SDL_FALSE);
 }
 
 video_driver_t video_sdl2 = {
@@ -698,13 +2964,48 @@ video_driver_t video_sdl2 = {
    sdl2_gfx_set_rotation,
    sdl2_gfx_viewport_info,
    sdl2_gfx_read_viewport,
-   NULL, /* read_frame_raw */
 #ifdef HAVE_OVERLAY
-   NULL, /* get_overlay_interface */
+   sdl2_get_overlay_interface,
 #endif
    sdl2_gfx_poke_interface,
    NULL, /* wrap_type_to_enum */
+   NULL, /* shader_load_begin */
+   NULL, /* shader_load_step */
 #ifdef HAVE_GFX_WIDGETS
-   NULL  /* gfx_widgets_enabled */
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+   sdl2_gfx_widgets_enabled,
+#else
+   NULL,  /* widgets need SDL_RenderGeometry */
 #endif
+#endif
+   NULL, /* invalidate_hw_render_cache */
+   NULL, /* read_viewport_hdr */
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+   &sdl2_raster_font,
+#else
+   NULL, /* sdl2_raster_font needs SDL_RenderGeometry */
+#endif
+#ifdef HAVE_OPENXR
+   NULL, /* set_vr_content_info */
+#endif
+   sdl2_gfx_read_viewport_bgrx
 };
+
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+gfx_display_ctx_driver_t gfx_display_ctx_sdl2 = {
+   gfx_display_sdl2_draw,
+   gfx_display_sdl2_draw_pipeline,
+   gfx_display_sdl2_blend_begin,
+   gfx_display_sdl2_blend_end,
+   gfx_display_sdl2_get_default_mvp,
+   NULL, /* get_default_vertices */
+   NULL, /* get_default_tex_coords */
+   &sdl2_raster_font,
+   GFX_VIDEO_DRIVER_SDL2,
+   "sdl2",
+   false,
+   true,
+   gfx_display_sdl2_scissor_begin,
+   gfx_display_sdl2_scissor_end
+};
+#endif

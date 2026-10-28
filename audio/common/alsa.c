@@ -17,12 +17,63 @@
 #include <string/stdstring.h>
 
 #include <alsa/asoundlib.h>
-#include <asm-generic/errno.h>
 
 #include "alsa.h"
 
 #include "../audio_driver.h"
+#include "../../configuration.h"
 #include "../../verbosity.h"
+
+/* ALSA's own order for a count, which a PCM without a channel map
+ * follows: the surround40, surround51 and surround71 devices'. */
+static const uint32_t *alsa_default_positions(unsigned channels)
+{
+   static const uint32_t pos[8] = {
+      AUDIO_SPEAKER_FRONT_LEFT, AUDIO_SPEAKER_FRONT_RIGHT,
+      AUDIO_SPEAKER_BACK_LEFT,  AUDIO_SPEAKER_BACK_RIGHT,
+      AUDIO_SPEAKER_FRONT_CENTER, AUDIO_SPEAKER_LOW_FREQUENCY,
+      AUDIO_SPEAKER_SIDE_LEFT,  AUDIO_SPEAKER_SIDE_RIGHT };
+   return (channels == 4 || channels == 6 || channels == 8) ? pos : NULL;
+}
+
+/* The device's channel map as AUDIO_SPEAKER_ positions, in the order
+ * the device takes them. False when the map is unknown, the wrong
+ * length, or has a position the frontend has no bit for. */
+static bool alsa_positions_of_chmap(snd_pcm_t *pcm, unsigned channels,
+      uint32_t *pos)
+{
+   snd_pcm_chmap_t *map = snd_pcm_get_chmap(pcm);
+   unsigned i;
+   if (!map)
+      return false;
+   if (map->channels != channels || channels > AUDIO_LAYOUT_ORDER_MAX)
+   {
+      free(map);
+      return false;
+   }
+   for (i = 0; i < map->channels; i++)
+   {
+      switch (map->pos[i])
+      {
+         case SND_CHMAP_FL:  pos[i] = AUDIO_SPEAKER_FRONT_LEFT;    break;
+         case SND_CHMAP_FR:  pos[i] = AUDIO_SPEAKER_FRONT_RIGHT;   break;
+         case SND_CHMAP_FC:  pos[i] = AUDIO_SPEAKER_FRONT_CENTER;  break;
+         case SND_CHMAP_LFE: pos[i] = AUDIO_SPEAKER_LOW_FREQUENCY; break;
+         case SND_CHMAP_RL:  pos[i] = AUDIO_SPEAKER_BACK_LEFT;     break;
+         case SND_CHMAP_RR:  pos[i] = AUDIO_SPEAKER_BACK_RIGHT;    break;
+         case SND_CHMAP_RC:  pos[i] = AUDIO_SPEAKER_BACK_CENTER;   break;
+         case SND_CHMAP_SL:  pos[i] = AUDIO_SPEAKER_SIDE_LEFT;     break;
+         case SND_CHMAP_SR:  pos[i] = AUDIO_SPEAKER_SIDE_RIGHT;    break;
+         case SND_CHMAP_FLC: pos[i] = AUDIO_SPEAKER_FRONT_LEFT_OF_CENTER;  break;
+         case SND_CHMAP_FRC: pos[i] = AUDIO_SPEAKER_FRONT_RIGHT_OF_CENTER; break;
+         default:
+            free(map);
+            return false;
+      }
+   }
+   free(map);
+   return true;
+}
 
 int alsa_init_pcm(snd_pcm_t **pcm,
    const char* device,
@@ -35,20 +86,20 @@ int alsa_init_pcm(snd_pcm_t **pcm,
    int mode)
 {
    snd_pcm_format_t format;
+   snd_pcm_access_t access;
    snd_pcm_uframes_t buffer_size;
    snd_pcm_hw_params_t *params    = NULL;
    snd_pcm_sw_params_t *sw_params = NULL;
    unsigned latency_usec          = latency * 1000;
    unsigned periods               = 4;
-   unsigned orig_rate             = rate;
    const char *alsa_dev           = device ? device : "default";
    int errnum                     = 0;
 
-   RARCH_DBG("[ALSA]: Requesting device \"%s\" for %s stream\n", alsa_dev, snd_pcm_stream_name(stream));
+   RARCH_DBG("[ALSA] Requesting device \"%s\" for %s stream...\n", alsa_dev, snd_pcm_stream_name(stream));
 
    if ((errnum = snd_pcm_open(pcm, alsa_dev, stream, mode)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to open %s stream on device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to open %s stream on device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             alsa_dev,
             snd_strerror(errnum));
@@ -58,7 +109,7 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
    if ((errnum = snd_pcm_hw_params_malloc(&params)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to allocate hardware parameters: %s\n",
+      RARCH_ERR("[ALSA] Failed to allocate hardware parameters: %s.\n",
             snd_strerror(errnum));
 
       goto error;
@@ -66,7 +117,7 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
    if ((errnum = snd_pcm_hw_params_any(*pcm, params)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to query hardware parameters from %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to query hardware parameters from %s device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
@@ -74,31 +125,56 @@ int alsa_init_pcm(snd_pcm_t **pcm,
       goto error;
    }
 
-   format = (snd_pcm_hw_params_test_format(*pcm, params, SND_PCM_FORMAT_FLOAT) == 0)
-         ? SND_PCM_FORMAT_FLOAT : SND_PCM_FORMAT_S16;
+   /* Honour the audio format-negotiation hint for both directions: 'Int16'
+    * skips the float request and uses S16 directly. Capture wants this as
+    * much as playback does - the libretro microphone interface is int16
+    * only, so a float capture stream is converted back to int16 before the
+    * core ever sees it. Either way we fall back to S16 if float is
+    * unavailable. */
+   if (     config_get_ptr()->uints.audio_format_negotiation
+               == AUDIO_FORMAT_NEGOTIATION_INT16)
+      format = SND_PCM_FORMAT_S16;
+   else
+      format = (snd_pcm_hw_params_test_format(*pcm, params, SND_PCM_FORMAT_FLOAT) == 0)
+            ? SND_PCM_FORMAT_FLOAT : SND_PCM_FORMAT_S16;
    stream_info->has_float = (format == SND_PCM_FORMAT_FLOAT);
 
-   RARCH_LOG("[ALSA]: Using %s sample format for %s device \"%s\"\n",
+   RARCH_LOG("[ALSA] Using %s sample format for %s device \"%s\".\n",
          snd_pcm_format_name(format),
          snd_pcm_stream_name(stream),
          snd_pcm_name(*pcm)
    );
 
-   if ((errnum = snd_pcm_hw_params_set_access(*pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0)
+   /* Playback for the threaded pipeline opens hw and plug PCMs for
+    * mmap, so the driver can lend their buffer. An ioplug or extplug
+    * PCM - PulseAudio's or PipeWire's - only emulates mmap, and
+    * lending it adds the copy it was meant to remove. */
+   access            = SND_PCM_ACCESS_RW_INTERLEAVED;
+   stream_info->mmap = false;
+#ifdef HAVE_THREADS
+   if (     stream == SND_PCM_STREAM_PLAYBACK
+         && config_get_ptr()->bools.audio_threaded_pipeline
+         && (   snd_pcm_type(*pcm) == SND_PCM_TYPE_HW
+             || snd_pcm_type(*pcm) == SND_PCM_TYPE_PLUG)
+         && snd_pcm_hw_params_test_access(*pcm, params,
+               SND_PCM_ACCESS_MMAP_INTERLEAVED) == 0)
+      access = SND_PCM_ACCESS_MMAP_INTERLEAVED;
+#endif
+
+   if ((errnum = snd_pcm_hw_params_set_access(*pcm, params, access)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to set %s access for %s device \"%s\": %s\n",
-            snd_pcm_access_name(SND_PCM_ACCESS_RW_INTERLEAVED),
+      RARCH_ERR("[ALSA] Failed to set %s access for %s device \"%s\": %s.\n",
+            snd_pcm_access_name(access),
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
 
       goto error;
    }
-   stream_info->frame_bits = snd_pcm_format_physical_width(format) * channels;
 
    if ((errnum = snd_pcm_hw_params_set_format(*pcm, params, format)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to set %s format for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to set %s format for %s device \"%s\": %s.\n",
             snd_pcm_format_name(format),
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
@@ -107,9 +183,30 @@ int alsa_init_pcm(snd_pcm_t **pcm,
       goto error;
    }
 
-   if ((errnum = snd_pcm_hw_params_set_channels(*pcm, params, channels)) < 0)
+   /* A wider count than stereo is a request: a device that will not
+    * take it gets the next narrower of 6 and 4 it does take, else
+    * stereo, and the caller learns the count from
+    * stream_info->channels. Stereo itself is required. */
+   if (channels > 2)
    {
-      RARCH_ERR("[ALSA]: Failed to set %u-channel audio for %s device \"%s\": %s\n",
+      unsigned want = channels;
+      while (channels > 2
+            && snd_pcm_hw_params_test_channels(*pcm, params, channels) < 0)
+         channels = (channels > 6) ? 6 : (channels > 4) ? 4 : 2;
+      if (     channels > 2
+            && (errnum = snd_pcm_hw_params_set_channels(*pcm, params, channels)) < 0)
+         channels = 2;
+      if (channels != want)
+         RARCH_WARN("[ALSA] %s device \"%s\" would not open with %u channels; opening %u.\n",
+               snd_pcm_stream_name(stream),
+               snd_pcm_name(*pcm),
+               want,
+               channels);
+   }
+   if (channels <= 2
+         && (errnum = snd_pcm_hw_params_set_channels(*pcm, params, channels)) < 0)
+   {
+      RARCH_ERR("[ALSA] Failed to set %u-channel audio for %s device \"%s\": %s.\n",
             channels,
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
@@ -117,11 +214,15 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
       goto error;
    }
+   stream_info->frame_bits = snd_pcm_format_physical_width(format) * channels;
+   stream_info->channels   = channels;
+   stream_info->layout     = 0;
+   stream_info->permute    = false;
 
    /* Don't allow rate resampling when probing for the default rate (but ignore if this call fails) */
    if ((errnum = snd_pcm_hw_params_set_rate_resample(*pcm, params, false)) < 0)
    {
-      RARCH_WARN("[ALSA]: Failed to request a default unsampled rate for %s device \"%s\": %s\n",
+      RARCH_WARN("[ALSA] Failed to request a default unsampled rate for %s device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
@@ -129,7 +230,7 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
    if ((errnum = snd_pcm_hw_params_set_rate_near(*pcm, params, &rate, 0)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to request a rate near %uHz for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to request a rate near %uHz for %s device \"%s\": %s.\n",
             rate,
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
@@ -138,12 +239,14 @@ int alsa_init_pcm(snd_pcm_t **pcm,
       goto error;
    }
 
+   stream_info->rate = rate;
+
    if (new_rate)
       *new_rate = rate;
 
    if ((snd_pcm_hw_params_set_buffer_time_near(*pcm, params, &latency_usec, NULL)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to request a buffer time near %uus for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to request a buffer time near %uus for %s device \"%s\": %s.\n",
             latency_usec,
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
@@ -155,7 +258,7 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
    if ((errnum = snd_pcm_hw_params_set_periods_near(*pcm, params, &periods, NULL)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to request %u periods per buffer for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to request %u periods per buffer for %s device \"%s\": %s.\n",
             periods,
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
@@ -166,27 +269,56 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
    if ((errnum = snd_pcm_hw_params(*pcm, params)) < 0)
    { /* This calls snd_pcm_prepare() under the hood */
-      RARCH_ERR("[ALSA]: Failed to install hardware parameters for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to install hardware parameters for %s device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
 
       goto error;
+   }
+
+   /* Wider than stereo: what the device says its channels are, in
+    * its order, or ALSA's order for the count where it says nothing.
+    * The driver permutes the frontend's frames into that order. */
+   if (channels > 2)
+   {
+      uint32_t        map[AUDIO_LAYOUT_ORDER_MAX];
+      const uint32_t *pos      = map;
+      bool            from_map = alsa_positions_of_chmap(*pcm, channels, map);
+      bool            identity = true;
+      if (!from_map)
+         pos = alsa_default_positions(channels);
+      if (pos && audio_layout_order(pos, channels, &stream_info->layout,
+               stream_info->order, &identity))
+      {
+         stream_info->permute = !identity;
+         RARCH_LOG("[ALSA] %s device \"%s\" opened with %u channels, layout 0x%03x from %s%s.\n",
+               snd_pcm_stream_name(stream), snd_pcm_name(*pcm), channels,
+               stream_info->layout,
+               from_map ? "its channel map" : "ALSA's default order",
+               identity ? "" : ", permuted from the frontend's order");
+      }
+      else
+      {
+         stream_info->layout = 0;
+         RARCH_LOG("[ALSA] %s device \"%s\" opened with %u channels; no usable channel map, the requested layout is assumed.\n",
+               snd_pcm_stream_name(stream), snd_pcm_name(*pcm), channels);
+      }
    }
 
    /* Shouldn't have to bother with this,
     * but some drivers are apparently broken. */
    if ((errnum = snd_pcm_hw_params_get_period_size(params, &stream_info->period_frames, NULL)) < 0)
    {
-      RARCH_WARN("[ALSA]: Failed to get an exact period size from %s device \"%s\": %s\n",
+      RARCH_WARN("[ALSA] Failed to get an exact period size from %s device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
-      RARCH_WARN("[ALSA]: Trying the minimum period size instead\n");
+      RARCH_WARN("[ALSA] Trying the minimum period size instead.\n");
 
       if ((errnum = snd_pcm_hw_params_get_period_size_min(params, &stream_info->period_frames, NULL)) < 0)
       {
-         RARCH_ERR("[ALSA]: Failed to get min period size from %s device \"%s\": %s\n",
+         RARCH_ERR("[ALSA] Failed to get min period size from %s device \"%s\": %s.\n",
                snd_pcm_stream_name(stream),
                snd_pcm_name(*pcm),
                snd_strerror(errnum));
@@ -194,31 +326,40 @@ int alsa_init_pcm(snd_pcm_t **pcm,
       }
    }
 
-   stream_info->period_size = snd_pcm_frames_to_bytes(*pcm, stream_info->period_frames);
-   if (stream_info->period_size < 0)
+   /* snd_pcm_frames_to_bytes returns a signed count and a negative
+    * value is its error; the field it is stored in is unsigned, so
+    * the test has to be on the return value. It was made after the
+    * store, where it could never be true, and a failure would have
+    * been carried on as an enormous size. The error's message came
+    * from the frame count too, not from the return. */
    {
-      RARCH_ERR("[ALSA]: Failed to convert a period size of %lu frames to bytes: %s\n",
-            stream_info->period_frames,
-            snd_strerror(stream_info->period_frames));
-      goto error;
+      ssize_t bytes = snd_pcm_frames_to_bytes(*pcm, stream_info->period_frames);
+      if (bytes < 0)
+      {
+         RARCH_ERR("[ALSA] Failed to convert a period size of %lu frames to bytes: %s.\n",
+               (unsigned long)stream_info->period_frames,
+               snd_strerror((int)bytes));
+         goto error;
+      }
+      stream_info->period_size = (size_t)bytes;
    }
 
-   RARCH_LOG("[ALSA]: Period: %u periods per buffer (%lu frames, %lu bytes)\n",
+   RARCH_LOG("[ALSA] Period: %u periods per buffer (%lu frames, %lu bytes).\n",
          periods,
          stream_info->period_frames,
          stream_info->period_size);
 
    if ((errnum = snd_pcm_hw_params_get_buffer_size(params, &buffer_size)) < 0)
    {
-      RARCH_WARN("[ALSA]: Failed to get exact buffer size from %s device \"%s\": %s\n",
+      RARCH_WARN("[ALSA] Failed to get exact buffer size from %s device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
-      RARCH_WARN("[ALSA]: Trying the maximum buffer size instead\n");
+      RARCH_WARN("[ALSA] Trying the maximum buffer size instead.\n");
 
       if ((errnum = snd_pcm_hw_params_get_buffer_size_max(params, &buffer_size)) < 0)
       {
-         RARCH_ERR("[ALSA]: Failed to get max buffer size from %s device \"%s\": %s\n",
+         RARCH_ERR("[ALSA] Failed to get max buffer size from %s device \"%s\": %s.\n",
                snd_pcm_stream_name(stream),
                snd_pcm_name(*pcm),
                snd_strerror(errnum));
@@ -227,23 +368,31 @@ int alsa_init_pcm(snd_pcm_t **pcm,
    }
 
 
-   stream_info->buffer_size = snd_pcm_frames_to_bytes(*pcm, buffer_size);
-   if (stream_info->buffer_size < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to convert a buffer size of %lu frames to bytes: %s\n",
-            buffer_size,
-            snd_strerror(buffer_size));
-      goto error;
+      ssize_t bytes = snd_pcm_frames_to_bytes(*pcm, buffer_size);
+      if (bytes < 0)
+      {
+         RARCH_ERR("[ALSA] Failed to convert a buffer size of %lu frames to bytes: %s.\n",
+               (unsigned long)buffer_size,
+               snd_strerror((int)bytes));
+         goto error;
+      }
+      stream_info->buffer_size   = (size_t)bytes;
+      stream_info->buffer_frames = buffer_size;
    }
-   RARCH_LOG("[ALSA]: Buffer size: %lu frames (%lu bytes)\n", buffer_size, stream_info->buffer_size);
+   RARCH_LOG("[ALSA] Buffer size: %lu frames (%lu bytes).\n",
+         (unsigned long)buffer_size, (unsigned long)stream_info->buffer_size);
 
    stream_info->can_pause = snd_pcm_hw_params_can_pause(params);
 
-   RARCH_LOG("[ALSA]: Can pause: %s.\n", stream_info->can_pause ? "yes" : "no");
+   RARCH_LOG("[ALSA] Can pause: %s.\n", stream_info->can_pause ? "yes" : "no");
+   stream_info->mmap = (access == SND_PCM_ACCESS_MMAP_INTERLEAVED);
+   if (stream_info->mmap)
+      RARCH_LOG("[ALSA] Opened for mmap: the threaded pipeline writes into the device's buffer.\n");
 
    if ((errnum = snd_pcm_sw_params_malloc(&sw_params)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to allocate software parameters: %s\n",
+      RARCH_ERR("[ALSA] Failed to allocate software parameters: %s.\n",
             snd_strerror(errnum));
 
       goto error;
@@ -251,7 +400,7 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
    if ((errnum = snd_pcm_sw_params_current(*pcm, sw_params)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to query current software parameters for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to query current software parameters for %s device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
@@ -261,7 +410,7 @@ int alsa_init_pcm(snd_pcm_t **pcm,
 
    if ((errnum = snd_pcm_sw_params_set_start_threshold(*pcm, sw_params, buffer_size / 2)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to set start %lu-frame threshold for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to set start %lu-frame threshold for %s device \"%s\": %s.\n",
             buffer_size / 2,
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
@@ -270,9 +419,11 @@ int alsa_init_pcm(snd_pcm_t **pcm,
       goto error;
    }
 
+   stream_info->start_frames = buffer_size / 2;
+
    if ((errnum = snd_pcm_sw_params(*pcm, sw_params)) < 0)
    {
-      RARCH_ERR("[ALSA]: Failed to install software parameters for %s device \"%s\": %s\n",
+      RARCH_ERR("[ALSA] Failed to install software parameters for %s device \"%s\": %s.\n",
             snd_pcm_stream_name(stream),
             snd_pcm_name(*pcm),
             snd_strerror(errnum));
@@ -283,11 +434,12 @@ int alsa_init_pcm(snd_pcm_t **pcm,
    snd_pcm_hw_params_free(params);
    snd_pcm_sw_params_free(sw_params);
 
-   RARCH_LOG("[ALSA]: Initialized %s device \"%s\"\n",
+   RARCH_LOG("[ALSA] Initialized %s device \"%s\".\n",
          snd_pcm_stream_name(stream),
          snd_pcm_name(*pcm));
 
    return 0;
+
 error:
    if (params)
       snd_pcm_hw_params_free(params);
@@ -312,7 +464,7 @@ void alsa_free_pcm(snd_pcm_t *pcm)
 
       if ((errnum = snd_pcm_drop(pcm)) < 0)
       {
-         RARCH_WARN("[ALSA]: Failed to drop remaining samples in %s stream \"%s\": %s\n",
+         RARCH_WARN("[ALSA] Failed to drop remaining samples in %s stream \"%s\": %s.\n",
                snd_pcm_stream_name(snd_pcm_stream(pcm)),
                snd_pcm_name(pcm),
                snd_strerror(errnum));
@@ -320,7 +472,7 @@ void alsa_free_pcm(snd_pcm_t *pcm)
 
       if ((errnum = snd_pcm_close(pcm)) < 0)
       {
-         RARCH_WARN("[ALSA]: Failed to close %s stream \"%s\": %s\n",
+         RARCH_WARN("[ALSA] Failed to close %s stream \"%s\": %s.\n",
                snd_pcm_stream_name(snd_pcm_stream(pcm)),
                snd_pcm_name(pcm),
                snd_strerror(errnum));
@@ -351,19 +503,19 @@ bool alsa_start_pcm(snd_pcm_t *pcm)
 
          break;
       case SND_PCM_STATE_RUNNING:
-         RARCH_DBG("[ALSA]: %s stream \"%s\" is already running, no action needed.\n",
+         RARCH_DBG("[ALSA] %s stream \"%s\" is already running, no action needed.\n",
             snd_pcm_stream_name(snd_pcm_stream(pcm)),
             snd_pcm_name(pcm));
          return true;
       default:
-         RARCH_ERR("[ALSA]: Failed to start %s stream \"%s\" in unexpected state %s\n",
+         RARCH_ERR("[ALSA] Failed to start %s stream \"%s\" in unexpected state %s.\n",
                    snd_pcm_stream_name(snd_pcm_stream(pcm)),
                    snd_pcm_name(pcm),
                    snd_pcm_state_name(pcm_state));
          return false;
    }
 
-   RARCH_DBG("[ALSA]: Started %s stream \"%s\", transitioning from %s to %s\n",
+   RARCH_DBG("[ALSA] Started %s stream \"%s\", transitioning from %s to %s.\n",
              snd_pcm_stream_name(snd_pcm_stream(pcm)),
              snd_pcm_name(pcm),
              snd_pcm_state_name(pcm_state),
@@ -372,7 +524,7 @@ bool alsa_start_pcm(snd_pcm_t *pcm)
    return true;
 
 error:
-   RARCH_ERR("[ALSA]: Failed to start %s stream \"%s\" in state %s: %s\n",
+   RARCH_ERR("[ALSA] Failed to start %s stream \"%s\" in state %s: %s.\n",
              snd_pcm_stream_name(snd_pcm_stream(pcm)),
              snd_pcm_name(pcm),
              snd_pcm_state_name(pcm_state),
@@ -393,12 +545,12 @@ bool alsa_stop_pcm(snd_pcm_t *pcm)
    switch (pcm_state)
    {
       case SND_PCM_STATE_PAUSED:
-         RARCH_DBG("[ALSA]: %s stream \"%s\" is already paused, no action needed.\n",
+         RARCH_DBG("[ALSA] %s stream \"%s\" is already paused, no action needed.\n",
             snd_pcm_stream_name(snd_pcm_stream(pcm)),
             snd_pcm_name(pcm));
          return true;
       case SND_PCM_STATE_PREPARED:
-         RARCH_DBG("[ALSA]: %s stream \"%s\" is prepared but not running, no action needed.\n",
+         RARCH_DBG("[ALSA] %s stream \"%s\" is prepared but not running, no action needed.\n",
             snd_pcm_stream_name(snd_pcm_stream(pcm)),
             snd_pcm_name(pcm));
          return true;
@@ -409,7 +561,7 @@ bool alsa_stop_pcm(snd_pcm_t *pcm)
 
          break;
       default:
-         RARCH_ERR("[ALSA]: Failed to stop %s stream \"%s\" in unexpected state %s\n",
+         RARCH_ERR("[ALSA] Failed to stop %s stream \"%s\" in unexpected state %s.\n",
                    snd_pcm_stream_name(snd_pcm_stream(pcm)),
                    snd_pcm_name(pcm),
                    snd_pcm_state_name(pcm_state));
@@ -417,7 +569,7 @@ bool alsa_stop_pcm(snd_pcm_t *pcm)
          return false;
    }
 
-   RARCH_DBG("[ALSA]: Stopped %s stream \"%s\", transitioning from %s to %s\n",
+   RARCH_DBG("[ALSA] Stopped %s stream \"%s\", transitioning from %s to %s.\n",
              snd_pcm_stream_name(snd_pcm_stream(pcm)),
              snd_pcm_name(pcm),
              snd_pcm_state_name(pcm_state),
@@ -426,7 +578,7 @@ bool alsa_stop_pcm(snd_pcm_t *pcm)
    return true;
 
 error:
-   RARCH_ERR("[ALSA]: Failed to stop %s stream \"%s\" in state %s: %s\n",
+   RARCH_ERR("[ALSA] Failed to stop %s stream \"%s\" in state %s: %s.\n",
              snd_pcm_stream_name(snd_pcm_stream(pcm)),
              snd_pcm_name(pcm),
              snd_pcm_state_name(pcm_state),

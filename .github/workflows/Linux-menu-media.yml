@@ -1,0 +1,240 @@
+name: CI fullscreen media menu
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rgui-media:
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: ffmpeg
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        threads: [enable, disable]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Configure C89 frontend
+        run: ./configure --disable-qt --disable-vulkan --disable-wayland --disable-x11 --disable-opengl --disable-opengl1 --disable-opengl_core --disable-ffmpeg --disable-cheevos --disable-webmplayer --${{ matrix.threads }}-threads
+      - name: Build shipping frontend
+        run: make -j2 C89_BUILD=1
+      - name: Generate movie fixture
+        run: ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 3 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -shortest samples/menu/rgui_media/fixture.mp4
+      - name: Real RGUI framebuffer and playback controls
+        run: python3 samples/menu/rgui_media/run.py --c89 --cadence-hz 30 samples/menu/rgui_media/fixture.mp4
+      - name: Real MaterialUI file-browser playback controls
+        run: python3 samples/menu/rgui_media/run.py --c89 --cadence-hz 30 --driver materialui samples/menu/rgui_media/fixture.mp4
+      - name: Real XMB file-browser playback controls
+        run: python3 samples/menu/rgui_media/run.py --c89 --cadence-hz 30 --driver xmb samples/menu/rgui_media/fixture.mp4
+      - name: Real Ozone file-browser playback controls
+        run: python3 samples/menu/rgui_media/run.py --c89 --cadence-hz 30 --driver ozone samples/menu/rgui_media/fixture.mp4
+      - name: UTF-8 subtitle sidecars across all four menus
+        run: |
+          python3 -c "from pathlib import Path; Path('samples/menu/rgui_media/fixture.srt').write_text('1\n00:00:00,000 --> 00:10:00,000\nSubtitle sidecar\nUTF-8 \u00e9\n\n', encoding='utf-8')"
+          python3 -c "from pathlib import Path; Path('samples/menu/rgui_media/fixture.en.srt').write_text('1\n00:00:00,000 --> 00:10:00,000\nEnglish track\n', encoding='utf-8')"
+          for driver in rgui materialui xmb ozone; do
+            python3 samples/menu/rgui_media/run.py --c89 --subtitles --driver "$driver" samples/menu/rgui_media/fixture.mp4
+          done
+      - name: Embedded MP4 subtitles across all four menus
+        run: |
+          python3 -c "from pathlib import Path; [Path('samples/menu/rgui_media/embedded-'+n+'.srt').write_text('1\n00:00:00,000 --> 00:10:00,000\nEmbedded '+n+' UTF-8 \u00e9\n', encoding='utf-8') for n in ('first', 'second')]"
+          ffmpeg -v error -y -i samples/menu/rgui_media/fixture.mp4 -i samples/menu/rgui_media/embedded-first.srt -i samples/menu/rgui_media/embedded-second.srt -map 0:v:0 -map 1:0 -map 2:0 -c:v copy -c:s mov_text samples/menu/rgui_media/embedded.mp4
+          for driver in rgui materialui xmb ozone; do
+            MEDIA_TEST_EMBEDDED_SUBTITLES=1 python3 samples/menu/rgui_media/run.py --c89 --driver "$driver" samples/menu/rgui_media/embedded.mp4
+          done
+      - name: Embedded Matroska subtitles across all four menus
+        run: |
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -i samples/menu/rgui_media/embedded-first.srt -i samples/menu/rgui_media/embedded-second.srt -map 0:v:0 -map 1:0 -map 2:0 -t 4 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -g 30 -auto-alt-ref 0 -threads 1 -c:s srt samples/menu/rgui_media/embedded.mkv
+          for driver in rgui materialui xmb ozone; do
+            MEDIA_TEST_EMBEDDED_SUBTITLES=1 python3 samples/menu/rgui_media/run.py --c89 --driver "$driver" samples/menu/rgui_media/embedded.mkv
+          done
+      - name: Folder playback and fullscreen settings across all menus
+        run: |
+          ffmpeg -v error -y -i samples/menu/rgui_media/embedded.mkv -map 0:v:0 -c:v copy samples/menu/rgui_media/folder.mkv
+          for driver in rgui materialui xmb ozone; do
+            python3 samples/menu/rgui_media/run.py --c89 --desktop-refresh --driver "$driver" samples/menu/rgui_media/fixture.mp4
+            python3 samples/menu/rgui_media/run.py --c89 --continuous-error --driver "$driver" samples/menu/rgui_media/fixture.mp4
+            python3 samples/menu/rgui_media/run.py --c89 --continuous --driver "$driver" samples/menu/rgui_media/folder.mkv
+          done
+      - name: External movies and internal image activation across all menus
+        run: |
+          ffmpeg -v error -y -f lavfi -i color=c=orange:size=32x32 -frames:v 1 -threads 1 samples/menu/rgui_media/fixture.png
+          for driver in rgui materialui xmb ozone; do
+            python3 samples/menu/rgui_media/run.py --c89 --external --driver "$driver" samples/menu/rgui_media/fixture.mp4
+            python3 samples/menu/rgui_media/run.py --c89 --external --driver "$driver" samples/menu/rgui_media/fixture.png
+            python3 samples/menu/rgui_media/run.py --c89 --browser-image --driver "$driver" samples/menu/rgui_media/fixture.png
+          done
+      - name: Background setting browser picks images instead of viewing them
+        run: |
+          ffmpeg -v error -y -f lavfi -i color=c=orange:size=32x32 -frames:v 1 -threads 1 samples/menu/rgui_media/fixture.png
+          for driver in xmb materialui; do
+            python3 samples/menu/rgui_media/run.py --c89 --wallpaper-pick --driver "$driver" samples/menu/rgui_media/fixture.png
+          done
+      - name: Generate WebM transport fixtures
+        run: |
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 3 -c:v libvpx -deadline realtime -cpu-used 8 -g 30 -auto-alt-ref 0 -c:a libopus -shortest samples/menu/rgui_media/fixture-opus.webm
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 3 -c:v libvpx-vp9 -g 30 -auto-alt-ref 0 -c:a libvorbis -shortest samples/menu/rgui_media/fixture-vorbis.webm
+      - name: Real WebM controls across all four menus
+        run: |
+          for driver in rgui materialui xmb ozone; do
+            python3 samples/menu/rgui_media/run.py --c89 --driver "$driver" samples/menu/rgui_media/fixture-opus.webm
+            python3 samples/menu/rgui_media/run.py --c89 --driver "$driver" samples/menu/rgui_media/fixture-vorbis.webm
+          done
+
+  window-toggle-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APT_PKGS: ffmpeg xvfb xauth libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev
+    steps:
+      - uses: actions/checkout@v6
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+      - name: Configure C89 GL frontend
+        run: ./configure --disable-qt --disable-vulkan --disable-wayland --disable-ffmpeg --disable-cheevos --disable-webmplayer
+      - name: Build shipping frontend
+        run: make -j2 C89_BUILD=1
+      - name: Generate moving VP8 fixture
+        run: |
+          ffmpeg -v error -y -f lavfi -i "testsrc2=size=320x240:rate=30,hue=h=90*t" -t 3 -c:v libvpx -deadline realtime -cpu-used 8 -g 90 -auto-alt-ref 0 samples/menu/rgui_media/window-toggle.webm
+          ffmpeg -v error -y -f lavfi -i "color=orange:size=320x240:rate=30" -t 3 -c:v libvpx -deadline realtime -cpu-used 8 -g 90 -auto-alt-ref 0 samples/menu/rgui_media/settings-preview.webm
+      - name: External media starts without browser frames and recovers from failure
+        run: |
+          set -eu
+          ffmpeg -v error -y -f lavfi -i color=c=orange:size=32x32 -frames:v 1 -threads 1 samples/menu/rgui_media/startup.png
+          python3 -c "from pathlib import Path; root = Path('samples/menu/rgui_media'); [(root / name).write_bytes(b'not decodable media') for name in ('corrupt.mp4', 'corrupt.png')]"
+          for driver in rgui materialui xmb ozone; do
+            for threaded in '' --threaded; do
+              for fixture in window-toggle.webm startup.png; do
+                xvfb-run -a python3 samples/menu/rgui_media/run.py --c89 --external --first-frame --video-driver gl --driver "$driver" $threaded "samples/menu/rgui_media/$fixture"
+              done
+              for fixture in corrupt.mp4 corrupt.png; do
+                xvfb-run -a python3 samples/menu/rgui_media/run.py --c89 --external --startup-failure --video-driver gl --driver "$driver" $threaded "samples/menu/rgui_media/$fixture"
+              done
+            done
+          done
+      - name: Fullscreen window transitions retain movie pixels and seeking
+        run: |
+          for driver in rgui materialui xmb ozone; do
+            for threaded in '' --threaded; do
+              xvfb-run -a python3 samples/menu/rgui_media/run.py --c89 --window-toggle --video-driver gl --driver "$driver" $threaded samples/menu/rgui_media/window-toggle.webm
+            done
+          done
+      - name: GPU folder playback and fullscreen settings across all menus
+        run: |
+          for driver in rgui materialui xmb ozone; do
+            for threaded in '' --threaded; do
+              MEDIA_TEST_SETTINGS_ORANGE=1 xvfb-run -a python3 samples/menu/rgui_media/run.py --c89 --fullscreen-settings --video-driver gl --driver "$driver" $threaded samples/menu/rgui_media/settings-preview.webm
+              xvfb-run -a python3 samples/menu/rgui_media/run.py --c89 --continuous-error --video-driver gl --driver "$driver" $threaded samples/menu/rgui_media/window-toggle.webm
+            done
+          done
+      - name: Generate delayed first-picture fixture
+        run: ffmpeg -v error -y -f lavfi -i "testsrc2=size=320x240:rate=30,hue=h=90*t" -vf "setpts=PTS+0.2/TB" -t 3 -c:v libvpx -deadline realtime -cpu-used 8 -g 90 -auto-alt-ref 0 samples/menu/rgui_media/delayed.webm
+      - name: Compare actual visible pictures after delayed-start seeks
+        run: |
+          for driver in rgui materialui xmb ozone; do
+            xvfb-run -a python3 samples/menu/rgui_media/run.py --c89 --video-driver gl --driver "$driver" --first-video-us 200000 samples/menu/rgui_media/delayed.webm
+          done
+
+  subtitle-sidecars:
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential clang ffmpeg
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: SubRip parsing, task ownership and drawing (GCC and Clang sanitizers)
+        shell: bash
+        run: |
+          set -eu
+          for compiler in gcc clang; do
+            for sample in libretro-common/samples/formats/subtitle_srt samples/tasks/subtitle_load samples/gfx/media_subtitle samples/gfx/media_controls; do
+              extra_flags=''
+              if [ "$compiler" = clang ]; then extra_flags=-Wno-c99-extensions; fi
+              make -C "$sample" clean
+              ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 CFLAGS="$extra_flags" \
+                make -C "$sample" check CC="$compiler" SANITIZER=address,undefined
+            done
+          done
+      - name: Subtitle ownership and publication races
+        shell: bash
+        run: |
+          set -eu
+          for sample in samples/tasks/subtitle_load samples/gfx/media_subtitle samples/gfx/media_controls; do
+            make -C "$sample" clean
+            TSAN_OPTIONS=halt_on_error=1 CFLAGS=-Wno-c99-extensions \
+              make -C "$sample" check CC=clang SANITIZER=thread
+          done
+      - name: Threadless subtitle loading and drawing
+        shell: bash
+        run: |
+          set -eu
+          for sample in libretro-common/samples/formats/subtitle_srt samples/tasks/subtitle_load samples/gfx/media_subtitle samples/gfx/media_controls; do
+            make -C "$sample" clean
+            ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+              make -C "$sample" check THREADS=0 SANITIZER=address,undefined
+          done

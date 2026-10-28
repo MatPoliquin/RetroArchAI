@@ -1,0 +1,644 @@
+/* Menu icon ownership.
+ *
+ * Links the shipping RetroArch objects with only main() replaced, the
+ * way ozone_color_theme_defer does, and drives the real menu drivers
+ * against the null video driver with one difference: the driver's
+ * load_texture and unload_texture are the harness's, so every handle
+ * the frontend holds is accounted for. An unload of a handle not
+ * live, or a handle still live at deinit, fails the lane.
+ *
+ *   ozone       A playlist whose sidebar icon file does not exist
+ *               leaves node->icon at 0. The sidebar draw used to
+ *               write the shared cursor texture into the node, and
+ *               the context destroy then unloaded it twice: once from
+ *               the node, once from the icon set. The lane draws one
+ *               frame, then deinits.
+ *
+ *   xmb         The same fixture against the other horizontal list;
+ *               the explore view's node no longer aliases the cursor.
+ *
+ *   materialui  An icon whose decode is still queued when the playlist
+ *               icon array is freed and rebuilt (RESET_HORIZONTAL_LIST
+ *               after the playlist file went) must land nowhere: the
+ *               array it was aimed at is gone. A completion that still
+ *               wrote through would store a handle in freed memory and
+ *               leak it, which the live count at deinit catches.
+ *
+ *   contentless The contentless cores list, built from one core whose
+ *               info says it runs without content, decodes the
+ *               fallback icon and the core's own; both are freed at
+ *               deinit.
+ *
+ * Usage: menu_icon_ownership_test ozone|xmb|materialui|contentless
+ *
+ * Requires a completed non-Qt build, same as the other menu harnesses:
+ *
+ *   ./configure --disable-qt && make
+ *   samples/menu/menu_icon_ownership/build.sh
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <boolean.h>
+#include <time/rtime.h>
+#include <file/config_file.h>
+#include <file/file_path.h>
+#include <streams/file_stream.h>
+#include <string/stdstring.h>
+#include <queues/task_queue.h>
+#include <features/features_cpu.h>
+
+#include "../../../configuration.h"
+#include "../../../retroarch.h"
+#include "../../../retroarch_types.h"
+#include "../../../menu/menu_driver.h"
+#include "../../../menu/menu_displaylist.h"
+#include "../../../gfx/gfx_display.h"
+#include "../../../gfx/video_driver.h"
+#include "../../../frontend/frontend_driver.h"
+
+static unsigned failures = 0;
+
+#define CHECK(cond, ...) \
+   do { \
+      if (!(cond)) \
+      { \
+         fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
+         fprintf(stderr, __VA_ARGS__); \
+         fprintf(stderr, "\n"); \
+         failures++; \
+      } \
+   } while (0)
+
+/* --- the accounting driver ----------------------------------------- */
+
+#define LIVE_MAX 512
+
+static uintptr_t live[LIVE_MAX];
+static unsigned  live_count;
+static unsigned  loads;
+static unsigned  unloads;
+static unsigned  unknown_unloads;
+
+/* Handles are never reused, so a texture drawn after it went cannot
+ * pass for one loaded since */
+static uintptr_t next_handle = 0x1000;
+
+static uintptr_t harness_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type)
+{
+   (void)video_data;
+   (void)data;
+   (void)threaded;
+   (void)filter_type;
+   next_handle += 0x10;
+   if (live_count < LIVE_MAX)
+      live[live_count++] = next_handle;
+   loads++;
+   return next_handle;
+}
+
+static void harness_unload_texture(void *data, bool threaded, uintptr_t id)
+{
+   unsigned i;
+   (void)data;
+   (void)threaded;
+   if (!id)
+      return;
+   unloads++;
+   for (i = 0; i < live_count; i++)
+   {
+      if (live[i] == id)
+      {
+         live[i] = live[--live_count];
+         return;
+      }
+   }
+   unknown_unloads++;
+   fprintf(stderr, "unload of a handle not live: %p\n", (void*)id);
+}
+
+static const video_poke_interface_t harness_poke = {
+   NULL, /* get_flags */
+   harness_load_texture,
+   harness_unload_texture,
+   NULL, /* set_video_mode */
+   NULL, /* get_refresh_rate */
+   NULL, /* set_filtering */
+   NULL, /* get_video_output_size */
+   NULL, /* get_video_output_prev */
+   NULL, /* get_video_output_next */
+   NULL, /* get_current_framebuffer */
+   NULL, /* get_proc_address */
+   NULL, /* set_aspect_ratio */
+   NULL, /* apply_state_changes */
+   NULL, /* set_texture_frame */
+   NULL, /* set_texture_enable */
+   NULL, /* set_osd_msg */
+   NULL, /* show_mouse */
+   NULL, /* grab_mouse_toggle */
+   NULL, /* get_current_shader */
+   NULL, /* get_current_software_framebuffer */
+   NULL, /* get_hw_render_interface */
+   NULL, /* set_hdr_menu_nits */
+   NULL, /* set_hdr_paper_white_nits */
+   NULL, /* set_hdr_expand_gamut */
+   NULL, /* set_hdr_scanlines */
+   NULL, /* set_hdr_subpixel_layout */
+   NULL, /* supports_texture_format */
+   NULL, /* load_texture_compressed */
+   NULL, /* present_last */
+   NULL  /* get_last_present_time */
+};
+
+static void harness_get_poke_interface(void *data,
+      const video_poke_interface_t **iface)
+{
+   (void)data;
+   *iface = &harness_poke;
+}
+
+/* --- the accounting display driver --------------------------------- */
+
+static unsigned live_draws;
+static unsigned dead_draws;
+
+static bool is_live(uintptr_t id)
+{
+   unsigned i;
+   for (i = 0; i < live_count; i++)
+      if (live[i] == id)
+         return true;
+   return false;
+}
+
+/* A draw names a texture the driver still has, or none */
+static void harness_draw(gfx_display_ctx_draw_t *draw,
+      void *data, unsigned video_dims)
+{
+   (void)data;
+   (void)video_dims;
+   if (!draw || !draw->texture)
+      return;
+   if (is_live(draw->texture))
+      live_draws++;
+   else
+   {
+      dead_draws++;
+      fprintf(stderr, "draw of a texture not live: %p\n",
+            (void*)draw->texture);
+   }
+}
+
+static gfx_display_ctx_driver_t harness_dispctx = {
+   harness_draw,
+   NULL, /* draw_pipeline */
+   NULL, /* blend_begin */
+   NULL, /* blend_end */
+   NULL, /* get_default_mvp */
+   NULL, /* get_default_vertices */
+   NULL, /* get_default_tex_coords */
+   NULL, /* font_backend */
+   GFX_VIDEO_DRIVER_GENERIC,
+   "harness",
+   false, /* handles_transform */
+   true,  /* handles_vertex_strip */
+   NULL, /* scissor_begin */
+   NULL, /* scissor_end */
+   NULL  /* mesh_draw */
+};
+
+/* --- the fixture --------------------------------------------------- */
+
+/* A 1x1 RGBA PNG */
+static const unsigned char png_1x1[] = {
+   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+   0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+   0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+   0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0x0f, 0x04, 0x00,
+   0x09, 0xfb, 0x03, 0xfd, 0xfb, 0x5e, 0x6b, 0x2b, 0x00, 0x00, 0x00, 0x00,
+   0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82
+};
+
+static bool write_file(const char *path, const void *data, size_t len)
+{
+   RFILE *f = filestream_open(path, RETRO_VFS_FILE_ACCESS_WRITE,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   int64_t n;
+   if (!f)
+      return false;
+   n = filestream_write(f, data, (int64_t)len);
+   filestream_close(f);
+   return n == (int64_t)len;
+}
+
+static bool write_text(const char *path, const char *text)
+{
+   return write_file(path, text, strlen(text));
+}
+
+static char fixture_dir[512];
+static char icons_dir[768];
+static char playlists_dir[640];
+static char playlist_path[768];
+static char cfg_path[640];
+static char cores_dir[640];
+static char info_dir[640];
+
+/* The icon directory every one of the three drivers reads its system
+ * icons from on this build: <assets>/xmb/monochrome/png. */
+static bool fixture_make(const char *menu_driver)
+{
+   char assets_dir[640];
+   char path[768];
+   const char *tmp = getenv("TMPDIR");
+   /* The configuration names MaterialUI by its driver ident; the
+    * contentless lane runs on ozone */
+   const char *ident = string_is_equal(menu_driver, "materialui") ? "glui"
+         : string_is_equal(menu_driver, "contentless") ? "ozone"
+         : "xmb";
+   if (string_is_equal(menu_driver, "ozone"))
+      ident = "ozone";
+
+   snprintf(fixture_dir, sizeof(fixture_dir),
+         "%s/menu_icon_ownership_%s_%u", tmp ? tmp : "/tmp", menu_driver,
+         (unsigned)(cpu_features_get_time_usec() & 0xffffff));
+   if (!path_mkdir(fixture_dir))
+      return false;
+
+   fill_pathname_join_special(assets_dir, fixture_dir, "assets",
+         sizeof(assets_dir));
+   fill_pathname_join_special(path, assets_dir, "xmb", sizeof(path));
+   fill_pathname_join_special(icons_dir, path, "monochrome",
+         sizeof(icons_dir));
+   fill_pathname_join_special(path, icons_dir, "png", sizeof(path));
+   strlcpy(icons_dir, path, sizeof(icons_dir));
+   if (!path_mkdir(icons_dir))
+      return false;
+
+   fill_pathname_join_special(playlists_dir, fixture_dir, "playlists",
+         sizeof(playlists_dir));
+   if (!path_mkdir(playlists_dir))
+      return false;
+
+   /* The one icon every lane has: the cursor the sidebar falls back
+    * to, and the one the alias doubled. */
+   fill_pathname_join_special(path, icons_dir, "cursor.png", sizeof(path));
+   if (!write_file(path, png_1x1, sizeof(png_1x1)))
+      return false;
+
+   if (string_is_equal(menu_driver, "ozone"))
+   {
+      static const char *themes[] = { "dark", "light", "nord" };
+      static const char *files[] = {
+         "switch.png", "check.png", "cursor_noborder.png", "cursor_static.png"
+      };
+      char theme_dir[768];
+      char png_dir[768];
+      unsigned i, j;
+      fill_pathname_join_special(path, assets_dir, "ozone", sizeof(path));
+      fill_pathname_join_special(png_dir, path, "png", sizeof(png_dir));
+      /* The logo the header falls back to */
+      if (!path_mkdir(png_dir))
+         return false;
+      fill_pathname_join_special(path, png_dir, "retroarch.png",
+            sizeof(path));
+      if (!write_file(path, png_1x1, sizeof(png_1x1)))
+         return false;
+      for (i = 0; i < sizeof(themes) / sizeof(themes[0]); i++)
+      {
+         fill_pathname_join_special(theme_dir, png_dir, themes[i],
+               sizeof(theme_dir));
+         if (!path_mkdir(theme_dir))
+            return false;
+         for (j = 0; j < sizeof(files) / sizeof(files[0]); j++)
+         {
+            fill_pathname_join_special(path, theme_dir, files[j], sizeof(path));
+            if (!write_file(path, png_1x1, sizeof(png_1x1)))
+               return false;
+         }
+      }
+   }
+
+   fill_pathname_join_special(playlist_path, playlists_dir,
+         "Harness System.lpl", sizeof(playlist_path));
+   if (!write_text(playlist_path,
+            "{\n  \"version\": \"1.5\",\n  \"items\": [\n  ]\n}\n"))
+      return false;
+
+   if (string_is_equal(menu_driver, "materialui"))
+   {
+      /* MaterialUI's lane needs the playlist's icon to exist, so
+       * that a decode is queued for it, and one icon of its own set
+       * under <assets>/glui */
+      fill_pathname_join_special(path, icons_dir,
+            "Harness System.png", sizeof(path));
+      if (!write_file(path, png_1x1, sizeof(png_1x1)))
+         return false;
+      {
+         char glui_dir[768];
+         fill_pathname_join_special(glui_dir, assets_dir, "glui",
+               sizeof(glui_dir));
+         if (!path_mkdir(glui_dir))
+            return false;
+         fill_pathname_join_special(path, glui_dir, "settings.png",
+               sizeof(path));
+         if (!write_file(path, png_1x1, sizeof(png_1x1)))
+            return false;
+      }
+   }
+
+   if (string_is_equal(menu_driver, "contentless"))
+   {
+      /* A core that runs without content, by its info alone: the
+       * library file is never opened. Its icon and the fallback. */
+      fill_pathname_join_special(cores_dir, fixture_dir, "cores",
+            sizeof(cores_dir));
+      fill_pathname_join_special(info_dir, fixture_dir, "info",
+            sizeof(info_dir));
+      if (!path_mkdir(cores_dir) || !path_mkdir(info_dir))
+         return false;
+      fill_pathname_join_special(path, cores_dir, "harness_libretro.so",
+            sizeof(path));
+      if (!write_text(path, ""))
+         return false;
+      fill_pathname_join_special(path, info_dir, "harness_libretro.info",
+            sizeof(path));
+      if (!write_text(path,
+               "display_name = \"Harness\"\n"
+               "corename = \"harness\"\n"
+               "supports_no_game = \"true\"\n"
+               "database = \"Harness System\"\n"))
+         return false;
+      fill_pathname_join_special(path, icons_dir, "default.png",
+            sizeof(path));
+      if (!write_file(path, png_1x1, sizeof(png_1x1)))
+         return false;
+      fill_pathname_join_special(path, icons_dir, "Harness System.png",
+            sizeof(path));
+      if (!write_file(path, png_1x1, sizeof(png_1x1)))
+         return false;
+   }
+
+   fill_pathname_join_special(cfg_path, fixture_dir, "harness.cfg",
+         sizeof(cfg_path));
+   {
+      char cfg[2048];
+      size_t _len = 0;
+      _len += snprintf(cfg + _len, sizeof(cfg) - _len,
+            "video_driver = \"null\"\n"
+            "audio_driver = \"null\"\n"
+            "input_driver = \"null\"\n"
+            "input_joypad_driver = \"null\"\n"
+            "video_threaded = \"false\"\n"
+            "threaded_data_runloop_enable = \"false\"\n"
+            "menu_ozone_color_theme = \"basic_black\"\n"
+            "menu_use_preferred_system_color_theme = \"false\"\n"
+            "menu_ignore_missing_assets = \"true\"\n"
+            "content_show_playlists = \"true\"\n"
+            "materialui_icons_enable = \"true\"\n"
+            "materialui_playlist_icons_enable = \"true\"\n");
+      _len += snprintf(cfg + _len, sizeof(cfg) - _len,
+            "menu_driver = \"%s\"\n", ident);
+      if (string_is_equal(menu_driver, "contentless"))
+         _len += snprintf(cfg + _len, sizeof(cfg) - _len,
+               "libretro_directory = \"%s\"\n"
+               "libretro_info_path = \"%s\"\n", cores_dir, info_dir);
+      _len += snprintf(cfg + _len, sizeof(cfg) - _len,
+            "assets_directory = \"%s\"\n", assets_dir);
+      _len += snprintf(cfg + _len, sizeof(cfg) - _len,
+            "playlist_directory = \"%s\"\n", playlists_dir);
+      return write_text(cfg_path, cfg);
+   }
+}
+
+static void fixture_remove(void)
+{
+   char cmd[600];
+   snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", fixture_dir);
+   if (system(cmd) != 0) { /* fixture dir left behind; harmless */ }
+}
+
+/* --- the lanes ----------------------------------------------------- */
+
+static void one_frame(void)
+{
+   video_frame_info_t vinfo;
+   struct menu_state *menu_st = menu_state_get_ptr();
+   /* The null driver reports no size; the sidebar culls every entry
+    * below a zero-height screen. */
+   video_driver_set_output_dims(VIDEO_SCALE_PACK(1280, 720));
+   video_driver_build_info(&vinfo);
+   vinfo.dims = VIDEO_SCALE_PACK(1280, 720);
+   disp_get_ptr()->dispctx = &harness_dispctx;
+   menu_driver_frame(true, &vinfo);
+   if (menu_st->driver_ctx && menu_st->driver_ctx->render)
+      menu_st->driver_ctx->render(menu_st->userdata, vinfo.dims, false);
+}
+
+static void run_tasks(void)
+{
+   unsigned i;
+   for (i = 0; i < 2000; i++)
+      task_queue_check();
+}
+
+/* A context reset with no destroy before it loads the icon sets again
+ * into the surfaces they are in, which retire the textures they had:
+ * the header must not go on drawing the logo it was given before. */
+static void ozone_header_reset_test(struct menu_state *menu_st)
+{
+   unsigned had_live = live_draws;
+   one_frame();
+   CHECK(live_draws > had_live, "fixture: the menu drew no texture");
+   menu_st->driver_ctx->context_reset(menu_st->userdata, false);
+   run_tasks();
+   one_frame();
+   one_frame();
+   CHECK(dead_draws == 0, "%u draw(s) of a retired texture", dead_draws);
+}
+
+static void ozone_theme_cache_test(struct menu_state *menu_st)
+{
+   static const char *themes[] = { "basic_black", "basic_white", "nord" };
+   settings_t *settings = config_get_ptr();
+   unsigned i, pass;
+   unsigned had_loads, had_unloads;
+#ifdef HAVE_LIBNX
+   const unsigned theme_icons = 4;
+#else
+   const unsigned theme_icons = 3;
+#endif
+
+   for (i = 1; i < sizeof(themes) / sizeof(themes[0]); i++)
+   {
+      had_loads = loads;
+      had_unloads = unloads;
+      configuration_set_string(settings,
+            settings->arrays.menu_ozone_color_theme, themes[i]);
+      one_frame();
+      one_frame();
+      CHECK(loads == had_loads + theme_icons,
+            "%s first visit loaded %u icons, want %u", themes[i],
+            loads - had_loads, theme_icons);
+      CHECK(unloads == had_unloads, "theme change evicted cached icons");
+   }
+
+   had_loads = loads;
+   had_unloads = unloads;
+   for (pass = 0; pass < 4; pass++)
+      for (i = 0; i < sizeof(themes) / sizeof(themes[0]); i++)
+      {
+         configuration_set_string(settings,
+               settings->arrays.menu_ozone_color_theme, themes[i]);
+         one_frame();
+         one_frame();
+      }
+   CHECK(loads == had_loads, "cached visits uploaded %u additional textures",
+         loads - had_loads);
+   CHECK(unloads == had_unloads, "cached visits unloaded %u textures",
+         unloads - had_unloads);
+
+   menu_st->driver_ctx->context_destroy(menu_st->userdata);
+   menu_st->driver_ctx->context_reset(menu_st->userdata, false);
+   run_tasks();
+   one_frame();
+   had_loads = loads;
+   configuration_set_string(settings,
+         settings->arrays.menu_ozone_color_theme, themes[0]);
+   one_frame();
+   one_frame();
+   CHECK(loads == had_loads + theme_icons,
+         "context reset did not invalidate cached theme textures");
+}
+
+int main(int argc, char *argv[])
+{
+   const char *menu_driver = argc > 1 ? argv[1] : "ozone";
+   char *rarch_argv[4];
+   int rarch_argc = 0;
+   struct menu_state *menu_st;
+
+   if (     !string_is_equal(menu_driver, "ozone")
+         && !string_is_equal(menu_driver, "xmb")
+         && !string_is_equal(menu_driver, "materialui")
+         && !string_is_equal(menu_driver, "contentless"))
+   {
+      fprintf(stderr, "usage: %s ozone|xmb|materialui|contentless\n",
+            argv[0]);
+      return 2;
+   }
+
+   /* Installed before the driver is picked: the null driver's poke
+    * comes from this function from now on. */
+   video_null.poke_interface = harness_get_poke_interface;
+
+   config_file_set_io_default(config_file_io_filestream());
+   rtime_init();
+   retroarch_config_init();
+   retroarch_ctl(RARCH_CTL_STATE_FREE, NULL);
+   frontend_driver_init_first(NULL);
+
+   if (!fixture_make(menu_driver))
+   {
+      fprintf(stderr, "FAIL: could not write the fixture\n");
+      return 1;
+   }
+
+   rarch_argv[rarch_argc++] = (char*)"retroarch";
+   rarch_argv[rarch_argc++] = (char*)"--menu";
+   rarch_argv[rarch_argc++] = (char*)"--config";
+   rarch_argv[rarch_argc++] = cfg_path;
+
+   if (!retroarch_main_init(rarch_argc, rarch_argv))
+   {
+      fprintf(stderr, "FAIL: retroarch_main_init failed\n");
+      return 1;
+   }
+   retroarch_menu_running();
+
+   menu_st = menu_state_get_ptr();
+   CHECK(   menu_st->driver_ctx && menu_st->driver_ctx->ident
+         && string_is_equal(menu_st->driver_ctx->ident,
+            string_is_equal(menu_driver, "materialui") ? "glui"
+            : string_is_equal(menu_driver, "contentless") ? "ozone"
+            : menu_driver),
+         "fixture: menu driver is %s, want %s",
+         (menu_st->driver_ctx && menu_st->driver_ctx->ident)
+            ? menu_st->driver_ctx->ident : "(none)", menu_driver);
+
+   if (string_is_equal(menu_driver, "contentless"))
+   {
+      /* Building the list makes the icon state and queues its decodes */
+      file_list_t list;
+      unsigned count;
+      unsigned had = loads;
+      memset(&list, 0, sizeof(list));
+      count = menu_displaylist_contentless_cores(&list,
+            MENU_CONTENTLESS_CORES_DISPLAY_ALL);
+      CHECK(count == 1, "fixture: %u contentless core(s) listed, want 1",
+            count);
+      file_list_deinitialize(&list);
+      run_tasks();
+      CHECK(menu_contentless_cores_get_entry_icon("harness_libretro") != 0,
+            "the core's icon did not land");
+      CHECK(loads == had + 2,
+            "fixture: %u texture(s) loaded for the list, want the fallback and the core's",
+            loads - had);
+      one_frame();
+   }
+   else if (string_is_equal(menu_driver, "materialui"))
+   {
+      /* The icon's decode is queued and not yet run. The playlist
+       * goes, and the icon array with it. */
+      filestream_delete(playlist_path);
+      if (menu_st->driver_ctx && menu_st->driver_ctx->environ_cb)
+         menu_st->driver_ctx->environ_cb(MENU_ENVIRON_RESET_HORIZONTAL_LIST,
+               NULL, menu_st->userdata);
+      run_tasks();
+      one_frame();
+   }
+   else
+   {
+      /* The first frame draws the sidebar with the playlist's icon
+       * not there, cursor in hand. */
+      run_tasks();
+      one_frame();
+      one_frame();
+   }
+
+   if (string_is_equal(menu_driver, "ozone"))
+   {
+      ozone_header_reset_test(menu_st);
+      ozone_theme_cache_test(menu_st);
+   }
+
+   CHECK(dead_draws == 0, "%u draw(s) of a texture not live", dead_draws);
+
+   CHECK(unknown_unloads == 0,
+         "%u unload(s) of a handle that was not live before deinit",
+         unknown_unloads);
+
+   retroarch_ctl(RARCH_CTL_MAIN_DEINIT, NULL);
+
+   CHECK(unknown_unloads == 0,
+         "%u unload(s) of a handle that was not live",
+         unknown_unloads);
+   CHECK(live_count == 0,
+         "%u texture(s) still live after deinit (%u loaded, %u unloaded)",
+         live_count, loads, unloads);
+   CHECK(loads > 0, "fixture: the menu loaded no texture at all");
+
+   fixture_remove();
+
+   if (failures)
+   {
+      fprintf(stderr, "FAILURES (%u) [%s]\n", failures, menu_driver);
+      return 1;
+   }
+   printf("menu_icon_ownership [%s]: %u loaded, %u unloaded, all accounted for\n",
+         menu_driver, loads, unloads);
+   return 0;
+}

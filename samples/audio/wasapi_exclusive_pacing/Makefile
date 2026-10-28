@@ -1,0 +1,71 @@
+# WASAPI exclusive-mode pacing: the driver's text, unmodified but for
+# its three Windows include lines, against a fake device on a
+# real-time clock, under the reporter's settings.
+
+include ../../sample_objdir.mk
+
+CORE_DIR          := ../../..
+LIBRETRO_COMM_DIR := $(CORE_DIR)/libretro-common
+
+TARGET    := wasapi_exclusive_pacing_test
+GEN       := wasapi_sim.c
+SOURCES_C := wasapi_exclusive_pacing_test.c fake_wasapi.c stubs_retroarch.c $(GEN) \
+	../../../audio/audio_upmix.c \
+	../../../audio/audio_binaural.c \
+	$(LIBRETRO_COMM_DIR)/formats/ac3/rac3_frame.c \
+	$(LIBRETRO_COMM_DIR)/formats/ac3/rac3_decode.c \
+	$(LIBRETRO_COMM_DIR)/formats/ac3/rac3_encode.c \
+	$(LIBRETRO_COMM_DIR)/formats/iec61937/iec61937.c \
+	$(LIBRETRO_COMM_DIR)/lists/string_list.c \
+	$(LIBRETRO_COMM_DIR)/queues/fifo_queue.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
+	$(LIBRETRO_COMM_DIR)/queues/retro_spsc.c \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \
+	$(LIBRETRO_COMM_DIR)/time/rtime.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+	$(LIBRETRO_COMM_DIR)/string/stdstring.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c
+OBJS      := $(call sample_objs,$(SOURCES_C:.c=.o))
+
+INCDIRS   := -I. -I$(LIBRETRO_COMM_DIR)/include -I$(CORE_DIR) -I$(CORE_DIR)/deps
+CFLAGS   += -Wall $(INCDIRS) -DRARCH_INTERNAL -DHAVE_THREADS -DHAVE_WASAPI -D_GNU_SOURCE
+
+ifneq ($(SANITIZER),)
+CFLAGS  += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer -g1
+LDFLAGS += -fsanitize=$(SANITIZER)
+else
+CFLAGS  += -g1 -O1
+endif
+
+all: $(TARGET) threadless-check
+
+# The driver with its Windows includes swapped for the fake's.
+WASAPI_SRC ?= $(CORE_DIR)/audio/drivers/wasapi.c
+$(GEN): $(WASAPI_SRC)
+	sed -e 's|#include "../common/mmdevice_common.h"|#include "fake_wasapi.h"|' \
+	    -e 's|#include "../common/mmdevice_common_inline.h"||' \
+	    -e 's|#include "../common/wasapi.h"||' \
+	    -e 's|#include "../audio_driver.h"|#include "$(CORE_DIR)/audio/audio_driver.h"|' \
+	    -e 's|#include "../../verbosity.h"|#include "$(CORE_DIR)/verbosity.h"|' \
+	    -e 's|#include "../../configuration.h"|#include "$(CORE_DIR)/configuration.h"|' \
+	    $< > $@
+
+threadless-check: $(GEN)
+	$(CC) $(CFLAGS) -UHAVE_THREADS -std=gnu99 -Werror=implicit-function-declaration -fsyntax-only $(GEN)
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $(OBJS) $(LDFLAGS) -lm -lpthread
+
+%.o: %.c
+	$(CC) $(CFLAGS) -std=gnu99 -c -o $@ $<
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -std=gnu99 -c -o $@ $<
+
+clean:
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(OBJS) $(TARGET) $(GEN)
+
+.PHONY: all clean threadless-check

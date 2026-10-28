@@ -4,6 +4,8 @@
 *.exe
 *.bmpobj
 *.binobj
+*.shbin
+*.shbin.s
 *.so
 *.so.*
 *.dll
@@ -14,6 +16,11 @@
 *.swp
 *.cache
 *.gcda
+gmon.out
+# clang --analyze drops a .plist report per translation unit into the
+# working directory. Anchored to the repository root so the tracked
+# Info.plist / ExportOptions.plist files under pkg/apple are unaffected.
+/*.plist
 *.lcbk
 *.gcno
 .tmp
@@ -65,6 +72,7 @@ apple/RetroArch_iOS.xcodeproj/project.xcworkspace/*
 /Cg/
 /GL/
 /SDL/
+/SDL3/
 /ffmpeg/
 /freetype2/
 /ft2build.h
@@ -79,7 +87,7 @@ apple/RetroArch_iOS.xcodeproj/project.xcworkspace/*
 .cproject
 .settings
 libretro-super
-run.sh
+/run.sh
 convert_rumble.awk
 *~
 assets
@@ -92,12 +100,12 @@ content_video_history.lpl
 saves
 screenshots
 autoconfig
-config
-database
+/config
+/database
 overlays
 playlists
 states
-cheats
+/cheats
 thumbnails
 docs/html
 system
@@ -117,7 +125,7 @@ shaders/shaders_slang
 *.depend
 *.rpx
 *.last
-wiiu/wut/elf2rpl/elf2rpl
+os/wiiu/wut/elf2rpl/elf2rpl
 /pkg/wiiu/retroarch
 /pkg/wiiu/wiiu
 /pkg/wiiu/rpx
@@ -148,10 +156,12 @@ wiiu/wut/elf2rpl/elf2rpl
 /pkg/android/phoenix/bin/
 /pkg/android/phoenix/gen/
 /pkg/android/phoenix/local.properties
-/pkg/android/phoenix/gradle.properties
 /pkg/android/phoenix/.gradle
 /pkg/android/phoenix/.externalNativeBuild
 /pkg/android/phoenix/build
+/pkg/android/phoenix-legacy/.project
+/pkg/android/phoenix-jelly-bean/**/.gradle/
+/pkg/android/phoenix-jelly-bean/.cxx/
 
 # Cloned by libretro-fetch.sh
 /media/assets/
@@ -229,6 +239,8 @@ gfx/common/wayland/xdg-shell.c
 gfx/common/wayland/xdg-shell.h
 gfx/common/wayland/pointer-constraints-unstable-v1.c
 gfx/common/wayland/pointer-constraints-unstable-v1.h
+gfx/common/wayland/presentation-time.h
+gfx/common/wayland/presentation-time.c
 gfx/common/wayland/relative-pointer-unstable-v1.c
 gfx/common/wayland/relative-pointer-unstable-v1.h
 gfx/common/wayland/viewporter.c
@@ -243,9 +255,85 @@ gfx/common/wayland/single-pixel-buffer-v1.h
 gfx/common/wayland/single-pixel-buffer-v1.c
 gfx/common/wayland/xdg-toplevel-icon-v1.h
 gfx/common/wayland/xdg-toplevel-icon-v1.c
+gfx/common/wayland/xdg-toplevel-tag-v1.h
+gfx/common/wayland/xdg-toplevel-tag-v1.c
+gfx/common/wayland/webos-foreign.c
+gfx/common/wayland/webos-foreign.h
+gfx/common/wayland/webos-input-manager.c
+gfx/common/wayland/webos-input-manager.h
+gfx/common/wayland/webos-shell.c
+gfx/common/wayland/webos-shell.h
+gfx/common/wayland/webos-surface-group.c
+gfx/common/wayland/webos-surface-group.h
+gfx/common/wayland/tearing-control-v1.h
+gfx/common/wayland/tearing-control-v1.c
+gfx/common/wayland/drm-lease-v1.h
+gfx/common/wayland/drm-lease-v1.c
+gfx/common/wayland/color-management-v1.c
+gfx/common/wayland/color-management-v1.h
+gfx/common/wayland/kde-output-device-v2.c
+gfx/common/wayland/kde-output-device-v2.h
+gfx/common/wayland/kde-output-management-v2.c
+gfx/common/wayland/kde-output-management-v2.h
+gfx/common/wayland/wlr-output-management-unstable-v1.c
+gfx/common/wayland/wlr-output-management-unstable-v1.h
+
+# samples/: built harness executables and objects. Each directory's
+# test is <dir>_test; nothing built there is source.
+samples/**/*_test
+samples/**/*_test_*
+samples/audio/stretch/stretch_bench
+samples/gfx/rslc_corpus/rslc_corpus_dump
+samples/gfx/rslc_reflect/rslc_reflect_check
+samples/gfx/rslc_reflect/spirv_cross.o
+samples/gfx/slang_blob_reflect/slang_blob_reflect_check
+samples/gfx/rslc_image/pattern_core.so
+samples/gfx/rslc_image/pattern_core.dll
+samples/gfx/rslc_image/out/
+samples/**/*.o
+libretro-common/samples/**/*_test
+libretro-common/samples/**/*_test_*
+!libretro-common/samples/**/*_test/
+!samples/**/*_test_*.c
+!libretro-common/samples/**/*_test_*.c
+!samples/**/*_test_*.h
+!libretro-common/samples/**/*_test_*.h
+# Harness executables that are not named <dir>_test. This one had been
+# committed as a built binary, which made any make clean in that
+# directory show up as a deletion.
+samples/audio/embedded_alsa/abi_check
+libretro-common/samples/rthreads/retro_eventcount_bench/retro_eventcount_bench
+libretro-common/samples/rthreads/retro_eventcount_bench/retro_eventcount_bench_*
+# The driver's text with its Windows includes swapped, produced by each
+# suite's Makefile from audio/drivers/wasapi.c. Committed copies went
+# stale against the driver they are generated from.
+samples/audio/wasapi_exclusive_pacing/wasapi_sim.c
+samples/audio/discrete_multichannel/wasapi_sim.c
+samples/audio/wasapi_mic/wasapi_mic_sim.c
+samples/gfx/font_lifecycle/lifecycle
+samples/gfx/font_lifecycle/lifecycle-threaded
+samples/gfx/font_lifecycle/create
+samples/gfx/font_lifecycle/fallback
+samples/gfx/font_lifecycle/chain
+samples/gfx/font_lifecycle/frame
+samples/gfx/font_lifecycle/vg
+samples/gfx/font_lifecycle/sdl2
+samples/gfx/slang_cache/mapped
+samples/gfx/slang_cache/read
+samples/tasks/database/database_task
+samples/gfx/raster_tear_live/raster_tear_live
+# The fake resizable-BAR layer's manifest, written by check-vulkan-rebar
+# with the library name of the platform it is built on.
+samples/gfx/threaded_video/fake_rebar_layer.json
+# Generated by samples/gfx/wayland_drm_lease from the bundled protocol
+# XML; the client half of the same pair lands in gfx/common/wayland.
+samples/gfx/wayland_drm_lease/drm-lease-v1-client-protocol.h
+samples/gfx/wayland_drm_lease/drm-lease-v1-server-protocol.h
+samples/gfx/wayland_drm_lease/drm-lease-v1-protocol.c
 
 # libretro-common samples
 libretro-common/samples/streams/rzip/rzip
+libretro-common/samples/audio/audio_mixer_loop/audio_mixer_loop_test
 
 # DINGUX
 *.opk
@@ -257,10 +345,47 @@ param.sfo
 *.self
 *.vpk
 /.vs
-/deps/SPIRV-Cross/out/build/x64-Debug
 
 # Visual Studio Code
 .vscode/
 
 # Clazy
 *.clazy.yaml
+
+# PSL1GHT
+*.SELF
+EBOOT.BIN
+pkg/psl1ght/*.pkg
+modern_alpha_blend_fpo.h
+modern_alpha_blend_vpo.h
+modern_opaque_fpo.h
+modern_opaque_vpo.h
+gfx/drivers/rsx_shaders/modern_alpha_blend.fpo
+gfx/drivers/rsx_shaders/modern_alpha_blend.vpo
+gfx/drivers/rsx_shaders/modern_opaque.fpo
+gfx/drivers/rsx_shaders/modern_opaque.vpo
+pkg/psl1ght/pkg/USRDIR/shaders_cg/
+!pkg/psl1ght/pkg/USRDIR/system/
+samples/audio/embedded_alsa/ealsa_abi.h
+
+# Python bytecode caches, written by tools/*.py whenever they run.
+__pycache__/
+*.pyc
+samples/audio/asio_clock/asio_clock_driver.h
+samples/gfx/integer_scale_axis/integer_scale_driver.h
+samples/gfx/coord_array/coord_array_driver.h
+samples/gfx/integer_scale_axis/integer_scale_axis_test
+
+# os/wiiu/slang host tool
+/os/wiiu/slang/slang-cafe
+/os/wiiu/slang/slang-cafe.exe
+samples/gfx/vulkan_upscaler/Zdir/
+samples/gfx/vulkan_upscaler/Zdir_fsr/
+samples/gfx/vulkan_upscaler/Zdir_xess/
+samples/gfx/vulkan_upscaler/Zdir_none/
+samples/gfx/d3d12_upscaler/Zdir/
+samples/gfx/d3d12_upscaler/Zdir_fsr/
+samples/gfx/d3d12_upscaler/Zdir_xess/
+samples/gfx/d3d12_upscaler/Zdir_none/
+samples/record/ffmpeg_pipeline/record_finalize_fragment.c
+samples/record/ffmpeg_pipeline/record_start_fragment.c

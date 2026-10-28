@@ -44,6 +44,7 @@ enum database_type
    DATABASE_TYPE_ITERATE_ARCHIVE,
    DATABASE_TYPE_ITERATE_LUTRO,
    DATABASE_TYPE_SERIAL_LOOKUP,
+   DATABASE_TYPE_SERIAL_LOOKUP_SIZEHINT,
    DATABASE_TYPE_CRC_LOOKUP
 };
 
@@ -67,13 +68,13 @@ enum database_query_type
    DATABASE_QUERY_ENTRY_FAMITSU_MAGAZINE_RATING,
    DATABASE_QUERY_ENTRY_RELEASEDATE_MONTH,
    DATABASE_QUERY_ENTRY_RELEASEDATE_YEAR,
-   DATABASE_QUERY_ENTRY_MAX_USERS
+   DATABASE_QUERY_ENTRY_MAX_USERS,
+   DATABASE_QUERY_ENTRY_GENRE,
+   DATABASE_QUERY_ENTRY_REGION
 };
 
 typedef struct
 {
-   struct string_list *list;
-   size_t list_ptr;
    enum database_status status;
    enum database_type type;
 } database_info_handle_t;
@@ -120,7 +121,7 @@ typedef struct
    int rumble_supported;
    int coop_supported;
    uint32_t crc32;
-   unsigned size;
+   uint64_t size;
    unsigned famitsu_magazine_rating;
    unsigned edge_magazine_rating;
    unsigned edge_magazine_issue;
@@ -136,17 +137,136 @@ typedef struct
    size_t count;
 } database_info_list_t;
 
+/* Field selection flags for database_info_list_new_filtered.
+ * Controls which fields are extracted from each record.
+ * 0 = extract all fields. */
+#define DB_EXTRACT_NAME     (1 << 0)
+#define DB_EXTRACT_CRC      (1 << 1)
+#define DB_EXTRACT_SERIAL   (1 << 2)
+#define DB_EXTRACT_SIZE     (1 << 3)
+#define DB_EXTRACT_MD5      (1 << 4)
+#define DB_EXTRACT_SHA1     (1 << 5)
+
+/* Preset used by the ROM scanner */
+#define DB_EXTRACT_SCAN_FIELDS \
+   (DB_EXTRACT_NAME | DB_EXTRACT_CRC | DB_EXTRACT_SERIAL | DB_EXTRACT_SIZE)
+
 database_info_list_t *database_info_list_new(const char *rdb_path,
       const char *query);
+
+/* One-slot cache of the most recent async database scan result
+ * (see tasks/task_database_info.c). The cache retains ownership
+ * of the returned list - callers must not free it. */
+database_info_list_t *menu_dbinfo_cache_get(const char *path,
+      const char *query);
+bool menu_dbinfo_cache_has(const char *path, const char *query);
+
+/* A crc -> record-offset index over one database, built in a single
+ * pass.  The scanner otherwise walks a whole database per content
+ * file; with an index it walks once and binary-searches thereafter.
+ * Costs 8 bytes per indexed record - a 32-bit offset beside the key -
+ * and lives for as long as the caller keeps it. */
+typedef struct database_info_crc_index database_info_crc_index_t;
+
+/* Bytes the index actually holds, for a caller tracking a budget
+ * across several databases. */
+size_t database_info_crc_index_bytes(const database_info_crc_index_t *idx);
+void database_info_crc_index_free(database_info_crc_index_t *idx);
+size_t database_info_crc_index_count(const database_info_crc_index_t *idx);
+
+/* Size range of the records the index covers, collected during the
+ * same walk that built it.  False when no record carried a size. */
+bool database_info_crc_index_size_range(
+      const database_info_crc_index_t *idx, int64_t *min, int64_t *max);
+
+/* Records whose crc is @crc or @archive_crc, in file order, with
+ * @fields extracted - the same list database_info_list_new_filtered()
+ * returns for "{crc:or(...)}".  NULL if the lookup could not be
+ * served, so the caller falls back to the query path. */
+/* @rdb_path is the database the caller believes @idx describes; the
+ * lookup refuses if it does not match, so an index paired with the
+ * wrong database degrades to the query path instead of answering with
+ * another system's records.  Pass NULL to skip the check. */
+database_info_list_t *database_info_list_new_crc(
+      database_info_crc_index_t *idx, const char *rdb_path,
+      uint32_t crc, uint32_t archive_crc, unsigned fields);
+
+/* The same treatment for the serial lookup disc content uses.  A
+ * serial is variable-length, so the index keeps a hash and the
+ * candidate records are read back and compared exactly: a collision
+ * costs an extra read, never a wrong match. */
+typedef struct database_info_serial_index database_info_serial_index_t;
+
+size_t database_info_serial_index_bytes(
+      const database_info_serial_index_t *idx);
+void database_info_serial_index_free(database_info_serial_index_t *idx);
+size_t database_info_serial_index_count(
+      const database_info_serial_index_t *idx);
+
+database_info_list_t *database_info_list_new_serial(
+      database_info_serial_index_t *idx, const char *rdb_path,
+      const char *serial, unsigned fields);
+
+/* What database_info_index_job_new() builds. */
+enum database_info_index_want
+{
+   DATABASE_INFO_INDEX_CRC        = (1 << 0),
+   DATABASE_INFO_INDEX_SERIAL     = (1 << 1),
+   /* Whether any record carries a serial, without the serial index. */
+   DATABASE_INFO_INDEX_HAS_SERIAL = (1 << 2)
+};
+
+/* Builds the crc index of a database and its serial index in one
+ * walk, spread over as many calls as it takes, so that no call walks
+ * or sorts a whole database. */
+typedef struct database_info_index_job database_info_index_job_t;
+
+/* NULL when @rdb_path cannot be opened or @want names no index.
+ * @max_bytes caps the crc index's entry table and the serial index
+ * gets what the crc index leaves; an index that cannot be built whole
+ * comes back NULL, because a partial index would miss matches without
+ * saying so.  Zero means no limit. */
+database_info_index_job_t *database_info_index_job_new(
+      const char *rdb_path, size_t max_bytes, unsigned want);
+
+/* Walks up to @records records or merges up to @entries index
+ * entries; both must be non-zero.  Unlike finish and free, it takes no
+ * NULL job.  True once the job is done, built or failed. */
+bool database_info_index_job_step(database_info_index_job_t *job,
+      unsigned records, size_t entries);
+
+/* Hands over what a done job built and frees the job.  Only what the
+ * job was asked for comes back; the other pointers may be NULL.
+ * @has_serial says whether any record carries a serial the serial
+ * index keys on; it is complete whenever an index comes back. */
+void database_info_index_job_finish(database_info_index_job_t *job,
+      database_info_crc_index_t **crc,
+      database_info_serial_index_t **serial, bool *has_serial);
+
+/* Frees a job, done or not. */
+void database_info_index_job_free(database_info_index_job_t *job);
+
+database_info_list_t *database_info_list_new_filtered(const char *rdb_path,
+      const char *query, unsigned fields);
 
 void database_info_list_free(database_info_list_t *list);
 
 database_info_handle_t *database_info_dir_init(const char *dir,
-      enum database_type type, retro_task_t *task,
-      bool show_hidden_files);
+      enum database_type type, char* file_exts,
+      bool show_hidden_files, bool recursive, bool include_archive, 
+      struct string_list **content_list);
+
+/* As database_info_dir_init(), but over a content list the caller has
+ * already built (e.g. incrementally via dir_list_iter_step() so the
+ * walk could be spread across task gathers).  Applies the same
+ * cue/gdi-prioritising sort the directory variant applies and borrows
+ * @list without taking ownership.  Returns NULL only on allocation
+ * failure. */
+database_info_handle_t *database_info_dir_init_from_list(
+      enum database_type type, struct string_list *list);
 
 database_info_handle_t *database_info_file_init(const char *path,
-      enum database_type type, retro_task_t *task);
+      enum database_type type, retro_task_t *task, struct string_list **content_list);
 
 void database_info_free(database_info_handle_t *handle);
 

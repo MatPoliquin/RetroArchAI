@@ -38,6 +38,7 @@
 #include "../input_driver.h"
 #define BUILDING_BTDYNAMIC
 #include "../connect/joypad_connection.h"
+#include "../../verbosity.h"
 
 /* Length of a Bluetooth device address. */
 #define BD_ADDR_LEN        6
@@ -681,7 +682,7 @@ struct btpad_queue_command
 
 struct btstack_hid_adapter
 {
-   uint32_t slot;
+   int32_t slot;
 
    enum btpad_state state;
 
@@ -747,6 +748,17 @@ static sthread_t *btstack_thread;
 
 #ifdef __APPLE__
 static CFRunLoopSourceRef btstack_quit_source;
+/* The btstack thread's run loop, for waking it: signalling a source
+ * marks it ready but does not wake a run loop that is asleep, so the
+ * stop request used to sit there until something else woke it. */
+static CFRunLoopRef btstack_run_loop;
+/* Armed when power-off is requested, so the thread ends even if the
+ * daemon never reports the power state that closes the connections
+ * and stops the loop. */
+static CFRunLoopTimerRef btstack_stop_timer;
+
+/* How long power-off is given before the thread stops regardless. */
+#define BTSTACK_POWER_OFF_TIMEOUT_S 2.0
 #endif
 
 static void *btstack_get_handle(void)
@@ -975,21 +987,6 @@ static void btpad_queue_reset(void)
    can_run         = 1;
 }
 
-#if 0
-static void btpad_queue_btstack_set_power_mode(
-      struct btpad_queue_command *cmd, uint8_t on)
-{
-   if (!cmd)
-      return;
-
-   cmd->command                   = btstack_set_power_mode_ptr;
-   cmd->btstack_set_power_mode.on = on;
-
-   btpad_increment_position(&insert_position);
-   btpad_queue_process();
-}
-#endif
-
 static void btpad_set_inquiry_state(bool on)
 {
    inquiry_off = !on;
@@ -1025,7 +1022,7 @@ static void btpad_packet_handler(uint8_t packet_type,
          switch (packet[0])
          {
             case BTSTACK_EVENT_STATE:
-               RARCH_LOG("[BTstack]: HCI State %d.\n", packet[2]);
+               RARCH_LOG("[BTstack] HCI State %d.\n", packet[2]);
 
                switch (packet[2])
                {
@@ -1059,10 +1056,10 @@ static void btpad_packet_handler(uint8_t packet_type,
                {
                   bt_flip_addr_ptr(event_addr, &packet[6]);
                   if (!packet[5])
-                     RARCH_LOG("[BTpad]: Local address is %s.\n",
+                     RARCH_LOG("[BTpad] Local address is %s.\n",
                            bd_addr_to_str_ptr(event_addr));
                   else
-                     RARCH_LOG("[BTpad]: Failed to get local address (Status: %02X).\n",
+                     RARCH_LOG("[BTpad] Failed to get local address (Status: %02X).\n",
                            packet[5]);
                }
                break;
@@ -1079,7 +1076,7 @@ static void btpad_packet_handler(uint8_t packet_type,
                   if (!connection)
                      return;
 
-                  RARCH_LOG("[BTpad]: Inquiry found device\n");
+                  RARCH_LOG("[BTpad] Inquiry found device\n");
                   memset(connection, 0, sizeof(struct btstack_hid_adapter));
 
                   memcpy(connection->address, event_addr, sizeof(bd_addr_t));
@@ -1116,11 +1113,11 @@ static void btpad_packet_handler(uint8_t packet_type,
                   {
                      if (!connection)
                      {
-                        RARCH_LOG("[BTpad]: Got L2CAP 'Channel Opened' event for unrecognized device.\n");
+                        RARCH_LOG("[BTpad] Got L2CAP \"Channel Opened\" event for unrecognized device.\n");
                         break;
                      }
 
-                     RARCH_LOG("[BTpad]: L2CAP channel opened: (PSM: %02X)\n", psm);
+                     RARCH_LOG("[BTpad] L2CAP channel opened: (PSM: %02X).\n", psm);
                      connection->handle         = handle;
 
                      switch (psm)
@@ -1132,18 +1129,18 @@ static void btpad_packet_handler(uint8_t packet_type,
                            connection->channels[1] = channel_id;
                            break;
                         default:
-                           RARCH_LOG("[BTpad]: Got unknown L2CAP PSM, ignoring (PSM: %02X).\n", psm);
+                           RARCH_LOG("[BTpad] Got unknown L2CAP PSM, ignoring (PSM: %02X).\n", psm);
                            break;
                      }
 
                      if (connection->channels[0] && connection->channels[1])
                      {
-                        RARCH_LOG("[BTpad]: Got both L2CAP channels, requesting name.\n");
+                        RARCH_LOG("[BTpad] Got both L2CAP channels, requesting name.\n");
                         btpad_queue_hci_remote_name_request(cmd, connection->address, 0, 0, 0);
                      }
                   }
                   else
-                     RARCH_LOG("[BTpad]: Got failed L2CAP 'Channel Opened' event (PSM: %02X, Status: %02X).\n", psm, packet[2]);
+                     RARCH_LOG("[BTpad] Got failed L2CAP \"Channel Opened\" event (PSM: %02X, Status: %02X).\n", psm, packet[2]);
                }
                break;
 
@@ -1166,7 +1163,7 @@ static void btpad_packet_handler(uint8_t packet_type,
                      if (!connection)
                         break;
 
-                     RARCH_LOG("[BTpad]: Got new incoming connection\n");
+                     RARCH_LOG("[BTpad] Got new incoming connection...\n");
 
                      memset(connection, 0,
                            sizeof(struct btstack_hid_adapter));
@@ -1178,7 +1175,7 @@ static void btpad_packet_handler(uint8_t packet_type,
                      connection->state = BTPAD_CONNECTING;
                   }
 
-                  RARCH_LOG("[BTpad]: Incoming L2CAP connection (PSM: %02X).\n",
+                  RARCH_LOG("[BTpad] Incoming L2CAP connection (PSM: %02X).\n",
                         psm);
                   bt_send_cmd_ptr(l2cap_accept_connection_ptr, channel_id);
                }
@@ -1194,11 +1191,11 @@ static void btpad_packet_handler(uint8_t packet_type,
 
                   if (!connection)
                   {
-                     RARCH_LOG("[BTpad]: Got unexpected remote name, ignoring.\n");
+                     RARCH_LOG("[BTpad] Got unexpected remote name, ignoring.\n");
                      break;
                   }
 
-                  RARCH_LOG("[BTpad]: Got %.200s.\n", (char*)&packet[9]);
+                  RARCH_LOG("[BTpad] Got %.200s.\n", (char*)&packet[9]);
 
                   connection->slot  = pad_connection_pad_init(&slots[connection->slot],
                         (char*)packet + 9, 0, 0, connection, &btstack_hid);
@@ -1207,7 +1204,7 @@ static void btpad_packet_handler(uint8_t packet_type,
                break;
 
             case HCI_EVENT_PIN_CODE_REQUEST:
-               RARCH_LOG("[BTpad]: Sending Wiimote PIN.\n");
+               RARCH_LOG("[BTpad] Sending Wiimote PIN.\n");
 
                bt_flip_addr_ptr(event_addr, &packet[2]);
                btpad_queue_hci_pin_code_request_reply(cmd, event_addr, &packet[2]);
@@ -1230,13 +1227,13 @@ static void btpad_packet_handler(uint8_t packet_type,
                      }
                   }
                   else
-                     RARCH_LOG("[BTpad]: Got failed 'Disconnection Complete' event (Status: %02X).\n", packet[2]);
+                     RARCH_LOG("[BTpad] Got failed \"Disconnection Complete\" event (Status: %02X).\n", packet[2]);
                }
                break;
 
             case L2CAP_EVENT_SERVICE_REGISTERED:
                if (packet[2])
-                  RARCH_LOG("[BTpad]: Got failed 'Service Registered' event (PSM: %02X, Status: %02X).\n",
+                  RARCH_LOG("[BTpad] Got failed \"Service Registered\" event (PSM: %02X, Status: %02X).\n",
                         READ_BT_16(packet, 3), packet[2]);
                break;
          }
@@ -1275,7 +1272,7 @@ static bool btstack_try_load(void)
    }
 #endif
 
-#if defined(HAVE_COCOA) || defined(HAVE_COCOATOUCH) || defined(HAVE_COCOA_METAL)
+#if defined(HAVE_COCOA) || defined(HAVE_COCOATOUCH)
    run_loop_init_ptr(RUN_LOOP_COCOA);
 #else
    run_loop_init_ptr(RUN_LOOP_POSIX);
@@ -1287,38 +1284,66 @@ static bool btstack_try_load(void)
    return true;
 }
 
+#ifdef __APPLE__
+static void btstack_thread_stop_timeout(CFRunLoopTimerRef timer, void *info)
+{
+   RARCH_WARN("[BTstack] No power-off report; stopping the thread anyway.\n");
+   CFRunLoopStop(CFRunLoopGetCurrent());
+}
+#endif
+
 static void btstack_thread_stop(void *data)
 {
    (void)data;
    bt_send_cmd_ptr(btstack_set_power_mode_ptr, HCI_POWER_OFF);
+#ifdef __APPLE__
+   /* The power-off report closes the connections and stops the loop;
+    * this stops it after a bound if that report never comes. */
+   btstack_stop_timer = CFRunLoopTimerCreate(NULL,
+         CFAbsoluteTimeGetCurrent() + BTSTACK_POWER_OFF_TIMEOUT_S,
+         0, 0, 0, btstack_thread_stop_timeout, NULL);
+   if (btstack_stop_timer)
+      CFRunLoopAddTimer(CFRunLoopGetCurrent(), btstack_stop_timer,
+            kCFRunLoopCommonModes);
+#endif
 }
 
 static void btstack_thread_func(void* data)
 {
-   RARCH_LOG("[BTstack]: Thread started");
+   RARCH_LOG("[BTstack] Thread started.\n");
 
    if (bt_open_ptr())
       return;
 
 #ifdef __APPLE__
    CFRunLoopSourceContext ctx = { 0, 0, 0, 0, 0, 0, 0, 0, 0, btstack_thread_stop };
+   /* Before the source: whoever sees the source can wake this loop. */
+   btstack_run_loop    = CFRunLoopGetCurrent();
    btstack_quit_source = CFRunLoopSourceCreate(0, 0, &ctx);
    CFRunLoopAddSource(CFRunLoopGetCurrent(), btstack_quit_source, kCFRunLoopCommonModes);
 #endif
 
-   RARCH_LOG("[BTstack]: Turning on...\n");
+   RARCH_LOG("[BTstack] Turning on...\n");
    bt_send_cmd_ptr(btstack_set_power_mode_ptr, HCI_POWER_ON);
 
-   RARCH_LOG("BTstack: Thread running...\n");
+   RARCH_LOG("[BTstack] Thread running...\n");
 #ifdef __APPLE__
    CFRunLoopRun();
 #endif
 
-   RARCH_LOG("[BTstack]: Thread done.\n");
+   RARCH_LOG("[BTstack] Thread done.\n");
 
 #ifdef __APPLE__
+   if (btstack_stop_timer)
+   {
+      CFRunLoopTimerInvalidate(btstack_stop_timer);
+      CFRelease(btstack_stop_timer);
+      btstack_stop_timer = NULL;
+   }
    CFRunLoopSourceInvalidate(btstack_quit_source);
    CFRelease(btstack_quit_source);
+   btstack_quit_source = NULL;
+   btstack_run_loop    = NULL;
 #endif
 }
 
@@ -1333,6 +1358,7 @@ static void btstack_set_poweron(bool on)
    {
 #ifdef __APPLE__
       CFRunLoopSourceSignal(btstack_quit_source);
+      CFRunLoopWakeUp(btstack_run_loop);
 #endif
       sthread_join(btstack_thread);
       btstack_thread = NULL;
@@ -1404,12 +1430,12 @@ static int16_t btstack_hid_joypad_axis(void *data,
 static int16_t btstack_hid_joypad_state(
       void *data,
       rarch_joypad_info_t *joypad_info,
-      const void *binds_data,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    unsigned i;
    int16_t ret                          = 0;
-   const struct retro_keybind *binds    = (const struct retro_keybind*)binds_data;
    uint16_t port_idx                     = joypad_info->joy_idx;
    joypad_connection_t              *pad = &slots[port_idx];
 
@@ -1418,11 +1444,8 @@ static int16_t btstack_hid_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN
             && btstack_hid_joypad_button(data, port_idx, (uint16_t)joykey))
